@@ -1,7 +1,7 @@
 {
   "Id": "AITraffic",
   "DisplayName": "AI Traffic",
-  "Author": "Domann",
+  "Author": "Killermops27",
   "Version": "0.1.0",
   "Requirements": [
     "DVSignals"
