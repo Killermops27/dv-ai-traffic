@@ -1,0 +1,3 @@
+[submodule "references/dv-signals"]
+	path = references/dv-signals
+	url = https://github.com/WhistleWiz/dv-signals.git

@@ -1,0 +1,18 @@
+{
+  "Id": "AITraffic",
+  "DisplayName": "AI Traffic",
+  "Author": "Domann",
+  "Version": "0.1.0",
+  "Requirements": [
+    "DVSignals"
+  ],
+  "LoadAfter": [
+    "DVSignals",
+    "DoubleTrack",
+    "PassengerJobs",
+    "PersistentJobsMod",
+    "SelfShunt"
+  ],
+  "EntryMethod": "AITraffic.Main.Load",
+  "AssemblyName": "AITraffic.dll"
+}

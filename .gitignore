@@ -1,0 +1,32 @@
+# Build and Output directories
+[Bb]in/
+[Oo]bj/
+[Oo]ut/
+[Gg]enerated/
+[Tt]emp/
+
+# Visual Studio / Rider / VS Code
+.vs/
+.idea/
+.vscode/
+*.user
+*.userprefs
+*.suo
+*.sln.docstates
+*.userosscache
+*.DotSettings.user
+
+# Logs and Crash Reports
+[Ll]ogs/
+*.log
+[Tt]est[Rr]esults/
+
+# Mod Packages & Archives
+*.zip
+*.7z
+*.tar.gz
+
+# OS Generated Files
+.DS_Store
+Thumbs.db
+[Dd]esktop.ini
