@@ -97,5 +97,5 @@ Built with cross-mod interoperability in mind:
 
 ## 📄 License & Acknowledgements
 
-- Mod authored by **Domann** (`Killermops27`).
+- Mod authored by **Killermops27**.
 - Special thanks to **WhistleWiz** and the Derail Valley modding community for the `dv-signals` framework and invaluable reverse-engineering insights.
