@@ -3,6 +3,7 @@
 [![Game: Derail Valley](https://img.shields.io/badge/Game-Derail%20Valley-blue.svg)](http://www.derailvalley.com/)
 [![Mod Loader: UMM](https://img.shields.io/badge/ModLoader-Unity%20Mod%20Manager-orange.svg)](https://www.nexusmods.com/site/mods/21)
 [![Requires: DVSignals](https://img.shields.io/badge/Requires-DVSignals-green.svg)](https://github.com/WhistleWiz/dv-signals)
+[![Latest Release](https://img.shields.io/github/v/release/Killermops27/dv-ai-traffic?include_prereleases&color=brightgreen)](https://github.com/Killermops27/dv-ai-traffic/releases)
 [![Status: Early Alpha](https://img.shields.io/badge/Status-Early%20Development-yellow.svg)](#disclaimer)
 
 An autonomous AI train traffic and dispatching system for **Derail Valley**, bringing the railway network to life with schedule-driven and dynamic freight, passenger, and shunting movements.
@@ -56,12 +57,14 @@ Built with cross-mod interoperability in mind:
 
 ## 🛠️ Installation
 
-1. Download or compile the latest release of `AITraffic`.
-2. Extract the `AITraffic` directory into your `Derail Valley/Mods/` folder so that `Info.json` is located at:
-   ```text
-   Derail Valley/Mods/AITraffic/Info.json
-   ```
-3. Start the game. Open the Unity Mod Manager interface (<kbd>Ctrl</kbd> + <kbd>F10</kbd>) to configure mod settings.
+1. Download the latest **`AITraffic-v<version>.zip`** from the **[Releases](https://github.com/Killermops27/dv-ai-traffic/releases)** section.
+2. Install via **Unity Mod Manager (UMM)**:
+   - Drag and drop the downloaded `.zip` file directly into the UMM **Mods** tab, **OR**
+   - Extract the `.zip` archive into your `Derail Valley/Mods/` folder so that `Info.json` is located at:
+     ```text
+     Derail Valley/Mods/AITraffic/Info.json
+     ```
+3. Start the game. Open the Unity Mod Manager interface (<kbd>Ctrl</kbd> + <kbd>F10</kbd>) to verify that `AI Traffic` is loaded with a green status indicator and configure mod settings.
 
 ---
 
