@@ -106,9 +106,11 @@ namespace AITraffic.Navigation
         /// <summary>
         /// Checks whether a track segment is currently occupied by the player's train, rolling stock, or player avatar.
         /// </summary>
-        public static bool IsTrackOccupiedByPlayer(RailTrack track)
+        public static bool IsTrackOccupiedByPlayer(RailTrack track, Trainset ignoringTrainset = null)
         {
             if (track == null) return false;
+
+            bool rideAlong = (Main.Settings != null && Main.Settings.RideAlongMode);
 
             // 1. Check player's active trainset
             try
@@ -118,12 +120,28 @@ namespace AITraffic.Navigation
                 float pSpeed;
                 if (TryGetPlayerTrainInfo(out pTrainset, out pPos, out pSpeed) && pTrainset != null && pTrainset.cars != null)
                 {
+                    // If player is on or riding the AI train, do not flag it as an opposing player obstacle
+                    bool isIgnoringTrain = (ignoringTrainset != null && pTrainset == ignoringTrainset);
+                    bool isAITrain = false;
                     for (int i = 0; i < pTrainset.cars.Count; i++)
                     {
-                        var car = pTrainset.cars[i];
-                        if (car == null) continue;
-                        if (car.FrontBogie != null && car.FrontBogie.track == track) return true;
-                        if (car.RearBogie != null && car.RearBogie.track == track) return true;
+                        var c = pTrainset.cars[i];
+                        if (c != null && (c.GetComponent<AITraffic.Driver.AIEngineer>() != null || (ignoringTrainset != null && ignoringTrainset.cars != null && ignoringTrainset.cars.Contains(c))))
+                        {
+                            isAITrain = true;
+                            break;
+                        }
+                    }
+
+                    if (!isIgnoringTrain && !isAITrain)
+                    {
+                        for (int i = 0; i < pTrainset.cars.Count; i++)
+                        {
+                            var car = pTrainset.cars[i];
+                            if (car == null) continue;
+                            if (car.FrontBogie != null && car.FrontBogie.track == track) return true;
+                            if (car.RearBogie != null && car.RearBogie.track == track) return true;
+                        }
                     }
                 }
             }
@@ -136,35 +154,63 @@ namespace AITraffic.Navigation
                 foreach (var bogie in bogiesComp.bogiesOnTrack)
                 {
                     if (bogie == null || bogie.Car == null) continue;
+                    if (ignoringTrainset != null)
+                    {
+                        if (bogie.Car.trainset == ignoringTrainset) continue;
+                        if (ignoringTrainset.cars != null && ignoringTrainset.cars.Contains(bogie.Car)) continue;
+                    }
+
                     var ai = bogie.Car.GetComponent<AITraffic.Driver.AIEngineer>();
-                    if (ai == null && (bogie.Car.playerSpawnedCar || bogie.Car.IsLoco))
+                    if (ai == null && (bogie.Car.playerSpawnedCar || (bogie.Car.IsLoco && !bogie.Car.preventDebtDisplay)))
                     {
                         return true;
                     }
                 }
             }
 
-            // 3. Check player avatar proximity to track curve (< 20m)
-            try
+            // 3. Check player avatar proximity to track curve (< 20m) - suppressed in Ride Along mode or when riding the train
+            if (!rideAlong)
             {
-                if (PlayerManager.PlayerTransform != null && track.curve != null)
+                try
                 {
-                    Vector3 playerPos = PlayerManager.PlayerTransform.position;
-                    Vector3 midPoint = track.curve.GetPointAt(0.5f);
-                    float trackLen = track.curve.length;
-                    if (Vector3.Distance(playerPos, midPoint) <= (trackLen * 0.5f + 25f))
+                    if (PlayerManager.PlayerTransform != null && track.curve != null)
                     {
-                        float dStart = Vector3.Distance(playerPos, track.curve.GetPointAt(0.0f));
-                        float dEnd = Vector3.Distance(playerPos, track.curve.GetPointAt(1.0f));
-                        float dMid = Vector3.Distance(playerPos, midPoint);
-                        if (Mathf.Min(dStart, Mathf.Min(dEnd, dMid)) < 20f)
+                        // If player is standing on/in the AI train, do not treat as an external obstacle
+                        bool playerOnIgnoringTrain = false;
+                        if (ignoringTrainset != null && ignoringTrainset.cars != null)
                         {
-                            return true;
+                            Vector3 playerPos = PlayerManager.PlayerTransform.position;
+                            for (int i = 0; i < ignoringTrainset.cars.Count; i++)
+                            {
+                                var c = ignoringTrainset.cars[i];
+                                if (c != null && Vector3.Distance(playerPos, c.transform.position) < 8.0f)
+                                {
+                                    playerOnIgnoringTrain = true;
+                                    break;
+                                }
+                            }
+                        }
+
+                        if (!playerOnIgnoringTrain)
+                        {
+                            Vector3 playerPos = PlayerManager.PlayerTransform.position;
+                            Vector3 midPoint = track.curve.GetPointAt(0.5f);
+                            float trackLen = track.curve.length;
+                            if (Vector3.Distance(playerPos, midPoint) <= (trackLen * 0.5f + 25f))
+                            {
+                                float dStart = Vector3.Distance(playerPos, track.curve.GetPointAt(0.0f));
+                                float dEnd = Vector3.Distance(playerPos, track.curve.GetPointAt(1.0f));
+                                float dMid = Vector3.Distance(playerPos, midPoint);
+                                if (Mathf.Min(dStart, Mathf.Min(dEnd, dMid)) < 20f)
+                                {
+                                    return true;
+                                }
+                            }
                         }
                     }
                 }
+                catch { }
             }
-            catch { }
 
             return false;
         }
@@ -172,14 +218,19 @@ namespace AITraffic.Navigation
         /// <summary>
         /// Checks whether a junction switch or any of its connecting branches is currently occupied by the player.
         /// </summary>
-        public static bool IsJunctionOccupiedByPlayer(Junction junction)
+        public static bool IsJunctionOccupiedByPlayer(Junction junction, Trainset ignoringTrainset = null)
         {
             if (junction == null) return false;
+
+            if (Main.Settings != null && Main.Settings.RideAlongMode)
+            {
+                return false;
+            }
 
             // 1. Check inBranch
             if (junction.inBranch != null && junction.inBranch.track != null)
             {
-                if (IsTrackOccupiedByPlayer(junction.inBranch.track)) return true;
+                if (IsTrackOccupiedByPlayer(junction.inBranch.track, ignoringTrainset)) return true;
             }
 
             // 2. Check outBranches
@@ -190,7 +241,7 @@ namespace AITraffic.Navigation
                     var branch = junction.outBranches[i];
                     if (branch != null && branch.track != null)
                     {
-                        if (IsTrackOccupiedByPlayer(branch.track)) return true;
+                        if (IsTrackOccupiedByPlayer(branch.track, ignoringTrainset)) return true;
                     }
                 }
             }
@@ -200,9 +251,27 @@ namespace AITraffic.Navigation
             {
                 if (PlayerManager.PlayerTransform != null)
                 {
-                    if (Vector3.Distance(PlayerManager.PlayerTransform.position, junction.position) < 30f)
+                    bool playerOnIgnoringTrain = false;
+                    if (ignoringTrainset != null && ignoringTrainset.cars != null)
                     {
-                        return true;
+                        Vector3 playerPos = PlayerManager.PlayerTransform.position;
+                        for (int i = 0; i < ignoringTrainset.cars.Count; i++)
+                        {
+                            var c = ignoringTrainset.cars[i];
+                            if (c != null && Vector3.Distance(playerPos, c.transform.position) < 8.0f)
+                            {
+                                playerOnIgnoringTrain = true;
+                                break;
+                            }
+                        }
+                    }
+
+                    if (!playerOnIgnoringTrain)
+                    {
+                        if (Vector3.Distance(PlayerManager.PlayerTransform.position, junction.position) < 30f)
+                        {
+                            return true;
+                        }
                     }
                 }
             }
@@ -596,7 +665,7 @@ namespace AITraffic.Navigation
                 foreach (var bogie in curBogies.bogiesOnTrack)
                 {
                     if (bogie == null || bogie.Car == null) continue;
-                    if (myTrainset != null && bogie.Car.trainset == myTrainset) continue;
+                    if (myTrainset != null && (bogie.Car.trainset == myTrainset || (myTrainset.cars != null && myTrainset.cars.Contains(bogie.Car)))) continue;
 
                     double bSpan = bogie.traveller != null ? bogie.traveller.Span : 0.0;
                     if ((direction >= 0.0f && bSpan > currentSpan) || (direction < 0.0f && bSpan < currentSpan))
@@ -606,7 +675,7 @@ namespace AITraffic.Navigation
                 }
             }
 
-            if (IsTrackOccupiedByPlayer(currentTrack))
+            if (IsTrackOccupiedByPlayer(currentTrack, myTrainset))
             {
                 currentBlock.IsPlayerOccupied = true;
                 currentBlock.IsClear = false;
@@ -722,12 +791,12 @@ namespace AITraffic.Navigation
                         foreach (var bogie in rBogies.bogiesOnTrack)
                         {
                             if (bogie == null || bogie.Car == null) continue;
-                            if (myTrainset != null && bogie.Car.trainset == myTrainset) continue;
+                            if (myTrainset != null && (bogie.Car.trainset == myTrainset || (myTrainset.cars != null && myTrainset.cars.Contains(bogie.Car)))) continue;
                             currentBlock.IsClear = false;
                         }
                     }
 
-                    if (IsTrackOccupiedByPlayer(rTrack))
+                    if (IsTrackOccupiedByPlayer(rTrack, myTrainset))
                     {
                         currentBlock.IsPlayerOccupied = true;
                         currentBlock.IsClear = false;
@@ -990,7 +1059,7 @@ namespace AITraffic.Navigation
                 foreach (var bogie in curBogiesComp.bogiesOnTrack)
                 {
                     if (bogie == null || bogie.Car == null) continue;
-                    if (myTrainset != null && bogie.Car.trainset == myTrainset) continue;
+                    if (myTrainset != null && (bogie.Car.trainset == myTrainset || (myTrainset.cars != null && myTrainset.cars.Contains(bogie.Car)))) continue;
 
                     double bSpan = bogie.traveller != null ? bogie.traveller.Span : 0.0;
                     if (direction >= 0.0f && bSpan > currentSpan)
@@ -1043,7 +1112,7 @@ namespace AITraffic.Navigation
                         foreach (var bogie in rBogiesComp.bogiesOnTrack)
                         {
                             if (bogie == null || bogie.Car == null) continue;
-                            if (myTrainset != null && bogie.Car.trainset == myTrainset) continue;
+                            if (myTrainset != null && (bogie.Car.trainset == myTrainset || (myTrainset.cars != null && myTrainset.cars.Contains(bogie.Car)))) continue;
 
                             double bSpan = bogie.traveller != null ? bogie.traveller.Span : 0.0;
                             float distFromEntry = (routeDir >= 0.0f) ? (float)bSpan : (float)(rTrackLen - bSpan);

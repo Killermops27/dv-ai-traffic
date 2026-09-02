@@ -782,14 +782,16 @@ namespace AITraffic.Core
                 GUILayout.Label("<size=13><b>[AI Traffic Debug Monitor]</b></size>");
                 if (_settings != null)
                 {
-                    _settings.ShowRouteVisualizer = GUILayout.Toggle(_settings.ShowRouteVisualizer, " 3D Path", GUILayout.Width(75));
-                    _settings.ShowSignalTags = GUILayout.Toggle(_settings.ShowSignalTags, " 3D Signals", GUILayout.Width(88));
+                    _settings.ShowRouteVisualizer = GUILayout.Toggle(_settings.ShowRouteVisualizer, " 3D Path", GUILayout.Width(72));
+                    _settings.ShowSignalTags = GUILayout.Toggle(_settings.ShowSignalTags, " 3D Signals", GUILayout.Width(86));
+                    _settings.RideAlongMode = GUILayout.Toggle(_settings.RideAlongMode, " Ride Along", GUILayout.Width(90));
                 }
                 GUILayout.EndHorizontal();
                 GUILayout.Space(2f);
 
-                GUILayout.Label(string.Format("<b>Mode:</b> {0} | <b>Density:</b> {1} | <b>Max Trains:</b> {2}",
-                    _settings.Mode, _settings.Density, _settings.MaxActiveTrains));
+                string rideStatus = (_settings != null && _settings.RideAlongMode) ? " | <color=#00FF88><b>Ride-Along: Active</b></color>" : "";
+                GUILayout.Label(string.Format("<b>Mode:</b> {0} | <b>Density:</b> {1} | <b>Max Trains:</b> {2}{3}",
+                    _settings.Mode, _settings.Density, _settings.MaxActiveTrains, rideStatus));
 
                 float timeToNext = Mathf.Max(0f, TrafficScheduler.Instance.DispatchIntervalSeconds - (Time.time - TrafficScheduler.Instance.LastDispatchTime));
                 GUILayout.Label(string.Format("<b>Active AI Trains:</b> {0} / {1} | <b>Next Dispatch:</b> {2:F0}s",
@@ -849,8 +851,12 @@ namespace AITraffic.Core
 
                         GUILayout.BeginVertical(GUI.skin.box);
                         
+                        string reasonStr = string.Format(" <color=#FFD700>[{0} (Limit:{1:F0}km/h)]</color>", 
+                            eng.CurrentSpeedProfile.LimitingReason,
+                            eng.CurrentSpeedProfile.TrackLimitKmh);
+
                         GUILayout.BeginHorizontal();
-                        GUILayout.Label(string.Format("• <b>{0}</b> [{1}]  Speed: <b>{2:F1}</b> / {3:F1} km/h", locoId, state, speed, targetSpeed));
+                        GUILayout.Label(string.Format("• <b>{0}</b> [{1}]  Speed: <b>{2:F1}</b> / {3:F1} km/h{4}", locoId, state, speed, targetSpeed, reasonStr));
                         
                         bool isRouteExpanded = _expandedRoutes.Contains(locoId);
                         if (GUILayout.Button(isRouteExpanded ? "▲ Route" : "▼ Route", GUILayout.Width(62), GUILayout.Height(19)))
@@ -868,6 +874,7 @@ namespace AITraffic.Core
 
                         if (GUILayout.Button("Jump", GUILayout.Width(46), GUILayout.Height(19)))
                         {
+                            if (_settings != null) _settings.RideAlongMode = true;
                             TeleportPlayerToTrain(eng.TrainCar);
                         }
                         if (GUILayout.Button("Del", GUILayout.Width(35), GUILayout.Height(19)))
@@ -887,7 +894,8 @@ namespace AITraffic.Core
                                 : string.Format("<b>Gear {0}</b> (A: {1}, B: {2})", eng.DM3Controller.CurrentGearIndex, eng.DM3Controller.CurrentGearA, eng.DM3Controller.CurrentGearB);
                             GUILayout.Label(string.Format("   <color=#FFD700>DM3 Transmission:</color> {0}", dm3Status));
                         }
-                        GUILayout.Label(string.Format("   Thr: <b>{0:F0}%</b> | Brk: <b>{1:F0}%</b> | Dyn: <b>{2:F0}%</b> | Signal: {3}", throttle, trainBrake, dynBrake, sigStr));
+                        string obsStr = float.IsInfinity(eng.DistanceToObstacle) ? "Clear" : string.Format("<color=#FF5555>{0:F0}m</color>", eng.DistanceToObstacle);
+                        GUILayout.Label(string.Format("   Thr: <b>{0:F0}%</b> | Brk: <b>{1:F0}%</b> | Dyn: <b>{2:F0}%</b> | Signal: {3} | Obstacle: {4}", throttle, trainBrake, dynBrake, sigStr, obsStr));
 
                         // --- Signal Blocks Section (Collapsible) ---
                         if (isBlocksExpanded)

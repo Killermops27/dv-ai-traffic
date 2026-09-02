@@ -34,6 +34,7 @@ namespace AITraffic.Config
         public bool ShowSignalTags = true;
         public bool HornAtCrossings = true;
         public bool AIDamageImmunity = true;
+        public bool RideAlongMode = false;
 
         // Custom styling cache
         [NonSerialized]
@@ -210,6 +211,7 @@ namespace AITraffic.Config
                 PlayerPriority = GUILayout.Toggle(PlayerPriority, " Player Priority (Signal dispatching prioritizes player train over AI)");
                 HornAtCrossings = GUILayout.Toggle(HornAtCrossings, " Horn at Level Crossings (AI locomotives sound horn approaching crossings)");
                 AIDamageImmunity = GUILayout.Toggle(AIDamageImmunity, " AI Damage Immunity (Disables engine, body, powertrain & wheel damage for AI locos only)");
+                RideAlongMode = GUILayout.Toggle(RideAlongMode, " Ride Along Mode (AI driver ignores player presence so you can ride cab/cars freely)");
                 ShowRouteVisualizer = GUILayout.Toggle(ShowRouteVisualizer, " Show 3D Route Visualization (Draws luminous 3D path line along tracks in world)");
                 ShowSignalTags = GUILayout.Toggle(ShowSignalTags, " Show 3D Signal Tags (Renders in-world floating status tags over upcoming signals)");
                 DebugVisuals = GUILayout.Toggle(DebugVisuals, " Debug Visuals (Render AI monitor, sensors and route gizmos)");

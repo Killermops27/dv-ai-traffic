@@ -207,21 +207,22 @@ namespace AITraffic.Driver
         }
 
         /// <summary>
-        /// Returns Derail Valley standard track speed limit table value for a given curve radius.
-        /// Minimum possible sign speed limit in Derail Valley is 30 km/h (yards and tight turnouts).
+        /// <summary>
+        /// Returns Derail Valley standard track speed limit table value for a given curve radius,
+        /// matching the game's official DV.Signs.SignPlacer thresholds.
         /// </summary>
         /// <param name="radius">Curve radius in meters.</param>
         /// <returns>Speed limit in km/h.</returns>
         public static float GetSignSpeedLimitForRadius(float radius)
         {
-            if (float.IsInfinity(radius) || radius >= 1100.0f) return 120.0f;
-            if (radius >= 850.0f) return 100.0f;
-            if (radius >= 650.0f) return 90.0f;
-            if (radius >= 480.0f) return 80.0f;
-            if (radius >= 340.0f) return 70.0f;
-            if (radius >= 240.0f) return 60.0f;
-            if (radius >= 160.0f) return 50.0f;
-            if (radius >= 100.0f) return 40.0f;
+            if (float.IsInfinity(radius) || radius >= 1200.0f) return 120.0f;
+            if (radius >= 900.0f) return 100.0f;
+            if (radius >= 700.0f) return 90.0f;
+            if (radius >= 360.0f) return 80.0f;
+            if (radius >= 230.0f) return 70.0f;
+            if (radius >= 170.0f) return 60.0f;
+            if (radius >= 130.0f) return 50.0f;
+            if (radius >= 95.0f) return 40.0f;
             return 30.0f;
         }
 
@@ -241,7 +242,81 @@ namespace AITraffic.Driver
 
             float maxLateralAcc = maxG * Gravity; // e.g. 0.5 * 9.80665 = 4.9033 m/s^2
             float vMaxMs = Mathf.Sqrt(maxLateralAcc * radius);
-            return vMaxMs * 3.6f;
+            return Mathf.Max(30.0f, vMaxMs * 3.6f);
+        }
+
+        /// <summary>
+        /// Robust horizontal curvature radius calculator for a track curve.
+        /// Uses Derail Valley's native BezierArcApproximation (matching SignPlacer)
+        /// with a 2D horizontal circumcircle fallback, ignoring elevation/grade changes.
+        /// </summary>
+        public static float CalculateTrackHorizontalRadius(BezierCurve curve)
+        {
+            if (curve == null || curve.pointCount < 2 || curve.length < 0.5f)
+            {
+                return float.PositiveInfinity;
+            }
+
+            try
+            {
+                // 1. Native Derail Valley 2D arc approximation (same method used by game's SignPlacer)
+                var arcs = new List<BezierArcApproximation.Arc>();
+                BezierArcApproximation.CalculateArcs(curve, 1.0f, arcs);
+                if (arcs != null && arcs.Count > 0)
+                {
+                    float minArcRadius = float.PositiveInfinity;
+                    for (int i = 0; i < arcs.Count; i++)
+                    {
+                        var arc = arcs[i];
+                        // Disregard straight lines (r >= 2500m) and tiny micro-transitions (< 8m)
+                        if (arc.r > 0.0f && arc.r < 2500.0f && arc.Length >= 8.0f)
+                        {
+                            if (arc.r < minArcRadius)
+                            {
+                                minArcRadius = arc.r;
+                            }
+                        }
+                    }
+
+                    if (!float.IsInfinity(minArcRadius) && minArcRadius > 0.0f)
+                    {
+                        return minArcRadius;
+                    }
+                    if (arcs.Count > 0)
+                    {
+                        return float.PositiveInfinity; // Straight track
+                    }
+                }
+            }
+            catch
+            {
+                // Fallback below
+            }
+
+            // 2. 2D Horizontal Circumcircle across 3 points in XZ plane (immune to elevation/pitch)
+            try
+            {
+                Vector3 p1 = curve.GetPointAt(0.0f);
+                Vector3 p2 = curve.GetPointAt(0.5f);
+                Vector3 p3 = curve.GetPointAt(1.0f);
+
+                double a = Math.Sqrt((p2.x - p1.x) * (p2.x - p1.x) + (p2.z - p1.z) * (p2.z - p1.z));
+                double b = Math.Sqrt((p3.x - p2.x) * (p3.x - p2.x) + (p3.z - p2.z) * (p3.z - p2.z));
+                double c = Math.Sqrt((p1.x - p3.x) * (p1.x - p3.x) + (p1.z - p3.z) * (p1.z - p3.z));
+
+                double area2 = Math.Abs((p2.x - p1.x) * (p3.z - p1.z) - (p2.z - p1.z) * (p3.x - p1.x));
+                if (area2 < 0.01)
+                {
+                    return float.PositiveInfinity;
+                }
+
+                double r = (a * b * c) / (2.0 * area2);
+                return (float)r;
+            }
+            catch
+            {
+                return float.PositiveInfinity;
+            }
         }
 
         /// <summary>
@@ -269,50 +344,8 @@ namespace AITraffic.Driver
                 }
             }
 
-            // 2. Fallback: sample along arc-length with angular tangent deltas
-            float minRadius = float.PositiveInfinity;
-            try
-            {
-                if (track.curve != null && track.curve.pointCount >= 2 && track.curve.length > 0.5f)
-                {
-                    var curve = track.curve;
-                    float length = curve.length;
-                    int sampleCount = Mathf.Max(6, Mathf.CeilToInt(length / 15.0f));
-
-                    Vector3 prevPoint = curve.GetPointAt(0f);
-                    Vector3 prevTangent = curve.GetTangentAt(0f).normalized;
-
-                    for (int s = 1; s <= sampleCount; s++)
-                    {
-                        float t = (float)s / sampleCount;
-                        Vector3 currentPoint = curve.GetPointAt(t);
-                        Vector3 currentTangent = curve.GetTangentAt(t).normalized;
-
-                        float segmentLen = Vector3.Distance(prevPoint, currentPoint);
-                        if (segmentLen > 0.1f)
-                        {
-                            float angleRad = Vector3.Angle(prevTangent, currentTangent) * Mathf.Deg2Rad;
-                            float curvature = angleRad / segmentLen;
-                            if (curvature > 0.0001f)
-                            {
-                                float r = 1.0f / curvature;
-                                if (r < minRadius)
-                                {
-                                    minRadius = r;
-                                }
-                            }
-                        }
-
-                        prevPoint = currentPoint;
-                        prevTangent = currentTangent;
-                    }
-                }
-            }
-            catch (Exception)
-            {
-                minRadius = float.PositiveInfinity;
-            }
-
+            // 2. Fallback: calculate horizontal radius directly
+            float minRadius = CalculateTrackHorizontalRadius(track.curve);
             _trackRadiusCache[track] = minRadius;
             return minRadius;
         }
@@ -335,7 +368,7 @@ namespace AITraffic.Driver
             float signLimit = GetSignSpeedLimitForRadius(radius);
             float centrifugalLimit = GetCentrifugalSpeedLimit(radius, LateralAccG);
 
-            float trackLimit = Mathf.Min(signLimit, centrifugalLimit);
+            float trackLimit = Mathf.Max(30.0f, Mathf.Min(signLimit, centrifugalLimit));
 
             // 2. Mainline / Station platform tracks: capped at 80 km/h max (or curve limit if lower)
             string trackName = track.name ?? string.Empty;
@@ -469,6 +502,80 @@ namespace AITraffic.Driver
         /// <param name="distanceToSignal">Distance along track to the signal (meters).</param>
         /// <param name="lineSpeedKmh">Current line speed in km/h.</param>
         /// <returns>Speed constraint in km/h.</returns>
+        /// <summary>
+        /// Evaluates the allowed passing speed (in km/h) when traversing this signal mast.
+        /// Handles m/s to km/h conversion from DVSignals AspectBaseDefinition and differentiates
+        /// between immediate signal restrictions and advance distant warnings (NEXT_).
+        /// </summary>
+        public static float ResolveAspectPassingSpeedKmh(IAspect aspect, AspectBaseDefinition def, string aspectId, float lineSpeedKmh)
+        {
+            if (aspect == null) return lineSpeedKmh;
+
+            bool disallowPassing = aspect.DisallowPassing || (def != null && def.DisallowPassing);
+            if (disallowPassing) return 0.0f;
+
+            string id = (aspectId ?? string.Empty).ToUpperInvariant();
+
+            // 1. Pure Distant Indications (NEXT_RESTRICTED, NEXT_STOP, NEXT_CAUTION, NEXT_CLEAR)
+            // When the aspect is "NEXT_..." (without a leading RESTRICTED_), the main signal head is GREEN/CLEAR.
+            // The passing speed at THIS mast is full line speed; the caution applies to the subsequent block.
+            if (id.StartsWith("NEXT_") || id.Contains("DISTANT") || id.Contains("REPEATER") || id.Contains("VR"))
+            {
+                return lineSpeedKmh;
+            }
+
+            // 2. Explicit DVSignals PassingSpeed definition
+            if (def != null && def.UsePassingSpeed && def.PassingSpeed > 0f)
+            {
+                // DVSignals stores physical PassingSpeed in m/s (e.g. 2.11 m/s = 7.6 km/h, 11.11 m/s = 40 km/h)
+                float speedKmh = (def.PassingSpeed <= 35.0f) ? (def.PassingSpeed * 3.6f) : def.PassingSpeed;
+                return Mathf.Max(25.0f, speedKmh);
+            }
+
+            // 3. Main Signal Aspect Classification
+            if (id.Contains("RESTRICT") || id.Contains("HP2") || id.Contains("YELLOW") ||
+                id.Contains("SLOW") || id.Contains("CAUTION") || id.Contains("DIVERGING"))
+            {
+                return DefaultYellowSignalSpeedKmh; // 40 km/h
+            }
+
+            // 4. Clear / Green / Shunting Permitted
+            return lineSpeedKmh;
+        }
+
+        /// <summary>
+        /// Checks if the aspect gives an advance warning for a restriction or stop at the NEXT downstream signal.
+        /// </summary>
+        public static bool TryGetDistantWarningTarget(IAspect aspect, AspectBaseDefinition def, string aspectId, out float targetSpeedKmh)
+        {
+            targetSpeedKmh = MaxNetworkSpeedKmh;
+            if (aspect == null) return false;
+
+            string id = (aspectId ?? string.Empty).ToUpperInvariant();
+
+            if (id.Contains("NEXT_STOP") || id.Contains("VR0") || id.Contains("DISTANT_STOP"))
+            {
+                targetSpeedKmh = 0.0f;
+                return true;
+            }
+
+            if (id.Contains("NEXT_RESTRICTED") || id.Contains("VR2") || id.Contains("NEXT_CAUTION") ||
+                id.Contains("NEXT_SLOW") || id.Contains("NEXT_DIVERGING") || id.Contains("DISTANT_CAUTION"))
+            {
+                targetSpeedKmh = DefaultYellowSignalSpeedKmh; // 40 km/h
+                return true;
+            }
+
+            return false;
+        }
+
+        /// <summary>
+        /// Evaluates the target speed for an approaching DVSignals signal.
+        /// </summary>
+        /// <param name="signal">Approaching signal instance.</param>
+        /// <param name="distanceToSignal">Distance along track to the signal (meters).</param>
+        /// <param name="lineSpeedKmh">Current line speed in km/h.</param>
+        /// <returns>Speed constraint in km/h.</returns>
         public float EvaluateSignalTargetSpeed(DVSignal signal, float distanceToSignal, float lineSpeedKmh)
         {
             if (signal == null || !signal.IsOn)
@@ -484,37 +591,7 @@ namespace AITraffic.Driver
 
             AspectBaseDefinition def = currentAspect.GetDefinition();
             bool disallowPassing = currentAspect.DisallowPassing || (def != null && def.DisallowPassing);
-
             string aspectId = currentAspect.Id ?? string.Empty;
-            bool isDistant = aspectId.IndexOf("DISTANT", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                             aspectId.IndexOf("REPEATER", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                             aspectId.IndexOf("VR", StringComparison.OrdinalIgnoreCase) >= 0;
-
-            if (isDistant)
-            {
-                bool expectsStopOrCaution = disallowPassing ||
-                                            aspectId.IndexOf("VR0", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                                            aspectId.IndexOf("VR2", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                                            aspectId.IndexOf("STOP", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                                            aspectId.IndexOf("CAUTION", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                                            aspectId.IndexOf("YELLOW", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                                            aspectId.IndexOf("RESTRICT", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                                            aspectId.IndexOf("SLOW", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                                            aspectId.IndexOf("DIVERGING", StringComparison.OrdinalIgnoreCase) >= 0;
-
-                if (expectsStopOrCaution)
-                {
-                    float cautionSpeedKmh = DefaultYellowSignalSpeedKmh;
-                    if (def != null && def.UsePassingSpeed && def.PassingSpeed > 0f)
-                    {
-                        cautionSpeedKmh = def.PassingSpeed;
-                    }
-                    float approachSpeedMs = CalculateBrakingSpeed(KmHToMs(cautionSpeedKmh), distanceToSignal, ServiceDeceleration);
-                    return Mathf.Min(lineSpeedKmh, MsToKmH(approachSpeedMs));
-                }
-
-                return lineSpeedKmh;
-            }
 
             // RED Aspect (Stop signal)
             if (disallowPassing)
@@ -523,30 +600,25 @@ namespace AITraffic.Driver
                 return MsToKmH(stopSpeedMs);
             }
 
-            // Custom passing speed, RESTRICTED, or YELLOW/Hp2 Aspect
-            float passingSpeedKmh = lineSpeedKmh;
-            if (def != null && def.UsePassingSpeed && def.PassingSpeed > 0f)
+            // Distant advance warning
+            float distantTargetKmh;
+            if (TryGetDistantWarningTarget(currentAspect, def, aspectId, out distantTargetKmh))
             {
-                passingSpeedKmh = def.PassingSpeed;
-            }
-            else if (aspectId.IndexOf("YELLOW", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                     aspectId.IndexOf("HP2", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                     aspectId.IndexOf("RESTRICT", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                     aspectId.IndexOf("SLOW", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                     aspectId.IndexOf("CAUTION", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                     aspectId.IndexOf("DIVERGING", StringComparison.OrdinalIgnoreCase) >= 0)
-            {
-                passingSpeedKmh = DefaultYellowSignalSpeedKmh; // 40 km/h
+                if (distantTargetKmh < lineSpeedKmh)
+                {
+                    float approachSpeedMs = CalculateBrakingSpeed(KmHToMs(distantTargetKmh), distanceToSignal, ServiceDeceleration);
+                    return Mathf.Min(lineSpeedKmh, MsToKmH(approachSpeedMs));
+                }
             }
 
-            // Dynamic approach curve towards the signal speed restriction
+            // Main mast passing speed
+            float passingSpeedKmh = ResolveAspectPassingSpeedKmh(currentAspect, def, aspectId, lineSpeedKmh);
             if (passingSpeedKmh < lineSpeedKmh)
             {
                 float approachSpeedMs = CalculateBrakingSpeed(KmHToMs(passingSpeedKmh), distanceToSignal, ServiceDeceleration);
                 return Mathf.Min(lineSpeedKmh, MsToKmH(approachSpeedMs));
             }
 
-            // GREEN / Clear Aspect
             return lineSpeedKmh;
         }
 
@@ -650,7 +722,7 @@ namespace AITraffic.Driver
                 result.CurvatureLimitKmh = GetCentrifugalSpeedLimit(radius, LateralAccG);
             }
 
-            float finalTargetKmh = Mathf.Min(result.TrackLimitKmh, result.CurvatureLimitKmh);
+            float finalTargetKmh = Mathf.Max(30.0f, Mathf.Min(result.TrackLimitKmh, result.CurvatureLimitKmh));
             result.LimitingReason = (result.CurvatureLimitKmh < result.TrackLimitKmh) 
                 ? SpeedLimitReason.CurvatureRadius 
                 : SpeedLimitReason.TrackSignLimit;
@@ -711,47 +783,11 @@ namespace AITraffic.Driver
 
                     AspectBaseDefinition def = aspect.GetDefinition();
                     bool disallowPassing = aspect.DisallowPassing || (def != null && def.DisallowPassing);
-
                     string aspectId = aspect.Id ?? string.Empty;
-                    bool isDistant = aspectId.IndexOf("DISTANT", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                                     aspectId.IndexOf("REPEATER", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                                     aspectId.IndexOf("VR", StringComparison.OrdinalIgnoreCase) >= 0;
 
-                    if (isDistant)
+                    // 1. Red / Stop Aspect (DisallowPassing)
+                    if (disallowPassing)
                     {
-                        // Warning signal aspect: does it warn of Stop (Vr0) or Caution (Vr2 / Restricted)?
-                        bool expectsStopOrCaution = disallowPassing ||
-                                                    aspectId.IndexOf("VR0", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                                                    aspectId.IndexOf("VR2", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                                                    aspectId.IndexOf("STOP", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                                                    aspectId.IndexOf("CAUTION", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                                                    aspectId.IndexOf("YELLOW", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                                                    aspectId.IndexOf("RESTRICT", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                                                    aspectId.IndexOf("SLOW", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                                                    aspectId.IndexOf("DIVERGING", StringComparison.OrdinalIgnoreCase) >= 0;
-
-                        if (expectsStopOrCaution)
-                        {
-                            // Do not stop at the distant mast, but slow train down towards 40 km/h approach speed
-                            float cautionSpeedKmh = DefaultYellowSignalSpeedKmh; // 40 km/h
-                            if (def != null && def.UsePassingSpeed && def.PassingSpeed > 0f)
-                            {
-                                cautionSpeedKmh = def.PassingSpeed;
-                            }
-
-                            float approachMs = CalculateBrakingSpeed(KmHToMs(cautionSpeedKmh), distSig, ServiceDeceleration);
-                            float approachKmh = MsToKmH(approachMs);
-                            if (approachKmh < finalTargetKmh)
-                            {
-                                finalTargetKmh = approachKmh;
-                                result.SignalLimitKmh = approachKmh;
-                                result.LimitingReason = SpeedLimitReason.SignalAspect;
-                            }
-                        }
-                    }
-                    else if (disallowPassing)
-                    {
-                        // RED Main Signal (Hp0 / Stop): calculate dynamic stopping curve to the mast
                         float redStopSpeedMs = CalculateStopBrakingSpeed(distSig, ServiceDeceleration);
                         float redStopSpeedKmh = MsToKmH(redStopSpeedMs);
                         if (redStopSpeedKmh < finalTargetKmh)
@@ -763,22 +799,25 @@ namespace AITraffic.Driver
                     }
                     else
                     {
-                        // Passing speed restriction for diverging or caution main aspects
-                        float passSpeedKmh = MaxNetworkSpeedKmh;
-                        if (def != null && def.UsePassingSpeed && def.PassingSpeed > 0f)
+                        // 2. Distant Advance Warning (NEXT_RESTRICTED, NEXT_STOP, VR2, etc.)
+                        float distantTargetKmh;
+                        if (TryGetDistantWarningTarget(aspect, def, aspectId, out distantTargetKmh))
                         {
-                            passSpeedKmh = def.PassingSpeed;
-                        }
-                        else if (aspectId.IndexOf("YELLOW", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                                 aspectId.IndexOf("HP2", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                                 aspectId.IndexOf("RESTRICT", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                                 aspectId.IndexOf("SLOW", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                                 aspectId.IndexOf("CAUTION", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                                 aspectId.IndexOf("DIVERGING", StringComparison.OrdinalIgnoreCase) >= 0)
-                        {
-                            passSpeedKmh = DefaultYellowSignalSpeedKmh; // 40 km/h
+                            if (distantTargetKmh < finalTargetKmh)
+                            {
+                                float approachMs = CalculateBrakingSpeed(KmHToMs(distantTargetKmh), distSig, ServiceDeceleration);
+                                float approachKmh = MsToKmH(approachMs);
+                                if (approachKmh < finalTargetKmh)
+                                {
+                                    finalTargetKmh = approachKmh;
+                                    result.SignalLimitKmh = approachKmh;
+                                    result.LimitingReason = SpeedLimitReason.SignalAspect;
+                                }
+                            }
                         }
 
+                        // 3. Main Mast Passing Speed Restriction (RESTRICTED, DIVERGING, HP2, etc.)
+                        float passSpeedKmh = ResolveAspectPassingSpeedKmh(aspect, def, aspectId, MaxNetworkSpeedKmh);
                         if (passSpeedKmh < finalTargetKmh)
                         {
                             float approachMs = CalculateBrakingSpeed(KmHToMs(passSpeedKmh), distSig, ServiceDeceleration);

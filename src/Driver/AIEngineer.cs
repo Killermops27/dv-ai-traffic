@@ -123,6 +123,7 @@ namespace AITraffic.Driver
         public float CurrentReverser { get { return _currentReverser; } }
 
         public DM3TransmissionController DM3Controller { get { return _dm3Controller; } }
+        public SpeedProfileResult CurrentSpeedProfile { get; private set; }
         public float SpawnTime { get; private set; }
         public float StationaryTimer { get; private set; }
 
@@ -683,7 +684,7 @@ namespace AITraffic.Driver
                                 if (isJunctionInPlayerBlock) break;
                             }
 
-                            if (isJunctionInPlayerBlock || AITraffic.Navigation.SignalRegistry.IsJunctionOccupiedByPlayer(junction))
+                            if (isJunctionInPlayerBlock || AITraffic.Navigation.SignalRegistry.IsJunctionOccupiedByPlayer(junction, _trainCar != null ? _trainCar.trainset : null))
                             {
                                 // Do not throw or lock switches in a block occupied by the player!
                                 prevSwitchTrack = trackB;
@@ -907,7 +908,7 @@ namespace AITraffic.Driver
                 bool isPlannedBlocked = false;
                 for (int p = divergePathIdx + 1; p < CurrentPath.Tracks.Count && p < divergePathIdx + 6; p++)
                 {
-                    if (AITraffic.Navigation.SignalRegistry.IsTrackOccupiedByPlayer(CurrentPath.Tracks[p]))
+                    if (AITraffic.Navigation.SignalRegistry.IsTrackOccupiedByPlayer(CurrentPath.Tracks[p], _trainCar != null ? _trainCar.trainset : null))
                     {
                         isPlannedBlocked = true;
                         break;
@@ -968,7 +969,7 @@ namespace AITraffic.Driver
             // 2a. No track in the aligned route may be occupied by the player
             for (int i = 0; i < alignedRouteTracks.Count; i++)
             {
-                if (AITraffic.Navigation.SignalRegistry.IsTrackOccupiedByPlayer(alignedRouteTracks[i]))
+                if (AITraffic.Navigation.SignalRegistry.IsTrackOccupiedByPlayer(alignedRouteTracks[i], _trainCar != null ? _trainCar.trainset : null))
                     return false;
             }
 
@@ -1109,6 +1110,7 @@ namespace AITraffic.Driver
                 isTerminusStop: IsTerminusDestination
             );
 
+            CurrentSpeedProfile = profile;
             TargetSpeedKmh = profile.TargetSpeedKmh;
             TargetSpeedMs = profile.TargetSpeedMs;
         }

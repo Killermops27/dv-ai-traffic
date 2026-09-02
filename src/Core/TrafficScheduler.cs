@@ -390,8 +390,15 @@ namespace AITraffic.Core
                         }
                     }
 
-                    // Spawn ambient consist
-                    AIEngineer engineer = TrainSpawner.SpawnAITrain(spawnTrack, corridor.PreferredConsist, startSpan: startSpan, flipTrainConsist: flipConsist, rng: _rng);
+                    // Spawn ambient consist with industry-matched cargo
+                    AIEngineer engineer = TrainSpawner.SpawnAITrain(
+                        spawnTrack,
+                        corridor.PreferredConsist,
+                        originYard: corridor.OriginYardId,
+                        destYard: corridor.DestinationYardId,
+                        startSpan: startSpan,
+                        flipTrainConsist: flipConsist,
+                        rng: _rng);
                     if (engineer == null)
                         continue;
 
@@ -529,12 +536,20 @@ namespace AITraffic.Core
                                 }
                             }
 
-                            AIEngineer engineer = TrainSpawner.SpawnAITrain(spawnTrack, inferredConsist, startSpan: startSpan, flipTrainConsist: flipConsist, rng: _rng);
+                            string origYard = (station.stationInfo != null && !string.IsNullOrEmpty(station.stationInfo.YardID)) ? station.stationInfo.YardID : "ORIG";
+                            string destYard = (candidateDest.stationInfo != null && !string.IsNullOrEmpty(candidateDest.stationInfo.YardID)) ? candidateDest.stationInfo.YardID : "DEST";
+
+                            AIEngineer engineer = TrainSpawner.SpawnAITrain(
+                                spawnTrack,
+                                inferredConsist,
+                                originYard: origYard,
+                                destYard: destYard,
+                                startSpan: startSpan,
+                                flipTrainConsist: flipConsist,
+                                rng: _rng);
                             if (engineer != null)
                             {
                                 engineer.CurrentPath = fallbackPath;
-                                string origYard = (station.stationInfo != null && !string.IsNullOrEmpty(station.stationInfo.YardID)) ? station.stationInfo.YardID : "ORIG";
-                                string destYard = (candidateDest.stationInfo != null && !string.IsNullOrEmpty(candidateDest.stationInfo.YardID)) ? candidateDest.stationInfo.YardID : "DEST";
                                 string origName = (station.stationInfo != null && !string.IsNullOrEmpty(station.stationInfo.Name)) 
                                     ? string.Format("{0} [{1}]", station.stationInfo.Name, origYard)
                                     : origYard;

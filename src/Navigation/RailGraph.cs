@@ -520,46 +520,9 @@ namespace AITraffic.Navigation
 
                 edge.Grade = horizontalDist > 0.1f ? (deltaY / horizontalDist) * 100f : 0f;
 
-                int sampleCount = Mathf.Max(6, Mathf.CeilToInt(length / 10f));
-                float maxCurvature = 0f;
-                float minRadius = float.PositiveInfinity;
-
-                Vector3 prevPoint = curve.GetPointAt(0f);
-                Vector3 prevTangent = curve.GetTangentAt(0f).normalized;
-
-                for (int s = 1; s <= sampleCount; s++)
-                {
-                    float t = (float)s / sampleCount;
-                    Vector3 currentPoint = curve.GetPointAt(t);
-                    Vector3 currentTangent = curve.GetTangentAt(t).normalized;
-
-                    float segmentLen = Vector3.Distance(prevPoint, currentPoint);
-                    if (segmentLen > 0.01f)
-                    {
-                        float angleRad = Vector3.Angle(prevTangent, currentTangent) * Mathf.Deg2Rad;
-                        float curvature = angleRad / segmentLen;
-
-                        if (curvature > maxCurvature)
-                        {
-                            maxCurvature = curvature;
-                        }
-
-                        if (curvature > 0.0001f)
-                        {
-                            float radius = 1f / curvature;
-                            if (radius < minRadius)
-                            {
-                                minRadius = radius;
-                            }
-                        }
-                    }
-
-                    prevPoint = currentPoint;
-                    prevTangent = currentTangent;
-                }
-
-                edge.Curvature = maxCurvature;
+                float minRadius = AITraffic.Driver.SpeedProfileGenerator.CalculateTrackHorizontalRadius(curve);
                 edge.MinRadius = minRadius;
+                edge.Curvature = float.IsInfinity(minRadius) || minRadius <= 0f ? 0f : (1f / minRadius);
             }
 
             for (int n = 0; n < Nodes.Count; n++)
@@ -649,14 +612,14 @@ namespace AITraffic.Navigation
                 float radius = edge.MinRadius;
                 float geoLimit;
 
-                if (float.IsInfinity(radius) || radius >= 1100f) geoLimit = 120f;
-                else if (radius >= 850f) geoLimit = 100f;
-                else if (radius >= 650f) geoLimit = 90f;
-                else if (radius >= 480f) geoLimit = 80f;
-                else if (radius >= 340f) geoLimit = 70f;
-                else if (radius >= 240f) geoLimit = 60f;
-                else if (radius >= 160f) geoLimit = 50f;
-                else if (radius >= 100f) geoLimit = 40f;
+                if (float.IsInfinity(radius) || radius >= 1200f) geoLimit = 120f;
+                else if (radius >= 900f) geoLimit = 100f;
+                else if (radius >= 700f) geoLimit = 90f;
+                else if (radius >= 360f) geoLimit = 80f;
+                else if (radius >= 230f) geoLimit = 70f;
+                else if (radius >= 170f) geoLimit = 60f;
+                else if (radius >= 130f) geoLimit = 50f;
+                else if (radius >= 95f) geoLimit = 40f;
                 else geoLimit = 30f;
 
                 string tName = edge.Track != null ? (edge.Track.name ?? string.Empty) : string.Empty;
