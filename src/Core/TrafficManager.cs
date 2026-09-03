@@ -153,10 +153,7 @@ namespace AITraffic.Core
             // 1. Synchronize active engineers list
             RefreshActiveEngineers();
 
-            // 2. Update Tier 2 Real-Job assignments
-            JobOperator.Instance.UpdateActiveAssignments(deltaTime);
-
-            // 3. Periodic despawn safety checks for out-of-range trains
+            // 2. Periodic despawn safety checks for out-of-range trains
             _despawnCheckTimer += deltaTime;
             if (_despawnCheckTimer >= DespawnCheckInterval)
             {
@@ -802,11 +799,6 @@ namespace AITraffic.Core
                 {
                     bool ok = TrafficScheduler.Instance.DispatchTier1Ambient();
                     _lastDispatchStatus = ok ? "<color=#00FF88>Ambient train dispatched successfully!</color>" : "<color=#FF4444>No clear corridor / departure track available.</color>";
-                }
-                if (GUILayout.Button("Spawn Real Job", GUILayout.Height(22)))
-                {
-                    bool ok = TrafficScheduler.Instance.DispatchTier2Job();
-                    _lastDispatchStatus = ok ? "<color=#00FF88>Real Job train dispatched successfully!</color>" : "<color=#FFCC00>No unreserved jobs found.</color>";
                 }
                 if (GUILayout.Button("Despawn All", GUILayout.Height(22)))
                 {

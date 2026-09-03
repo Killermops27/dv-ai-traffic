@@ -29,7 +29,7 @@ namespace AITraffic.Core
 
     /// <summary>
     /// Schedules and coordinates periodic train departures across major stations in the valley.
-    /// Dispatches Tier 1 ambient runs and Tier 2 job runs according to user settings and traffic density.
+    /// Dispatches Tier 1 ambient runs according to user settings and traffic density.
     /// </summary>
     public class TrafficScheduler
     {
@@ -258,9 +258,6 @@ namespace AITraffic.Core
         public bool ForceDispatch(AITrafficSettings settings)
         {
             _lastDispatchTime = Time.time;
-            TrafficMode mode = settings != null ? settings.Mode : TrafficMode.Hybrid;
-            if (mode == TrafficMode.RealJobsOnly)
-                return DispatchTier2Job();
             return DispatchTier1Ambient();
         }
 
@@ -268,24 +265,9 @@ namespace AITraffic.Core
         {
             try
             {
-                TrafficMode mode = settings != null ? settings.Mode : TrafficMode.Hybrid;
-
-                if (mode == TrafficMode.RealJobsOnly)
-                {
-                    DispatchTier2Job();
-                }
-                else if (mode == TrafficMode.AmbientOnly)
+                if (currentCount < maxCount)
                 {
                     DispatchTier1Ambient();
-                }
-                else // Hybrid
-                {
-                    // In Hybrid mode, try to dispatch a real job first; fallback to ambient if none available
-                    bool jobDispatched = DispatchTier2Job();
-                    if (!jobDispatched && currentCount < maxCount)
-                    {
-                        DispatchTier1Ambient();
-                    }
                 }
             }
             catch (Exception ex)
@@ -582,30 +564,6 @@ namespace AITraffic.Core
             {
                 if (Main.ModEntry != null && Main.ModEntry.Logger != null)
                     Main.ModEntry.Logger.Error(string.Format("Error dispatching Tier 1 ambient train: {0}", ex));
-                return false;
-            }
-        }
-
-        /// <summary>
-        /// Dispatches a Tier 2 real-job AI train using JobOperator.
-        /// </summary>
-        public bool DispatchTier2Job()
-        {
-            try
-            {
-                var availableJobs = JobOperator.Instance.ScanAvailableJobs();
-                if (availableJobs == null || availableJobs.Count == 0)
-                    return false;
-
-                // Pick first suitable job
-                Job targetJob = availableJobs[0];
-                var assignment = JobOperator.Instance.ClaimAndDispatchJob(targetJob);
-                return assignment != null;
-            }
-            catch (Exception ex)
-            {
-                if (Main.ModEntry != null && Main.ModEntry.Logger != null)
-                    Main.ModEntry.Logger.Error(string.Format("Error dispatching Tier 2 job train: {0}", ex));
                 return false;
             }
         }

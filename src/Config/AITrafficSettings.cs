@@ -7,9 +7,7 @@ namespace AITraffic.Config
 {
     public enum TrafficMode
     {
-        AmbientOnly,
-        RealJobsOnly,
-        Hybrid
+        Ambient
     }
 
     public enum TrafficDensity
@@ -22,7 +20,7 @@ namespace AITraffic.Config
 
     public class AITrafficSettings : UnityModManager.ModSettings
     {
-        public TrafficMode Mode = TrafficMode.Hybrid;
+        public TrafficMode Mode = TrafficMode.Ambient;
         public TrafficDensity Density = TrafficDensity.Medium;
         public bool PlayerPriority = true;
         public float MaxActiveTrains = 4f;
@@ -116,29 +114,8 @@ namespace AITraffic.Config
                 GUILayout.Space(4);
 
                 // --- TRAFFIC MODE ---
-                GUILayout.Label("Traffic Operating Mode", subHeaderStyle);
-                var prevMode = Mode;
-                string[] modeNames = { "Ambient Only", "Real Jobs Only", "Hybrid" };
-                Mode = (TrafficMode)GUILayout.Toolbar((int)Mode, modeNames);
-                if (Mode != prevMode)
-                {
-                    // Clamp or adjust settings if mode changed
-                }
-
-                string modeDescription = string.Empty;
-                switch (Mode)
-                {
-                    case TrafficMode.AmbientOnly:
-                        modeDescription = "Ambient Only: AI trains run on schedules purely for world immersion (spawned & despawned dynamically).";
-                        break;
-                    case TrafficMode.RealJobsOnly:
-                        modeDescription = "Real Jobs Only: AI trains execute actual station haul and freight jobs across the valley.";
-                        break;
-                    case TrafficMode.Hybrid:
-                        modeDescription = "Hybrid: Dynamic mix of background ambient trains and freight job runners.";
-                        break;
-                }
-                GUILayout.Label(modeDescription, descStyle);
+                GUILayout.Label("Traffic Operating Mode: <b>Ambient Immersion</b>", subHeaderStyle);
+                GUILayout.Label("Ambient trains run on schedules for valley immersion. Player-employed AI Workers can be commissioned separately via the Worker Dispatcher.", descStyle);
                 GUILayout.Space(8);
 
                 // --- TRAFFIC DENSITY ---
