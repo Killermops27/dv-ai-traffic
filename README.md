@@ -47,11 +47,15 @@ Built with cross-mod interoperability in mind:
 
 ---
 
-## 📦 Requirements & Prerequisites
+## 📦 Requirements & Recommendations
 
+### Required:
 1. **[Derail Valley](https://store.steampowered.com/app/588030/Derail_Valley/)** (PC / Steam release)
 2. **[Unity Mod Manager (UMM)](https://www.nexusmods.com/site/mods/21)** (v0.27.0 or newer, configured for Doorstop / Assembly Injection)
 3. **[DVSignals](https://github.com/WhistleWiz/dv-signals)** installed in your `Derail Valley/Mods/` directory
+
+### Strongly Recommended:
+* **Double Track (`DoubleTrack`)**: Highly recommended for smooth traffic flow. Double track sections provide bi-directional passing capacity, significantly mitigating single-track traffic bottlenecks and deadlocks between ambient AI trains and player operations.
 
 ---
 
