@@ -18,6 +18,13 @@ namespace AITraffic.Config
         Dense
     }
 
+    public enum StationWakeUpMode
+    {
+        Disabled,
+        WorkerTrainsOnly,
+        AllAITrains
+    }
+
     public class AITrafficSettings : UnityModManager.ModSettings
     {
         public TrafficMode Mode = TrafficMode.Ambient;
@@ -28,11 +35,14 @@ namespace AITraffic.Config
         public float SpawnDistanceMax = 2500f;
         public float DespawnDistance = 3000f;
         public bool DebugVisuals = false;
-        public bool ShowRouteVisualizer = true;
-        public bool ShowSignalTags = true;
+        public bool ShowRouteVisualizer = false;
+        public bool ShowSignalTags = false;
+        public bool ShowLocoTags = false;
         public bool HornAtCrossings = true;
         public bool AIDamageImmunity = true;
         public bool RideAlongMode = false;
+        public StationWakeUpMode StationWakeUp = StationWakeUpMode.WorkerTrainsOnly;
+        public bool ReserveArrivalTrackFirst = true;
 
         // Custom styling cache
         [NonSerialized]
@@ -189,6 +199,7 @@ namespace AITraffic.Config
                 HornAtCrossings = GUILayout.Toggle(HornAtCrossings, " Horn at Level Crossings (AI locomotives sound horn approaching crossings)");
                 AIDamageImmunity = GUILayout.Toggle(AIDamageImmunity, " AI Damage Immunity (Disables engine, body, powertrain & wheel damage for AI locos only)");
                 RideAlongMode = GUILayout.Toggle(RideAlongMode, " Ride Along Mode (AI driver ignores player presence so you can ride cab/cars freely)");
+                ShowLocoTags = GUILayout.Toggle(ShowLocoTags, " Show 3D Locomotive Tags (Renders in-world floating nametags above AI locomotives)");
                 ShowRouteVisualizer = GUILayout.Toggle(ShowRouteVisualizer, " Show 3D Route Visualization (Draws luminous 3D path line along tracks in world)");
                 ShowSignalTags = GUILayout.Toggle(ShowSignalTags, " Show 3D Signal Tags (Renders in-world floating status tags over upcoming signals)");
                 DebugVisuals = GUILayout.Toggle(DebugVisuals, " Debug Visuals (Render AI monitor, sensors and route gizmos)");
@@ -198,10 +209,31 @@ namespace AITraffic.Config
                 // --- MOD COMPATIBILITY STATUS ---
                 GUILayout.Label("Mod Compatibility Status", subHeaderStyle);
                 DrawCompatItem("DVSignals (Signaling & Interlocking)", ModCompatManager.IsDVSignalsLoaded, true);
+                DrawCompatItem("CommsRadioAPI (In-Game Dispatcher Mode)", ModCompatManager.IsCommsRadioAPILoaded, true);
                 DrawCompatItem("DoubleTrack (Multi-track mainline routing)", ModCompatManager.IsDoubleTrackLoaded, false);
                 DrawCompatItem("PersistentJobs (Job-car isolation)", ModCompatManager.IsPersistentJobsLoaded, false);
                 DrawCompatItem("SelfShunt / YardMaster (Yard shunting exclusion)", ModCompatManager.IsYardMasterLoaded, false);
                 DrawCompatItem("PassengerJobs (Station platform routing)", ModCompatManager.IsPassengerJobsLoaded, false);
+
+                // --- AI STATION LOADING & PERSISTENCE ---
+                GUILayout.Space(12);
+                GUILayout.Label("AI Station Loading & Persistence", subHeaderStyle);
+                GUILayout.Label("Controls dynamic station yard loading and car persistence when AI trains arrive.", descStyle);
+
+                GUILayout.BeginHorizontal();
+                GUILayout.Label("Station Wake-Up Mode:", GUILayout.Width(240));
+                if (GUILayout.Button(string.Format("Mode: {0}", StationWakeUp), GUILayout.Width(180)))
+                {
+                    if (StationWakeUp == StationWakeUpMode.WorkerTrainsOnly) StationWakeUp = StationWakeUpMode.AllAITrains;
+                    else if (StationWakeUp == StationWakeUpMode.AllAITrains) StationWakeUp = StationWakeUpMode.Disabled;
+                    else StationWakeUp = StationWakeUpMode.WorkerTrainsOnly;
+                }
+                GUILayout.EndHorizontal();
+
+                GUILayout.BeginHorizontal();
+                GUILayout.Label("Reserve Arrival Track First:", GUILayout.Width(240));
+                ReserveArrivalTrackFirst = GUILayout.Toggle(ReserveArrivalTrackFirst, ReserveArrivalTrackFirst ? "Enabled (Recommended)" : "Disabled (Pure Persistence)");
+                GUILayout.EndHorizontal();
 
                 GUILayout.EndVertical();
             }

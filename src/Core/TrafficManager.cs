@@ -54,6 +54,7 @@ namespace AITraffic.Core
 
         private float _despawnCheckTimer = 0f;
         private const float DespawnCheckInterval = 5.0f;
+        private bool _showWorkerDispatcher = false;
 
         #region Unity Lifecycle
 
@@ -160,6 +161,9 @@ namespace AITraffic.Core
                 _despawnCheckTimer = 0f;
                 CheckDespawnEligibleTrains();
             }
+
+            // 3. Update player-employed AI worker tasks
+            AITraffic.Workers.WorkerManager.Instance.Update(deltaTime);
 
             // 4. Update traffic scheduler to maintain active train density
             int maxAllowed = _settings != null ? (int)_settings.MaxActiveTrains : 4;
@@ -327,6 +331,12 @@ namespace AITraffic.Core
                 if (engineer == null || engineer.TrainCar == null || engineer.TrainCar.trainset == null)
                 {
                     _activeEngineers.RemoveAt(i);
+                    continue;
+                }
+
+                // AI Worker trains are player property/consists and must NEVER be despawned!
+                if (engineer.IsWorkerDriven)
+                {
                     continue;
                 }
 
@@ -522,7 +532,7 @@ namespace AITraffic.Core
 
         private void Update3DRouteVisualizer()
         {
-            bool showVisuals = _settings == null || _settings.ShowRouteVisualizer;
+            bool showVisuals = _settings != null && _settings.ShowRouteVisualizer;
             if (!showVisuals)
             {
                 for (int i = 0; i < _routeLineRenderers.Count; i++)
@@ -756,14 +766,17 @@ namespace AITraffic.Core
 
             InitStyles();
 
+            // Draw floating toast notifications for worker hiring and arrival
+            AITraffic.Workers.WorkerManager.Instance.DrawToastGUI();
+
             // 1. Draw Master Debug Monitor (HUD)
-            bool showHud = _settings == null || _settings.DebugVisuals;
+            bool showHud = _settings != null && _settings.DebugVisuals;
             if (showHud)
             {
                 float screenW = Screen.width;
                 float screenH = Screen.height;
-                float boxWidth = 550f;
-                float boxHeight = Mathf.Min(600f, screenH - 100f);
+                float boxWidth = _showWorkerDispatcher ? 680f : 640f;
+                float boxHeight = _showWorkerDispatcher ? Mathf.Min(780f, screenH - 80f) : Mathf.Min(600f, screenH - 100f);
 
                 Rect hudRect = new Rect(20f, 50f, boxWidth, boxHeight);
 
@@ -779,12 +792,20 @@ namespace AITraffic.Core
                 GUILayout.Label("<size=13><b>[AI Traffic Debug Monitor]</b></size>");
                 if (_settings != null)
                 {
+                    _settings.ShowLocoTags = GUILayout.Toggle(_settings.ShowLocoTags, " 3D Locos", GUILayout.Width(78));
                     _settings.ShowRouteVisualizer = GUILayout.Toggle(_settings.ShowRouteVisualizer, " 3D Path", GUILayout.Width(72));
                     _settings.ShowSignalTags = GUILayout.Toggle(_settings.ShowSignalTags, " 3D Signals", GUILayout.Width(86));
                     _settings.RideAlongMode = GUILayout.Toggle(_settings.RideAlongMode, " Ride Along", GUILayout.Width(90));
                 }
+                _showWorkerDispatcher = GUILayout.Toggle(_showWorkerDispatcher, " 👷 Workers", GUILayout.Width(92));
                 GUILayout.EndHorizontal();
                 GUILayout.Space(2f);
+
+                if (_showWorkerDispatcher)
+                {
+                    AITraffic.Workers.WorkerManager.Instance.DrawWorkerDispatcherGUI();
+                    GUILayout.Space(6f);
+                }
 
                 string rideStatus = (_settings != null && _settings.RideAlongMode) ? " | <color=#00FF88><b>Ride-Along: Active</b></color>" : "";
                 GUILayout.Label(string.Format("<b>Mode:</b> {0} | <b>Density:</b> {1} | <b>Max Trains:</b> {2}{3}",
@@ -821,7 +842,8 @@ namespace AITraffic.Core
                 }
                 else
                 {
-                    _hudScrollPos = GUILayout.BeginScrollView(_hudScrollPos, GUILayout.Height(boxHeight - 150f));
+                    float scrollHeight = _showWorkerDispatcher ? Mathf.Max(120f, boxHeight - 480f) : (boxHeight - 150f);
+                    _hudScrollPos = GUILayout.BeginScrollView(_hudScrollPos, GUILayout.Height(scrollHeight));
                     for (int i = 0; i < _activeEngineers.Count; i++)
                     {
                         var eng = _activeEngineers[i];
@@ -982,22 +1004,25 @@ namespace AITraffic.Core
             Camera cam = _mainCamera;
             if (cam != null)
             {
-                // Active AI Train Nametags
-                for (int i = 0; i < _activeEngineers.Count; i++)
+                // Active AI Train Nametags (rendered only when toggled on in debug monitor or settings)
+                if (_settings != null && _settings.ShowLocoTags)
                 {
-                    var eng = _activeEngineers[i];
-                    if (eng == null || eng.TrainCar == null) continue;
-
-                    Vector3 worldPos = eng.TrainCar.transform.position + Vector3.up * 3.2f;
-                    Vector3 screenPos = cam.WorldToScreenPoint(worldPos);
-
-                    if (screenPos.z > 0f && screenPos.z < 1500f)
+                    for (int i = 0; i < _activeEngineers.Count; i++)
                     {
-                        float guiY = Screen.height - screenPos.y;
-                        string destShort = !string.IsNullOrEmpty(eng.DestinationStationName) ? eng.DestinationStationName : "Open Line";
-                        string tag = string.Format("<color=#FFD700><b>[AI: {0}]</b></color>\n<color=white>{1:F0} km/h ({2})</color>\n<color=#98FB98>➜ {3}</color>",
-                            eng.TrainCar.ID, eng.CurrentSpeedKmh, eng.State, destShort);
-                        GUI.Label(new Rect(screenPos.x - 120f, guiY - 30f, 240f, 60f), tag, _nameTagStyle);
+                        var eng = _activeEngineers[i];
+                        if (eng == null || eng.TrainCar == null) continue;
+
+                        Vector3 worldPos = eng.TrainCar.transform.position + Vector3.up * 3.2f;
+                        Vector3 screenPos = cam.WorldToScreenPoint(worldPos);
+
+                        if (screenPos.z > 0f && screenPos.z < 1500f)
+                        {
+                            float guiY = Screen.height - screenPos.y;
+                            string destShort = !string.IsNullOrEmpty(eng.DestinationStationName) ? eng.DestinationStationName : "Open Line";
+                            string tag = string.Format("<color=#FFD700><b>[AI: {0}]</b></color>\n<color=white>{1:F0} km/h ({2})</color>\n<color=#98FB98>➜ {3}</color>",
+                                eng.TrainCar.ID, eng.CurrentSpeedKmh, eng.State, destShort);
+                            GUI.Label(new Rect(screenPos.x - 120f, guiY - 30f, 240f, 60f), tag, _nameTagStyle);
+                        }
                     }
                 }
 

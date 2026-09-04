@@ -90,6 +90,11 @@ namespace AITraffic.Navigation
         /// </summary>
         public float MaxSearchDistance { get; set; }
 
+        /// <summary>
+        /// Optional Trainset belonging to the requester. Cars belonging to this trainset are ignored during occupancy checks.
+        /// </summary>
+        public Trainset RequesterTrainset { get; set; }
+
         public PathfinderOptions()
         {
             AllowWrongDirection = true;
@@ -103,10 +108,11 @@ namespace AITraffic.Navigation
             StrictlyAvoidReserved = false;
             PreventPlayerOvertake = true;
             Requester = null;
+            RequesterTrainset = null;
             TurnoutDivergingPenalty = 40f;
             YardTrackPenaltyPerMeter = 1.5f;
             PreferSpeedOverDistance = true;
-            MaxSearchDistance = 150000f;
+            MaxSearchDistance = 5000000f;
         }
     }
 
@@ -550,9 +556,18 @@ namespace AITraffic.Navigation
 
             SearchNode goalNode = null;
 
+            int exploredNodes = 0;
+            int prunedByDist = 0;
+            int prunedByBestG = 0;
+            float maxGScoreReached = 0f;
+
             while (openSet.Count > 0)
             {
                 var current = openSet.Pop();
+                exploredNodes++;
+
+                if (current.GScore > maxGScoreReached)
+                    maxGScoreReached = current.GScore;
 
                 // Check destination reached
                 if (destEdge != null && current.IncomingEdge == destEdge)
@@ -568,12 +583,16 @@ namespace AITraffic.Navigation
                 }
 
                 if (current.GScore > options.MaxSearchDistance)
+                {
+                    prunedByDist++;
                     continue;
+                }
 
                 long currentKey = GetStateKey(current.Node.Id, current.IncomingEdge != null ? current.IncomingEdge.Id : 0);
                 float bestG;
                 if (nodeBestCost.TryGetValue(currentKey, out bestG) && current.GScore > bestG + 0.01f)
                 {
+                    prunedByBestG++;
                     continue;
                 }
 
@@ -589,7 +608,7 @@ namespace AITraffic.Navigation
 
                     float traversalCost;
                     byte requiredBranch;
-                    if (!EvaluateEdgeCost(edge, current.Node, nextNode, current.IncomingEdge, destEdge, options, out traversalCost, out requiredBranch))
+                    if (!EvaluateEdgeCost(edge, current.Node, nextNode, current.IncomingEdge, initialEdge, destEdge, options, out traversalCost, out requiredBranch))
                     {
                         continue;
                     }
@@ -623,10 +642,25 @@ namespace AITraffic.Navigation
 
             if (goalNode == null)
             {
+                if (AITraffic.Main.ModEntry != null && AITraffic.Main.ModEntry.Logger != null)
+                {
+                    string startTrk = initialEdge != null && initialEdge.Track != null ? initialEdge.Track.name : "null";
+                    string destTrk = destEdge != null && destEdge.Track != null ? destEdge.Track.name : "null";
+                    AITraffic.Main.ModEntry.Logger.Log(string.Format("[Pathfinder] Route search failed: '{0}' -> '{1}'. Explored: {2}, OpenRemaining: {3}, MaxG: {4:F0}, PrunedDist: {5}, PrunedBestG: {6}.",
+                        startTrk, destTrk, exploredNodes, openSet.Count, maxGScoreReached, prunedByDist, prunedByBestG));
+                }
                 return null;
             }
 
-            return ReconstructPath(goalNode, initialEdge);
+            var resultPath = ReconstructPath(goalNode, initialEdge);
+            if (resultPath != null && AITraffic.Main.ModEntry != null && AITraffic.Main.ModEntry.Logger != null)
+            {
+                string startTrk = initialEdge != null && initialEdge.Track != null ? initialEdge.Track.name : "null";
+                string destTrk = destEdge != null && destEdge.Track != null ? destEdge.Track.name : "null";
+                AITraffic.Main.ModEntry.Logger.Log(string.Format("[Pathfinder] Route search succeeded: '{0}' -> '{1}'. Explored: {2}, Dist: {3:F0}m, Tracks: {4}.",
+                    startTrk, destTrk, exploredNodes, resultPath.TotalDistance, resultPath.Tracks != null ? resultPath.Tracks.Count : 0));
+            }
+            return resultPath;
         }
 
         private bool EvaluateEdgeCost(
@@ -634,6 +668,7 @@ namespace AITraffic.Navigation
             RailNode fromNode,
             RailNode toNode,
             RailEdge incomingEdge,
+            RailEdge initialEdge,
             RailEdge destEdge,
             PathfinderOptions options,
             out float cost,
@@ -650,10 +685,27 @@ namespace AITraffic.Navigation
                 requiredBranch = _graph.GetRequiredBranch(fromNode, incomingEdge, edge);
             }
 
-            bool isStartOrDest = (destEdge != null && edge == destEdge);
+            bool isStartOrDest = (destEdge != null && edge == destEdge) || (initialEdge != null && edge == initialEdge);
 
-            // Occupancy checks
-            if (options.AvoidOccupiedTracks && !isStartOrDest)
+            // Check if track is occupied by requester's own train cars
+            bool isOccupiedByRequester = false;
+            if (options.RequesterTrainset != null && options.RequesterTrainset.cars != null)
+            {
+                for (int c = 0; c < options.RequesterTrainset.cars.Count; c++)
+                {
+                    var car = options.RequesterTrainset.cars[c];
+                    if (car == null) continue;
+                    if ((car.FrontBogie != null && car.FrontBogie.track == edge.Track) ||
+                        (car.RearBogie != null && car.RearBogie.track == edge.Track))
+                    {
+                        isOccupiedByRequester = true;
+                        break;
+                    }
+                }
+            }
+
+            // Occupancy checks (skip if start/dest or occupied only by requester's own consist)
+            if (options.AvoidOccupiedTracks && !isStartOrDest && !isOccupiedByRequester)
             {
                 bool isOccupied = _graph.IsTrackOccupied(edge.Track);
                 if (isOccupied)
@@ -678,10 +730,15 @@ namespace AITraffic.Navigation
                 }
             }
 
-            // Direct Player Track Occupancy Avoidance
-            if (options.PreventPlayerOvertake && !isStartOrDest)
+            // Direct Player Track Occupancy Avoidance (never applies to start/dest, requester's own train, or AI workers)
+            var eng = options.Requester as AITraffic.Driver.AIEngineer;
+            bool isWorkerOrPlayerLoco = options.RequesterTrainset != null ||
+                                        options.Requester is TrainCar ||
+                                        (eng != null && eng.IsWorkerDriven);
+
+            if (options.PreventPlayerOvertake && !isWorkerOrPlayerLoco && !isStartOrDest && !isOccupiedByRequester)
             {
-                if (SignalRegistry.IsTrackOccupiedByPlayer(edge.Track))
+                if (SignalRegistry.IsTrackOccupiedByPlayer(edge.Track, options.RequesterTrainset))
                 {
                     cost += 2000000f;
                 }
@@ -724,12 +781,41 @@ namespace AITraffic.Navigation
                 }
             }
 
-            // General Yard & Storage Siding Avoidance for through-trains
-            // (Note: Passing sidings [S] and platform loops [P] that connect through are valid running lines)
-            bool isApproachingDest = (destEdge != null && edge.Track != null && destEdge.Track != null && 
-                                     Vector3.Distance(edge.Track.transform.position, destEdge.Track.transform.position) < 400f);
+            // General Yard & Storage Siding Avoidance for through-trains:
+            // Exempt tracks within 2500m of the starting track (leaving origin) or destination track (approaching dest)
+            Vector3 edgeMid = edge.GetMidPoint();
+            bool isLeavingOrigin = (initialEdge != null && Vector3.Distance(edgeMid, initialEdge.GetMidPoint()) < 2500f);
+            bool isApproachingDest = (destEdge != null && Vector3.Distance(edgeMid, destEdge.GetMidPoint()) < 2500f);
 
-            if (!isStartOrDest && !isApproachingDest && (edge.IsYardTrack ||
+            // Also check if tracks share same yard code prefix (e.g. [Y]_[MF]_ or [Y]_[OR]_)
+            if (!isApproachingDest && destEdge != null && destEdge.Track != null)
+            {
+                string destName = destEdge.Track.name ?? string.Empty;
+                if (trackName.Length >= 7 && destName.Length >= 7 &&
+                    trackName.StartsWith("[Y]_", StringComparison.OrdinalIgnoreCase) &&
+                    destName.StartsWith("[Y]_", StringComparison.OrdinalIgnoreCase))
+                {
+                    if (string.Equals(trackName.Substring(4, 2), destName.Substring(4, 2), StringComparison.OrdinalIgnoreCase))
+                    {
+                        isApproachingDest = true;
+                    }
+                }
+            }
+            if (!isLeavingOrigin && initialEdge != null && initialEdge.Track != null)
+            {
+                string initName = initialEdge.Track.name ?? string.Empty;
+                if (trackName.Length >= 7 && initName.Length >= 7 &&
+                    trackName.StartsWith("[Y]_", StringComparison.OrdinalIgnoreCase) &&
+                    initName.StartsWith("[Y]_", StringComparison.OrdinalIgnoreCase))
+                {
+                    if (string.Equals(trackName.Substring(4, 2), initName.Substring(4, 2), StringComparison.OrdinalIgnoreCase))
+                    {
+                        isLeavingOrigin = true;
+                    }
+                }
+            }
+
+            if (!isStartOrDest && !isApproachingDest && !isLeavingOrigin && (edge.IsYardTrack ||
                 trackName.StartsWith("[Y]", StringComparison.OrdinalIgnoreCase) ||
                 trackName.StartsWith("[L]", StringComparison.OrdinalIgnoreCase) ||
                 trackName.StartsWith("[C]", StringComparison.OrdinalIgnoreCase) ||
@@ -738,7 +824,7 @@ namespace AITraffic.Navigation
             {
                 cost += 25000f + (baseDistance * 20f);
             }
-            else if (edge.IsYardTrack && !isApproachingDest)
+            else if (edge.IsYardTrack && !isApproachingDest && !isLeavingOrigin)
             {
                 cost += baseDistance * options.YardTrackPenaltyPerMeter;
             }

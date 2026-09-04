@@ -2,12 +2,14 @@
   "Id": "AITraffic",
   "DisplayName": "AI Traffic",
   "Author": "Killermops27",
-  "Version": "0.1.2",
+  "Version": "0.2.0",
   "Requirements": [
-    "DVSignals"
+    "DVSignals",
+    "CommsRadioAPI"
   ],
   "LoadAfter": [
     "DVSignals",
+    "CommsRadioAPI",
     "DoubleTrack",
     "PassengerJobs",
     "PersistentJobsMod",

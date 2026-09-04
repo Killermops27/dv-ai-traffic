@@ -37,6 +37,7 @@ namespace AITraffic.Compat
 
         // Mod ID Constants
         private const string ModIdDVSignals = "DVSignals";
+        private const string ModIdCommsRadioAPI = "CommsRadioAPI";
         private const string ModIdDoubleTrack = "DoubleTrack";
         private const string ModIdPersistentJobsMod = "PersistentJobsMod";
         private const string ModIdPersistentJobs = "PersistentJobs";
@@ -54,6 +55,18 @@ namespace AITraffic.Compat
             get
             {
                 var mod = UnityModManager.FindMod(ModIdDVSignals);
+                return mod != null && mod.Active;
+            }
+        }
+
+        /// <summary>
+        /// True if CommsRadioAPI is installed and active.
+        /// </summary>
+        public static bool IsCommsRadioAPILoaded
+        {
+            get
+            {
+                var mod = UnityModManager.FindMod(ModIdCommsRadioAPI);
                 return mod != null && mod.Active;
             }
         }
@@ -130,6 +143,7 @@ namespace AITraffic.Compat
                     Main.ModEntry.Logger.Log("Initializing AI Traffic Mod Compatibility Adapters...");
 
                     Main.ModEntry.Logger.Log(string.Format(" • DVSignals: {0}", IsDVSignalsLoaded ? "Active [Signaling & Interlocking Enabled]" : "NOT DETECTED (Required)"));
+                    Main.ModEntry.Logger.Log(string.Format(" • CommsRadioAPI: {0}", IsCommsRadioAPILoaded ? "Active [In-Game Dispatcher Mode Enabled]" : "NOT DETECTED (Required)"));
                     Main.ModEntry.Logger.Log(string.Format(" • DoubleTrack: {0}", IsDoubleTrackLoaded ? "Active [Multi-Track Mainlines Enabled]" : "Not Detected"));
                     Main.ModEntry.Logger.Log(string.Format(" • PersistentJobs: {0}", IsPersistentJobsLoaded ? "Active [Dynamic Car Isolation Enabled]" : "Not Detected"));
                     Main.ModEntry.Logger.Log(string.Format(" • SelfShunt (YardMaster): {0}", IsYardMasterLoaded ? "Active [Active Yard Protection Enabled]" : "Not Detected"));

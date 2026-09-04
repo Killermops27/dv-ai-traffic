@@ -127,6 +127,9 @@ namespace AITraffic.Driver
         public float SpawnTime { get; private set; }
         public float StationaryTimer { get; private set; }
 
+        public bool IsWorkerDriven { get; set; }
+        public event Action<AIEngineer> OnTerminusArrival;
+
         #endregion
 
         #region Internal State & Control Values
@@ -1765,6 +1768,23 @@ namespace AITraffic.Driver
                 AITraffic.Navigation.JunctionController.Instance.ReleaseAllLocksFor(this);
             }
             ReleaseAllSignalReservations();
+
+            if (IsWorkerDriven && _controlsOverrider != null && _controlsOverrider.Handbrake != null)
+            {
+                _controlsOverrider.Handbrake.Set(1.0f);
+            }
+
+            try
+            {
+                if (OnTerminusArrival != null)
+                {
+                    OnTerminusArrival(this);
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.LogError(string.Format("[AITraffic] Error in OnTerminusArrival callback: {0}", ex));
+            }
         }
 
         #endregion

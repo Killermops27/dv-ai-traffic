@@ -93,6 +93,10 @@
       <HintPath>$(DVInstallPath)\DerailValley_Data\Managed\DV.ThingTypes.dll</HintPath>
       <Private>False</Private>
     </Reference>
+    <Reference Include="DV.Inventory">
+      <HintPath>$(DVInstallPath)\DerailValley_Data\Managed\DV.Inventory.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
     <Reference Include="DV.Utils">
       <HintPath>$(DVInstallPath)\DerailValley_Data\Managed\DV.Utils.dll</HintPath>
       <Private>False</Private>
@@ -158,6 +162,10 @@
     </Reference>
     <Reference Include="DoubleTrack" Condition="Exists('$(DVInstallPath)\Mods\DoubleTrack\DoubleTrack.dll')">
       <HintPath>$(DVInstallPath)\Mods\DoubleTrack\DoubleTrack.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
+    <Reference Include="CommsRadioAPI">
+      <HintPath>references\CommsRadioAPI\CommsRadioAPI.dll</HintPath>
       <Private>False</Private>
     </Reference>
   </ItemGroup>

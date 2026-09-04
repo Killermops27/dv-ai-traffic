@@ -37,6 +37,16 @@ namespace AITraffic
                 // Subscribe to World Loading event
                 WorldStreamingInit.LoadingFinished += OnWorldLoaded;
 
+                // Register Comms Radio mode via CommsRadioAPI
+                try
+                {
+                    CommsRadioAPI.ControllerAPI.Ready += AITraffic.Workers.Radio.WorkerRadioMode.Register;
+                }
+                catch (Exception ex)
+                {
+                    modEntry.Logger.Warning(string.Format("Failed to hook CommsRadioAPI.Ready: {0}", ex));
+                }
+
                 Enabled = true;
 
                 // If world is already loaded, start manager immediately
@@ -71,6 +81,13 @@ namespace AITraffic
                 // Start Traffic Manager
                 TrafficManager.Instance.Settings = Settings;
                 TrafficManager.Instance.enabled = true;
+
+                // Ensure Worker Radio mode is registered with Comms Radio
+                try
+                {
+                    AITraffic.Workers.Radio.WorkerRadioMode.Register();
+                }
+                catch { }
 
                 if (ModEntry != null && ModEntry.Logger != null)
                     ModEntry.Logger.Log("AI Traffic Manager started.");

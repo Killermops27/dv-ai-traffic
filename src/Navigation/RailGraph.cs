@@ -14,7 +14,7 @@ namespace AITraffic.Navigation
         public int Id { get; private set; }
         public string Name { get; private set; }
         public Vector3 Position { get; private set; }
-        public Junction Junction { get; private set; }
+        public Junction Junction { get; internal set; }
         public float Grade { get; internal set; }
         public float SpeedLimit { get; internal set; }
 
@@ -409,7 +409,7 @@ namespace AITraffic.Navigation
             int edgeIdCounter = 1;
 
             var positionToNode = new List<PositionNodeEntry>();
-            const float positionMergeThreshold = 0.35f;
+            const float positionMergeThreshold = 1.2f;
 
             for (int tIdx = 0; tIdx < allTracks.Count; tIdx++)
             {
@@ -455,8 +455,12 @@ namespace AITraffic.Navigation
                 var item = positionToNode[i];
                 if (Vector3.Distance(item.Position, pos) <= positionMergeThreshold)
                 {
-                    if (junction != null && item.Node.Junction == null)
+                    if (junction != null)
                     {
+                        if (item.Node.Junction == null)
+                        {
+                            item.Node.Junction = junction;
+                        }
                         _junctionToNode[junction] = item.Node;
                     }
                     return item.Node;
@@ -802,73 +806,104 @@ namespace AITraffic.Navigation
                 return result;
             }
 
-            var junction = currentNode.Junction;
-            if (junction == null)
+            var track = incomingEdge.Track;
+            if (track != null)
             {
-                for (int i = 0; i < currentNode.IncidentEdges.Count; i++)
+                try
                 {
-                    var edge = currentNode.IncidentEdges[i];
-                    if (edge != incomingEdge)
+                    List<Junction.Branch> branches = null;
+                    if (currentNode == incomingEdge.FromNode)
                     {
-                        result.Add(edge);
+                        branches = track.GetAllInBranches();
                     }
-                }
-                return result;
-            }
-
-            // Facing move: entering from inBranch -> can exit onto any outBranch
-            if (junction.inBranch != null && junction.inBranch.track == incomingEdge.Track)
-            {
-                if (junction.outBranches != null)
-                {
-                    for (int i = 0; i < junction.outBranches.Count; i++)
+                    else if (currentNode == incomingEdge.ToNode)
                     {
-                        var branch = junction.outBranches[i];
-                        if (branch != null && branch.track != null)
+                        branches = track.GetAllOutBranches();
+                    }
+
+                    if (branches != null && branches.Count > 0)
+                    {
+                        for (int i = 0; i < branches.Count; i++)
                         {
-                            var edge = GetEdge(branch.track);
-                            if (edge != null && !result.Contains(edge))
+                            var branch = branches[i];
+                            if (branch != null && branch.track != null)
                             {
-                                result.Add(edge);
+                                var edge = GetEdge(branch.track);
+                                if (edge != null && edge != incomingEdge && !result.Contains(edge))
+                                {
+                                    result.Add(edge);
+                                }
                             }
                         }
                     }
                 }
-                return result;
-            }
-
-            // Trailing move: entering from an outBranch -> can only exit onto inBranch
-            if (junction.outBranches != null)
-            {
-                bool isTrailing = false;
-                for (int i = 0; i < junction.outBranches.Count; i++)
+                catch
                 {
-                    var branch = junction.outBranches[i];
-                    if (branch != null && branch.track == incomingEdge.Track)
-                    {
-                        isTrailing = true;
-                        break;
-                    }
-                }
-
-                if (isTrailing && junction.inBranch != null && junction.inBranch.track != null)
-                {
-                    var inEdge = GetEdge(junction.inBranch.track);
-                    if (inEdge != null)
-                    {
-                        result.Add(inEdge);
-                        return result;
-                    }
+                    // Fall back to graph heuristics if DV track query fails
                 }
             }
 
-            // Fallback for irregular junctions
-            for (int i = 0; i < currentNode.IncidentEdges.Count; i++)
+            // Fallback 1: Use Junction heuristics if result is still empty
+            if (result.Count == 0)
             {
-                var edge = currentNode.IncidentEdges[i];
-                if (edge != incomingEdge)
+                var junction = currentNode.Junction;
+                if (junction != null)
                 {
-                    result.Add(edge);
+                    // Facing move: entering from inBranch -> can exit onto any outBranch
+                    if (junction.inBranch != null && junction.inBranch.track == incomingEdge.Track)
+                    {
+                        if (junction.outBranches != null)
+                        {
+                            for (int i = 0; i < junction.outBranches.Count; i++)
+                            {
+                                var branch = junction.outBranches[i];
+                                if (branch != null && branch.track != null)
+                                {
+                                    var edge = GetEdge(branch.track);
+                                    if (edge != null && edge != incomingEdge && !result.Contains(edge))
+                                    {
+                                        result.Add(edge);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // Trailing move: entering from an outBranch -> can only exit onto inBranch
+                    else if (junction.outBranches != null)
+                    {
+                        bool isTrailing = false;
+                        for (int i = 0; i < junction.outBranches.Count; i++)
+                        {
+                            var branch = junction.outBranches[i];
+                            if (branch != null && branch.track == incomingEdge.Track)
+                            {
+                                isTrailing = true;
+                                break;
+                            }
+                        }
+
+                        if (isTrailing && junction.inBranch != null && junction.inBranch.track != null)
+                        {
+                            var inEdge = GetEdge(junction.inBranch.track);
+                            if (inEdge != null && inEdge != incomingEdge && !result.Contains(inEdge))
+                            {
+                                result.Add(inEdge);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Fallback 2: IncidentEdges fallback to ensure no disconnected joints
+            if (result.Count == 0 && currentNode.IncidentEdges != null)
+            {
+                for (int i = 0; i < currentNode.IncidentEdges.Count; i++)
+                {
+                    var edge = currentNode.IncidentEdges[i];
+                    if (edge != null && edge != incomingEdge && !result.Contains(edge))
+                    {
+                        result.Add(edge);
+                    }
                 }
             }
 
@@ -877,10 +912,20 @@ namespace AITraffic.Navigation
 
         public byte GetRequiredBranch(RailNode junctionNode, RailEdge incomingEdge, RailEdge outgoingEdge)
         {
-            if (junctionNode == null || junctionNode.Junction == null || outgoingEdge == null)
+            if (outgoingEdge == null)
                 return 0;
 
-            var junction = junctionNode.Junction;
+            var junction = junctionNode != null ? junctionNode.Junction : null;
+            if (junction == null && incomingEdge != null && incomingEdge.Track != null)
+            {
+                junction = incomingEdge.Track.inJunction ?? incomingEdge.Track.outJunction;
+            }
+            if (junction == null && outgoingEdge.Track != null)
+            {
+                junction = outgoingEdge.Track.inJunction ?? outgoingEdge.Track.outJunction;
+            }
+            if (junction == null)
+                return 0;
 
             // Facing move: selecting which outBranch to diverge to
             if (junction.inBranch != null && incomingEdge != null && junction.inBranch.track == incomingEdge.Track)

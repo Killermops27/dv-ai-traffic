@@ -416,7 +416,7 @@ namespace AITraffic.Fleet
             }
         }
 
-        private static void InitializeLocomotive(TrainCar loco)
+        public static void InitializeLocomotive(TrainCar loco)
         {
             if (loco == null) return;
 
