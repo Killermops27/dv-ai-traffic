@@ -89,6 +89,13 @@ namespace AITraffic
                 }
                 catch { }
 
+                // Scrub any active ambient AI debts from career debt tracker
+                try
+                {
+                    AIDebtPatches.ScrubActiveAIDebts();
+                }
+                catch { }
+
                 if (ModEntry != null && ModEntry.Logger != null)
                     ModEntry.Logger.Log("AI Traffic Manager started.");
             }

@@ -969,12 +969,52 @@ namespace AITraffic.Navigation
 
         #region Reservations & Occupancy
 
-        public bool IsTrackOccupied(RailTrack track)
+        public bool IsTrackOccupied(RailTrack track, Trainset ignoreTrainset = null)
         {
             if (track == null) return false;
 
             try
             {
+                // 1. Direct physical bogie registry on track (fastest and most comprehensive)
+                var bogies = track.BogiesOnTrack();
+                if (bogies != null && bogies.Count > 0)
+                {
+                    if (ignoreTrainset == null) return true;
+
+                    foreach (var bogie in bogies)
+                    {
+                        if (bogie != null && bogie.Car != null)
+                        {
+                            if (bogie.Car.trainset != ignoreTrainset &&
+                                (ignoreTrainset.cars == null || !ignoreTrainset.cars.Contains(bogie.Car)))
+                            {
+                                return true;
+                            }
+                        }
+                    }
+                }
+
+                // 2. Physical train car bogie fallback check
+                if (CarSpawner.Instance != null && CarSpawner.Instance.AllCars != null)
+                {
+                    var allCars = CarSpawner.Instance.AllCars;
+                    int count = allCars.Count;
+                    for (int i = 0; i < count; i++)
+                    {
+                        var car = allCars[i];
+                        if (car == null) continue;
+                        if (ignoreTrainset != null && (car.trainset == ignoreTrainset || (ignoreTrainset.cars != null && ignoreTrainset.cars.Contains(car))))
+                            continue;
+
+                        if ((car.FrontBogie != null && car.FrontBogie.track == track) ||
+                            (car.RearBogie != null && car.RearBogie.track == track))
+                        {
+                            return true;
+                        }
+                    }
+                }
+
+                // 3. Logic track check
                 if (RailTrackRegistry.RailTrackToLogicTrack != null)
                 {
                     DV.Logic.Job.Track logicTrack;
@@ -987,7 +1027,7 @@ namespace AITraffic.Navigation
             }
             catch
             {
-                // Fallback to internal checks
+                // Fallback
             }
 
             return false;

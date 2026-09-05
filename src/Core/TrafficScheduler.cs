@@ -577,6 +577,17 @@ namespace AITraffic.Core
         {
             if (track == null) return true;
 
+            // 0. Direct physical bogie registry on track (fastest and most comprehensive)
+            try
+            {
+                var bogies = track.BogiesOnTrack();
+                if (bogies != null && bogies.Count > 0)
+                {
+                    return true;
+                }
+            }
+            catch { }
+
             // 1. Check LogicTrack reservation / cars if available
             var logicTrack = ModCompatManager.GetLogicTrack(track);
             if (logicTrack != null && !logicTrack.IsFree())
@@ -902,7 +913,7 @@ namespace AITraffic.Core
                     for (int i = 0; i < destStation.AllStationTracks.Count; i++)
                     {
                         var t = destStation.AllStationTracks[i];
-                        if (t == null || IsTrackOccupied(t)) continue;
+                        if (t == null || IsTrackOccupied(t) || IsDeadEndTrack(t)) continue;
                         // STRICT GUARD: Never route freight to a passenger platform
                         if (IsPlatformTrack(t, destStation)) continue;
 
@@ -910,11 +921,11 @@ namespace AITraffic.Core
                             results.Add(t);
                     }
 
-                    // Pass 2: Yard storage / classification tracks [S]
+                    // Pass 2: Yard storage / classification tracks [S] (excluding dead-end sidings and active shunting zones)
                     for (int i = 0; i < destStation.AllStationTracks.Count; i++)
                     {
                         var t = destStation.AllStationTracks[i];
-                        if (t == null || IsTrackOccupied(t)) continue;
+                        if (t == null || IsTrackOccupied(t) || IsDeadEndTrack(t) || ModCompatManager.IsTrackActiveYardZone(t)) continue;
                         if (IsPlatformTrack(t, destStation)) continue;
 
                         if (IsYardStorageTrack(t, destStation) && !results.Contains(t))
@@ -925,7 +936,7 @@ namespace AITraffic.Core
                     for (int i = 0; i < destStation.AllStationTracks.Count; i++)
                     {
                         var t = destStation.AllStationTracks[i];
-                        if (t == null || IsTrackOccupied(t)) continue;
+                        if (t == null || IsTrackOccupied(t) || IsDeadEndTrack(t)) continue;
                         if (IsPlatformTrack(t, destStation)) continue;
 
                         if (IsPassingOrLoopTrack(t) && !results.Contains(t))
@@ -943,7 +954,7 @@ namespace AITraffic.Core
                     var edge = edges[i];
                     if (edge == null || edge.Track == null) continue;
                     var t = edge.Track;
-                    if (t.curve == null || IsTrackOccupied(t)) continue;
+                    if (t.curve == null || IsTrackOccupied(t) || (!isPax && IsDeadEndTrack(t))) continue;
 
                     string name = t.name ?? "";
                     if (!string.IsNullOrEmpty(yardId) && name.IndexOf(yardId, StringComparison.OrdinalIgnoreCase) >= 0)
@@ -956,6 +967,7 @@ namespace AITraffic.Core
                         else
                         {
                             if (IsPlatformTrack(t, destStation)) continue; // STRICT GUARD
+                            if (ModCompatManager.IsTrackActiveYardZone(t)) continue;
 
                             if ((IsInboundTrack(t, destStation) || IsYardStorageTrack(t, destStation) || IsPassingOrLoopTrack(t)) && !results.Contains(t))
                                 results.Add(t);
@@ -964,13 +976,13 @@ namespace AITraffic.Core
                 }
             }
 
-            // 3. Fallback: Non-occupied station tracks respecting passenger/freight separation
+            // 3. Fallback: Non-occupied station tracks respecting passenger/freight separation and non-dead-end
             if (results.Count == 0 && destStation.AllStationTracks != null)
             {
                 for (int i = 0; i < destStation.AllStationTracks.Count; i++)
                 {
                     var t = destStation.AllStationTracks[i];
-                    if (t == null || IsTrackOccupied(t)) continue;
+                    if (t == null || IsTrackOccupied(t) || (!isPax && IsDeadEndTrack(t))) continue;
 
                     if (isPax)
                     {
@@ -979,7 +991,7 @@ namespace AITraffic.Core
                     }
                     else
                     {
-                        if (!IsPlatformTrack(t, destStation) && !results.Contains(t))
+                        if (!IsPlatformTrack(t, destStation) && !ModCompatManager.IsTrackActiveYardZone(t) && !results.Contains(t))
                             results.Add(t);
                     }
                 }

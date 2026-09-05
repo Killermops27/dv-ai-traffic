@@ -235,6 +235,20 @@ namespace AITraffic.Config
                 ReserveArrivalTrackFirst = GUILayout.Toggle(ReserveArrivalTrackFirst, ReserveArrivalTrackFirst ? "Enabled (Recommended)" : "Disabled (Pure Persistence)");
                 GUILayout.EndHorizontal();
 
+                // --- CAREER FEE MAINTENANCE ---
+                GUILayout.Space(12);
+                GUILayout.Label("Career Fee Maintenance", subHeaderStyle);
+                GUILayout.Label("Removes staged 'destroyed locomotive' debt created by AI trains in older mod versions before v0.2.1.", descStyle);
+
+                GUILayout.BeginHorizontal();
+                if (GUILayout.Button("Purge Staged AI Destroyed Loco Debts", GUILayout.Width(300)))
+                {
+                    int purged = AITraffic.Compat.AIDebtPatches.PurgeHistoricalStagedDebts();
+                    if (Main.ModEntry != null && Main.ModEntry.Logger != null)
+                        Main.ModEntry.Logger.Log(string.Format("Purged {0} staged loco debts from career ledger.", purged));
+                }
+                GUILayout.EndHorizontal();
+
                 GUILayout.EndVertical();
             }
             catch (Exception ex)

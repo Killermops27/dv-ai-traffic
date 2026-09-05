@@ -301,28 +301,9 @@ namespace AITraffic.Workers
                 }
             }
 
-            // Pass 3: Fallback if all yard tracks have rolling stock/cars, pick any candidate with length >= bufferLength that has a path
-            if (bestCandidate == null)
-            {
-                for (int i = 0; i < candidates.Count; i++)
-                {
-                    var track = candidates[i];
-                    if (track == null || track.curve == null) continue;
+            // Note: Pass 3 (fallback to occupied tracks) was removed in v0.2.1 to prevent AI trains
+            // from routing into sidings and colliding with/pushing parked rolling stock.
 
-                    if (track.curve.length >= bufferLength)
-                    {
-                        if (originTrack != null)
-                        {
-                            var testPath = pathfinder.FindPath(originTrack, track, pathOptions);
-                            if (testPath != null && testPath.IsValid)
-                            {
-                                bestCandidate = track;
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
 
             if (Main.ModEntry != null && Main.ModEntry.Logger != null)
             {
@@ -415,6 +396,12 @@ namespace AITraffic.Workers
             {
                 statusMessage = string.Format("No suitable arrival track found at {0} with length >= {1:F0}m!",
                     destStation.stationInfo != null ? destStation.stationInfo.Name : "destination", totalLength + 25f);
+                return false;
+            }
+
+            if (!isAutoTrack && TrafficScheduler.IsTrackOccupied(destTrack))
+            {
+                statusMessage = string.Format("Destination track '{0}' is currently occupied by other cars!", destTrack.name);
                 return false;
             }
 
@@ -512,11 +499,9 @@ namespace AITraffic.Workers
             // Register with TrafficManager
             TrafficManager.Instance.RegisterEngineer(engineer);
 
-            // Tag trainset for AI traffic
-            if (leadLoco.trainset != null)
-            {
-                ModCompatManager.TagTrainAsAITraffic(leadLoco.trainset);
-            }
+            // Note: In v0.2.1, worker-driven consists are no longer tagged as transient AI traffic,
+            // allowing them to retain proper player save serialization, job car linkages, and career tracking.
+
 
             // 9. Create task record
             var task = new AtoBHaulTask(

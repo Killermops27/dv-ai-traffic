@@ -685,7 +685,8 @@ namespace AITraffic.Navigation
                 requiredBranch = _graph.GetRequiredBranch(fromNode, incomingEdge, edge);
             }
 
-            bool isStartOrDest = (destEdge != null && edge == destEdge) || (initialEdge != null && edge == initialEdge);
+            bool isInitial = (initialEdge != null && edge == initialEdge);
+            bool isStartOrDest = (destEdge != null && edge == destEdge) || isInitial;
 
             // Check if track is occupied by requester's own train cars
             bool isOccupiedByRequester = false;
@@ -704,10 +705,10 @@ namespace AITraffic.Navigation
                 }
             }
 
-            // Occupancy checks (skip if start/dest or occupied only by requester's own consist)
-            if (options.AvoidOccupiedTracks && !isStartOrDest && !isOccupiedByRequester)
+            // Occupancy checks (skip only if initial starting track or occupied by requester's own consist)
+            if (options.AvoidOccupiedTracks && !isInitial && !isOccupiedByRequester)
             {
-                bool isOccupied = _graph.IsTrackOccupied(edge.Track);
+                bool isOccupied = _graph.IsTrackOccupied(edge.Track, options.RequesterTrainset);
                 if (isOccupied)
                 {
                     if (options.StrictlyAvoidOccupied)
@@ -718,7 +719,7 @@ namespace AITraffic.Navigation
             }
 
             // Reservation checks
-            if (options.AvoidReservedTracks && !isStartOrDest)
+            if (options.AvoidReservedTracks && !isInitial)
             {
                 bool isReservedByOther = _graph.IsTrackReservedByOther(edge.Track, options.Requester);
                 if (isReservedByOther)

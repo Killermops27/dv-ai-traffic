@@ -454,6 +454,44 @@ namespace AITraffic.Compat
             return false;
         }
 
+        /// <summary>
+        /// Checks if a <see cref="TrainCar"/> is part of a train driven by an AI worker employed by the player.
+        /// Worker-driven trains are player consists with legitimate jobs, and must be saved in the game save file.
+        /// </summary>
+        public static bool IsWorkerTrain(TrainCar car)
+        {
+            if (car == null) return false;
+
+            var directEng = car.GetComponent<AITraffic.Driver.AIEngineer>();
+            if (directEng != null && directEng.IsWorkerDriven) return true;
+
+            if (car.trainset != null && car.trainset.cars != null)
+            {
+                for (int i = 0; i < car.trainset.cars.Count; i++)
+                {
+                    var c = car.trainset.cars[i];
+                    if (c != null)
+                    {
+                        var eng = c.GetComponent<AITraffic.Driver.AIEngineer>();
+                        if (eng != null && eng.IsWorkerDriven) return true;
+                    }
+                }
+            }
+
+            return false;
+        }
+
+        /// <summary>
+        /// Checks if a <see cref="TrainCar"/> is an ambient procedural AI train (not a player-employed worker train).
+        /// Only ambient procedural AI trains are excluded from saves and exempted from player career debt.
+        /// </summary>
+        public static bool IsAmbientAITrain(TrainCar car)
+        {
+            if (car == null) return false;
+            if (IsWorkerTrain(car)) return false;
+            return IsAITrain(car);
+        }
+
         #endregion
     }
 
@@ -471,9 +509,9 @@ namespace AITraffic.Compat
         {
             try
             {
-                if (car != null && ModCompatManager.IsAITrain(car))
+                if (car != null && ModCompatManager.IsAmbientAITrain(car))
                 {
-                    // Return null to skip saving this AI car
+                    // Return null to skip saving this ambient AI car
                     __result = null;
                     return false;
                 }

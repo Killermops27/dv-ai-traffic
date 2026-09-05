@@ -1725,7 +1725,7 @@ namespace AITraffic.Driver
             }
 
             // Imminent physical obstacle emergency clamping
-            if (DistanceToObstacle < 150.0f && CurrentSpeedKmh > 1.0f)
+            if (DistanceToObstacle < 150.0f)
             {
                 _commandedTrainBrake = 1.0f;
                 _commandedIndependentBrake = 1.0f;
@@ -1733,7 +1733,7 @@ namespace AITraffic.Driver
             }
 
             // Absolute holding brake when stopped
-            if (CurrentSpeedKmh < 0.5f && TargetSpeedKmh <= 0.1f)
+            if (CurrentSpeedKmh < 0.5f && (TargetSpeedKmh <= 0.1f || DistanceToObstacle < 150.0f))
             {
                 _commandedTrainBrake = Mathf.Max(0.6f, brakeDemand);
                 _commandedIndependentBrake = 1.0f;
