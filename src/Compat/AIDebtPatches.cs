@@ -25,14 +25,14 @@ namespace AITraffic.Compat
         public static class LocoDebtController_RegisterLocoDebtTracker_Patch
         {
             [HarmonyPrefix]
-            public static bool Prefix(TrainCar loco, LocoDebtTrackerBase locoDebtTracker)
+            public static bool Prefix(TrainCar car, LocoDebtTrackerBase locoDebtTracker)
             {
                 try
                 {
-                    if (loco != null && ModCompatManager.IsAmbientAITrain(loco))
+                    if (car != null && ModCompatManager.IsAmbientAITrain(car))
                     {
                         if (Main.ModEntry != null && Main.ModEntry.Logger != null)
-                            Main.ModEntry.Logger.Log(string.Format("[AIDebt] Suppressed debt registration for ambient AI loco '{0}'.", loco.ID));
+                            Main.ModEntry.Logger.Log(string.Format("[AIDebt] Suppressed debt registration for ambient AI loco '{0}'.", car.ID));
 
                         return false; // Do not track debt for ambient AI locomotives
                     }
@@ -111,7 +111,7 @@ namespace AITraffic.Compat
         public static class CarDebtController_SetDebtTracker_Patch
         {
             [HarmonyPrefix]
-            public static bool Prefix(CarDebtController __instance, CarDamageModel carDamage, CargoDamageModel cargoDamage)
+            public static bool Prefix(CarDebtController __instance)
             {
                 try
                 {
