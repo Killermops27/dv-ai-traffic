@@ -16,6 +16,12 @@ namespace AITraffic.Fleet
     public static class TrainSpawner
     {
         /// <summary>
+        /// True while an ambient AI consist is being instantiated by CarSpawner.
+        /// Checked by debt and penalty patches to suppress registration during spawning.
+        /// </summary>
+        public static bool IsSpawningAmbientConsist { get; private set; }
+
+        /// <summary>
         /// Spawns an AI train consist of the specified type on the given track, matching origin and destination industrial chains.
         /// </summary>
         /// <param name="track">The rail track to spawn on.</param>
@@ -173,17 +179,26 @@ namespace AITraffic.Fleet
                     orientationList.Add(flipTrainConsist);
                 }
 
-                // 1. Spawn cars on track with playerSpawnedCars = false so PersistentJobs treats them properly
-                List<TrainCar> spawnedCars = CarSpawner.Instance.SpawnCarTypesOnTrack(
-                    trainCarTypes: liveries,
-                    carsOrientationReversed: orientationList,
-                    railTrack: track,
-                    preventAutoCoupleOnLastCars: false,
-                    applyHandbrakeOnLastCars: false,
-                    startSpan: startSpan,
-                    flipTrainConsist: flipTrainConsist,
-                    playerSpawnedCars: false
-                );
+                // 1. Spawn cars on track with playerSpawnedCars = true so SimController natively skips debt tracking
+                List<TrainCar> spawnedCars;
+                try
+                {
+                    IsSpawningAmbientConsist = true;
+                    spawnedCars = CarSpawner.Instance.SpawnCarTypesOnTrack(
+                        trainCarTypes: liveries,
+                        carsOrientationReversed: orientationList,
+                        railTrack: track,
+                        preventAutoCoupleOnLastCars: false,
+                        applyHandbrakeOnLastCars: false,
+                        startSpan: startSpan,
+                        flipTrainConsist: flipTrainConsist,
+                        playerSpawnedCars: true
+                    );
+                }
+                finally
+                {
+                    IsSpawningAmbientConsist = false;
+                }
 
                 if (spawnedCars == null || spawnedCars.Count == 0)
                 {
@@ -209,17 +224,44 @@ namespace AITraffic.Fleet
                     leadLoco = spawnedCars[0];
                 }
 
-                // 3. Connect couplers, air hoses, open cocks, tighten chains
+                // 3. Tag trainset immediately for AI save segregation, mod compatibility, and debt suppression
+                if (leadLoco.trainset != null)
+                {
+                    ModCompatManager.TagTrainAsAITraffic(leadLoco.trainset);
+                }
+
+                // 4. Connect couplers, air hoses, open cocks, tighten chains
                 ConfigureConsistCouplers(spawnedCars);
 
-                // 4. Release handbrakes across all cars and apply damage immunity
+                // 5. Release handbrakes, apply damage immunity, and guarantee debt immunity across all cars
                 for (int i = 0; i < spawnedCars.Count; i++)
                 {
                     var car = spawnedCars[i];
                     if (car == null) continue;
 
-                    car.playerSpawnedCar = false;
+                    car.playerSpawnedCar = true;
                     car.preventDebtDisplay = true;
+
+                    // Attach dummy debt tracker to eliminate any car/cargo damage debt
+                    var cdc = car.GetComponent<DV.ServicePenalty.CarDebtController>();
+                    if (cdc != null)
+                    {
+                        cdc.SetDummyDebtTracker();
+                    }
+
+                    // Purge any accidental registration in LocoDebtController
+                    if (car.IsLoco && DV.ServicePenalty.LocoDebtController.Instance != null && DV.ServicePenalty.LocoDebtController.Instance.trackedLocosDebts != null)
+                    {
+                        var existingDebt = DV.ServicePenalty.LocoDebtController.Instance.trackedLocosDebts.Find(d => d != null && d.car == car);
+                        if (existingDebt != null)
+                        {
+                            DV.ServicePenalty.LocoDebtController.Instance.trackedLocosDebts.Remove(existingDebt);
+                            if (DV.ServicePenalty.CareerManagerDebtController.Instance != null)
+                            {
+                                DV.ServicePenalty.CareerManagerDebtController.Instance.UnregisterDebt(existingDebt);
+                            }
+                        }
+                    }
 
                     if (Main.Settings != null && Main.Settings.AIDamageImmunity)
                     {
@@ -234,7 +276,7 @@ namespace AITraffic.Fleet
                     }
                 }
 
-                // 5. Initialize locomotives (start engine, headlights, reverser)
+                // 6. Initialize locomotives (start engine, headlights, reverser)
                 for (int i = 0; i < spawnedCars.Count; i++)
                 {
                     var car = spawnedCars[i];
@@ -242,12 +284,6 @@ namespace AITraffic.Fleet
                     {
                         InitializeLocomotive(car);
                     }
-                }
-
-                // 6. Tag trainset for AI save segregation and mod compatibility
-                if (leadLoco.trainset != null)
-                {
-                    ModCompatManager.TagTrainAsAITraffic(leadLoco.trainset);
                 }
 
                 // 7. Attach AIEngineer component to lead locomotive

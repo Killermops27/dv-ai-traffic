@@ -34,6 +34,8 @@ namespace AITraffic.Compat
         private static readonly object s_aiCarsLock = new object();
         private static readonly HashSet<string> s_aiCarGuids = new HashSet<string>();
         private static readonly HashSet<TrainCar> s_aiCars = new HashSet<TrainCar>();
+        private static readonly HashSet<string> s_aiCarIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        private static readonly HashSet<string> s_historicalAmbientCarIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
         // Mod ID Constants
         private const string ModIdDVSignals = "DVSignals";
@@ -359,6 +361,11 @@ namespace AITraffic.Compat
                         {
                             s_aiCarGuids.Add(car.CarGUID);
                         }
+                        if (!string.IsNullOrEmpty(car.ID))
+                        {
+                            s_aiCarIds.Add(car.ID);
+                            s_historicalAmbientCarIds.Add(car.ID);
+                        }
                         s_aiCars.Add(car);
                     }
                 }
@@ -399,6 +406,10 @@ namespace AITraffic.Compat
                         if (!string.IsNullOrEmpty(car.CarGUID))
                         {
                             s_aiCarGuids.Remove(car.CarGUID);
+                        }
+                        if (!string.IsNullOrEmpty(car.ID))
+                        {
+                            s_aiCarIds.Remove(car.ID);
                         }
                         s_aiCars.Remove(car);
                     }
@@ -488,8 +499,35 @@ namespace AITraffic.Compat
         public static bool IsAmbientAITrain(TrainCar car)
         {
             if (car == null) return false;
+            if (AITraffic.Fleet.TrainSpawner.IsSpawningAmbientConsist) return true;
             if (IsWorkerTrain(car)) return false;
             return IsAITrain(car);
+        }
+
+        /// <summary>
+        /// Checks if a train car ID belongs to an ambient procedural AI train (active or historical).
+        /// Used by debt controllers to ensure ambient AI rolling stock never generates player fees.
+        /// </summary>
+        public static bool IsAmbientAITrainId(string carId)
+        {
+            if (string.IsNullOrEmpty(carId)) return false;
+
+            lock (s_aiCarsLock)
+            {
+                if (s_historicalAmbientCarIds.Contains(carId) || s_aiCarIds.Contains(carId))
+                    return true;
+            }
+
+            if (CarSpawner.Instance != null && CarSpawner.Instance.AllCars != null)
+            {
+                var car = CarSpawner.Instance.AllCars.Find(c => c != null && c.ID == carId);
+                if (car != null)
+                {
+                    return IsAmbientAITrain(car);
+                }
+            }
+
+            return false;
         }
 
         #endregion
