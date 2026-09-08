@@ -701,7 +701,7 @@ namespace AITraffic.Navigation
                     double sigSpan = pInfo.Span;
                     float dist = (direction >= 0.0f) ? (float)(sigSpan - currentSpan) : (float)(currentSpan - sigSpan);
 
-                    if (dist > 0f)
+                    if (dist > 1.5f)
                     {
                         aheadSignals.Add(new UpcomingSignal { Signal = sig, Distance = dist });
                     }
@@ -946,12 +946,12 @@ namespace AITraffic.Navigation
                     var pInfo = sig.Controller.PlacementInfo.Value;
                     double sigSpan = pInfo.Span;
 
-                    if (direction >= 0.0f && sigSpan > currentSpan)
+                    if (direction >= 0.0f && sigSpan > currentSpan + 1.5)
                     {
                         float dist = (float)(sigSpan - currentSpan);
                         results.Add(new UpcomingSignal { Signal = sig, Distance = dist });
                     }
-                    else if (direction < 0.0f && sigSpan < currentSpan)
+                    else if (direction < 0.0f && sigSpan < currentSpan - 1.5)
                     {
                         float dist = (float)(currentSpan - sigSpan);
                         results.Add(new UpcomingSignal { Signal = sig, Distance = dist });
@@ -973,6 +973,8 @@ namespace AITraffic.Navigation
                 {
                     var routeTrack = upcomingRoute[r];
                     if (routeTrack == null || routeTrack.curve == null)
+                        continue;
+                    if (routeTrack == currentTrack)
                         continue;
 
                     Vector3 startPos = routeTrack.curve.GetPointAt(0.0f);

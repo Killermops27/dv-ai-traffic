@@ -324,6 +324,16 @@ namespace AITraffic.Driver
         {
             if (_trainCar == null) return;
 
+            // Safety killswitch: Immediate shutdown on derailment or collision
+            if (_trainCar.derailed || (_trainCar.FrontBogie != null && _trainCar.FrontBogie.HasDerailed) || (_trainCar.RearBogie != null && _trainCar.RearBogie.HasDerailed))
+            {
+                if (State != EngineState.TerminusStop)
+                {
+                    EmergencyCrashShutdown();
+                }
+                return;
+            }
+
             float dt = Time.deltaTime;
             if (dt <= 0.0f) return;
 
@@ -336,8 +346,8 @@ namespace AITraffic.Driver
                 StationaryTimer = 0.0f;
             }
 
-            UpdateSensors(dt);
             UpdatePathAndJunctions(dt);
+            UpdateSensors(dt);
             UpdateSingleTrackCorridorProtection(dt);
             UpdateWheelSlipProtection(dt);
             UpdatePowertrainProtection(dt);
@@ -481,9 +491,13 @@ namespace AITraffic.Driver
                     {
                         Vector3 curStart = currentTrack.curve.GetPointAt(0.0f);
                         Vector3 curEnd = currentTrack.curve.GetPointAt(1.0f);
-                        Vector3 nextMid = nextTrack.curve.GetPointAt(0.5f);
+                        Vector3 nextStart = nextTrack.curve.GetPointAt(0.0f);
+                        Vector3 nextEnd = nextTrack.curve.GetPointAt(1.0f);
 
-                        TargetDirection = (Vector3.Distance(curEnd, nextMid) <= Vector3.Distance(curStart, nextMid)) ? 1.0f : -1.0f;
+                        float distEndToNext = Mathf.Min(Vector3.Distance(curEnd, nextStart), Vector3.Distance(curEnd, nextEnd));
+                        float distStartToNext = Mathf.Min(Vector3.Distance(curStart, nextStart), Vector3.Distance(curStart, nextEnd));
+
+                        TargetDirection = (distEndToNext <= distStartToNext) ? 1.0f : -1.0f;
                     }
                 }
                 else if (CurrentPath != null && CurrentPath.Tracks != null && CurrentPathTrackIndex > 0 && CurrentPathTrackIndex == CurrentPath.Tracks.Count - 1)
@@ -506,30 +520,11 @@ namespace AITraffic.Driver
                 {
                     // Fallback to locomotive heading along track tangent
                     Vector3 locoHeading = _trainCar.transform.forward;
-                    if (_commandedReverser < 0f || _desiredReverser < 0f) locoHeading = -locoHeading;
                     TargetDirection = (Vector3.Dot(locoHeading, tangent) >= 0.0f) ? 1.0f : -1.0f;
                 }
 
-                Vector3 desiredMoveVector = tangent * TargetDirection;
-                float dot = Vector3.Dot(_trainCar.transform.forward, desiredMoveVector);
-
-                // Lock reverser while rolling to prevent curvature tangent flutter from flipping reverser on mainlines
-                if (CurrentSpeedMs > 0.4f)
-                {
-                    // Maintain current desired reverser orientation while moving forward
-                }
-                else
-                {
-                    // Only change reverser while stationary if dot product is decisive (hysteresis prevents flip-flopping)
-                    if (dot > 0.25f)
-                    {
-                        _desiredReverser = 1.0f;
-                    }
-                    else if (dot < -0.25f)
-                    {
-                        _desiredReverser = -1.0f;
-                    }
-                }
+                // AI line service trains must always run in forward gear
+                _desiredReverser = 1.0f;
             }
             else if (TargetDirection == 0.0f)
             {
@@ -666,28 +661,11 @@ namespace AITraffic.Driver
                     float frac = (float)Mathf.Clamp01((float)(span / curTrack.curve.length));
                     Vector3 tangent = curTrack.curve.GetTangentAt(frac);
                     Vector3 locoHeading = (_trainCar != null) ? _trainCar.transform.forward : Vector3.forward;
-                    if (_commandedReverser < 0f || _desiredReverser < 0f) locoHeading = -locoHeading;
                     TargetDirection = (Vector3.Dot(locoHeading, tangent) >= 0.0f) ? 1.0f : -1.0f;
                 }
 
-                // 2c. Compute locomotive reverser requirement based on physical locomotive heading vs track travel direction
-                // Only evaluate reverser while essentially stationary to lock out curvature coordinate flutter at speed
-                if (CurrentSpeedMs <= 0.3f)
-                {
-                    double curLocoSpan = (_trainCar != null && _trainCar.FrontBogie != null && _trainCar.FrontBogie.traveller != null) ? _trainCar.FrontBogie.traveller.Span : 0.0;
-                    float locoFrac = (float)Mathf.Clamp01((float)(curLocoSpan / curTrack.curve.length));
-                    Vector3 curTangent = curTrack.curve.GetTangentAt(locoFrac);
-                    Vector3 desiredMoveVector = curTangent * TargetDirection;
-                    float dot = (_trainCar != null) ? Vector3.Dot(_trainCar.transform.forward, desiredMoveVector) : 1.0f;
-                    if (dot > 0.25f)
-                    {
-                        _desiredReverser = 1.0f;
-                    }
-                    else if (dot < -0.25f)
-                    {
-                        _desiredReverser = -1.0f;
-                    }
-                }
+                // 2c. AI line service trains must always run in forward gear
+                _desiredReverser = 1.0f;
             }
 
             // 2d. Dynamically compute exact remaining distance along route based on TargetDirection
@@ -2691,6 +2669,37 @@ namespace AITraffic.Driver
         {
             State = EngineState.StationHold;
             DwellTimeRemaining = StationDwellDuration > 0.0f ? StationDwellDuration : UnityEngine.Random.Range(30.0f, 60.0f);
+        }
+
+        /// <summary>
+        /// Emergency killswitch invoked upon derailment or collision.
+        /// Immediately halts train, applies all brakes, shuts down engine, and releases all reservations.
+        /// </summary>
+        private void EmergencyCrashShutdown()
+        {
+            _commandedThrottle = 0.0f;
+            _rampThrottle = 0.0f;
+            _currentThrottle = 0.0f;
+            _commandedDynamicBrake = 0.0f;
+            _currentDynamicBrake = 0.0f;
+            _commandedTrainBrake = 1.0f;
+            _currentTrainBrake = 1.0f;
+            _commandedIndependentBrake = 1.0f;
+            _currentIndependentBrake = 1.0f;
+            _desiredReverser = 0.0f;
+            _commandedReverser = 0.0f;
+            _currentReverser = 0.0f;
+
+            if (_controlsOverrider != null)
+            {
+                if (_controlsOverrider.Throttle != null) _controlsOverrider.Throttle.Set(0.0f);
+                if (_controlsOverrider.Brake != null) _controlsOverrider.Brake.Set(1.0f);
+                if (_controlsOverrider.IndependentBrake != null) _controlsOverrider.IndependentBrake.Set(1.0f);
+                if (_controlsOverrider.Handbrake != null) _controlsOverrider.Handbrake.Set(1.0f);
+                if (_controlsOverrider.Reverser != null) _controlsOverrider.Reverser.Set(0.0f);
+            }
+
+            EnterTerminusStop();
         }
 
         private void EnterTerminusStop()
