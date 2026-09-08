@@ -747,6 +747,12 @@ namespace AITraffic.Driver
                 RailTrack prevSwitchTrack = curTrack;
                 _switchHoldDistance = float.PositiveInfinity;
 
+                bool isStoppedWaiting = (CurrentSpeedKmh < 1.0f && (DistanceToObstacle < 250f || DistanceToSignal < 250f || _corridorHoldDistance < 250f || State == EngineState.StationHold || State == EngineState.TerminusStop));
+                if (isStoppedWaiting && AITraffic.Navigation.JunctionController.Instance != null)
+                {
+                    AITraffic.Navigation.JunctionController.Instance.ReleaseAllLocksFor(this);
+                }
+
                 for (int i = 0; i < _upcomingTracks.Count; i++)
                 {
                     var trackA = prevSwitchTrack;
@@ -789,7 +795,7 @@ namespace AITraffic.Driver
 
                             // Advance Alignment: set switch immediately so station exit/entry route is aligned
                             bool switchAligned = (junction.selectedBranch == requiredBranch);
-                            if (!switchAligned)
+                            if (!switchAligned && !isStoppedWaiting)
                             {
                                 switchAligned = AITraffic.Navigation.JunctionController.Instance.RequestJunctionAlignment(junction, requiredBranch, this);
                             }
@@ -805,7 +811,7 @@ namespace AITraffic.Driver
                             }
 
                             // Critical Approach Lock: within 250m ahead of train along route (or immediate proximity)
-                            if (routeDist < 250f || dist < 200f)
+                            if ((routeDist < 250f || dist < 200f) && !isStoppedWaiting)
                             {
                                 AITraffic.Navigation.JunctionController.Instance.TryLockJunction(junction, this, 60f);
 
@@ -1821,15 +1827,15 @@ namespace AITraffic.Driver
                 }
                 else
                 {
-                    if (maxAmpsPerTm >= 420.0f)
+                    if (maxAmpsPerTm >= 500.0f) // was 420.0f
                     {
-                        _overcurrentThrottleLimit = 0.30f;
-                        _rampThrottle = Mathf.Min(_rampThrottle, 0.30f);
+                        _overcurrentThrottleLimit = 0.50f; // was 0.30f
+                        _rampThrottle = Mathf.Min(_rampThrottle, 0.50f); // was 0.30f
                     }
-                    else if (maxAmpsPerTm > 380.0f)
+                    else if (maxAmpsPerTm > 450.0f) // was 380.0f
                     {
-                        float overcurrentFactor = (maxAmpsPerTm - 380.0f) / (420.0f - 380.0f);
-                        _overcurrentThrottleLimit = Mathf.Lerp(1.0f, 0.40f, overcurrentFactor);
+                        float overcurrentFactor = (maxAmpsPerTm - 450.0f) / (500.0f - 450.0f); // was (380.0f) / (420.0f - 380.0f)
+                        _overcurrentThrottleLimit = Mathf.Lerp(1.0f, 0.50f, overcurrentFactor); // was 0.40f
                     }
                     else
                     {
