@@ -530,8 +530,9 @@ namespace AITraffic.Driver
                     TargetDirection = (Vector3.Dot(locoHeading, tangent) >= 0.0f) ? 1.0f : -1.0f;
                 }
 
-                // AI line service trains must always run in forward gear
-                _desiredReverser = 1.0f;
+                // AI line service trains must always run in gear matching route movement
+                Vector3 desiredMoveVector = tangent * TargetDirection;
+                _desiredReverser = (Vector3.Dot(_trainCar.transform.forward, desiredMoveVector) >= 0.0f) ? 1.0f : -1.0f;
             }
             else if (TargetDirection == 0.0f)
             {
@@ -628,6 +629,10 @@ namespace AITraffic.Driver
             // 2b. Compute dynamic TargetDirection along current track
             if (curTrack != null && curTrack.curve != null)
             {
+                double curSpanForDir = (_trainCar != null && _trainCar.FrontBogie != null && _trainCar.FrontBogie.traveller != null) ? _trainCar.FrontBogie.traveller.Span : 0.0;
+                float fracDir = (float)Mathf.Clamp01((float)(curSpanForDir / curTrack.curve.length));
+                Vector3 tangent = curTrack.curve.GetTangentAt(fracDir);
+
                 if (CurrentPath.Tracks != null && CurrentPath.Tracks.Count > CurrentPathTrackIndex + 1)
                 {
                     var nextTrack = CurrentPath.Tracks[CurrentPathTrackIndex + 1];
@@ -664,15 +669,14 @@ namespace AITraffic.Driver
                 else
                 {
                     // Fallback to locomotive heading along track tangent
-                    double span = (_trainCar != null && _trainCar.FrontBogie != null && _trainCar.FrontBogie.traveller != null) ? _trainCar.FrontBogie.traveller.Span : 0.0;
-                    float frac = (float)Mathf.Clamp01((float)(span / curTrack.curve.length));
-                    Vector3 tangent = curTrack.curve.GetTangentAt(frac);
                     Vector3 locoHeading = (_trainCar != null) ? _trainCar.transform.forward : Vector3.forward;
                     TargetDirection = (Vector3.Dot(locoHeading, tangent) >= 0.0f) ? 1.0f : -1.0f;
                 }
 
-                // 2c. AI line service trains must always run in forward gear
-                _desiredReverser = 1.0f;
+                // 2c. AI line service trains must always run in gear matching route direction
+                Vector3 routeMoveVector = tangent * TargetDirection;
+                Vector3 trainHeading = (_trainCar != null) ? _trainCar.transform.forward : Vector3.forward;
+                _desiredReverser = (Vector3.Dot(trainHeading, routeMoveVector) >= 0.0f) ? 1.0f : -1.0f;
             }
 
             // 2d. Dynamically compute exact remaining distance along route based on TargetDirection

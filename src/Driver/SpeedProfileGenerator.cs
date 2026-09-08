@@ -777,7 +777,7 @@ namespace AITraffic.Driver
                     var sig = sigEntry.Signal;
                     float distSig = sigEntry.Distance;
 
-                    if (sig == null || !sig.IsOn || distSig <= 0.0f || distSig > 2000.0f) continue;
+                    if (sig == null || !sig.IsOn || distSig < 0.0f || distSig > 2000.0f) continue;
 
                     IAspect aspect = sig.CurrentAspect;
                     if (aspect == null) continue;
