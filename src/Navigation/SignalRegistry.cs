@@ -355,23 +355,23 @@ namespace AITraffic.Navigation
         /// <summary>
         /// Checks if a signal is facing towards oncoming traffic for the given track traversal direction.
         /// In DVSignals:
-        /// - A signal facing traffic moving forward along track curve (0 -> Length) points its mast/lamps towards 0 (TrackDirection.In = 1).
-        /// - A signal facing traffic moving reverse along track curve (Length -> 0) points its mast/lamps towards Length (TrackDirection.Out = 0).
-        /// When facing an approaching train, the signal forward vector and train movement vector point towards each other (Dot < 0).
+        /// - A signal governing traffic moving forward along track curve (0 -> Length) has Definition.transform.forward aligned with the track tangent in the direction of train movement.
+        /// - A signal governing traffic moving reverse along track curve (Length -> 0) has Definition.transform.forward aligned opposite to the track tangent.
+        /// When governing an approaching train, the signal forward vector and train movement vector point in the SAME direction along the route (Dot > 0).
         /// </summary>
         public static bool IsSignalFacingTrain(DVSignal sig, float traversalDirection)
         {
             if (sig == null || sig.Controller == null || !sig.Controller.PlacementInfo.HasValue) return false;
 
             var pInfo = sig.Controller.PlacementInfo.Value;
-            int sigDir = (int)pInfo.Direction; // 0 = Out (faces Length -> 0 traffic), 1 = In (faces 0 -> Length traffic)
+            int sigDir = (int)pInfo.Direction; // In DVSignals: 0 = Out (governs 0 -> Length traffic), 1 = In (governs Length -> 0 traffic)
 
             // 1. Physical 3D Mast Orientation Validation (Most accurate & foolproof):
-            // In DVSignals, Definition.transform.forward points in the direction the signal faces (where lamps shine).
-            // A signal governing oncoming traffic points its lamps TOWARDS the approaching train.
+            // In DVSignals, Definition.transform.forward is oriented along the track in the direction of governed train travel.
             // When a train is moving in traversalDirection, its movement vector is tangent * traversalDirection.
-            // Therefore, signalForward and trainMoveVector point in OPPOSITE directions: Dot(signalForward, trainMoveVector) < 0.
-            // (If Dot > 0, the train is looking at the back of the signal mast, i.e. it is an opposing signal for traffic in the other direction).
+            // Therefore, for a signal governing this train, signalForward and trainMoveVector point in the SAME direction:
+            // Dot(signalForward, trainMoveVector) > 0.
+            // (If Dot < 0, the signal governs opposing traffic moving in the opposite direction).
             if (sig.Controller.Definition != null && pInfo.Track != null && pInfo.Track.curve != null)
             {
                 double span = pInfo.Span;
@@ -384,14 +384,15 @@ namespace AITraffic.Navigation
                 float dot = Vector3.Dot(signalForward, trainMoveVector);
                 if (Mathf.Abs(dot) > 0.2f)
                 {
-                    return dot < 0.0f;
+                    return dot > 0.0f;
                 }
             }
 
             // 2. Logical DVSignals PlacementInfo Direction Mapping Fallback:
-            // Forward travel (moving 0 -> Length): governed by TrackDirection.In (1) (signal faces towards span 0)
-            // Reverse travel (moving Length -> 0): governed by TrackDirection.Out (0) (signal faces towards span Length)
-            return (traversalDirection >= 0.0f) ? (sigDir == 1) : (sigDir == 0);
+            // In DVSignals:
+            // TrackDirection.Out (0) governs traffic moving from span 0 -> Length (traversalDirection >= 0).
+            // TrackDirection.In (1) governs traffic moving from span Length -> 0 (traversalDirection < 0).
+            return (traversalDirection >= 0.0f) ? (sigDir == 0) : (sigDir == 1);
         }
 
         /// <summary>
@@ -1097,8 +1098,8 @@ namespace AITraffic.Navigation
                     if (direction >= 0.0f && bSpan > currentSpan)
                     {
                         float dist = (float)(bSpan - currentSpan);
-                        // Micro-distance (< 3.0m) on locomotive's own current track is coupler/bogie overlap noise
-                        if (dist >= 3.0f && dist < distanceToObstacle)
+                        // Micro-distance (< 0.5m) on locomotive's own current track is coupler/bogie overlap noise
+                        if (dist >= 0.5f && dist < distanceToObstacle)
                         {
                             distanceToObstacle = dist;
                             obstacleTrack = currentTrack;
@@ -1107,7 +1108,7 @@ namespace AITraffic.Navigation
                     else if (direction < 0.0f && bSpan < currentSpan)
                     {
                         float dist = (float)(currentSpan - bSpan);
-                        if (dist >= 3.0f && dist < distanceToObstacle)
+                        if (dist >= 0.5f && dist < distanceToObstacle)
                         {
                             distanceToObstacle = dist;
                             obstacleTrack = currentTrack;
@@ -1135,6 +1136,8 @@ namespace AITraffic.Navigation
                 {
                     var rTrack = upcomingRoute[r];
                     if (rTrack == null || rTrack.curve == null)
+                        continue;
+                    if (rTrack == currentTrack)
                         continue;
 
                     Vector3 startPos = rTrack.curve.GetPointAt(0.0f);

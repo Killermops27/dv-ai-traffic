@@ -89,6 +89,10 @@ namespace AITraffic.Driver
         public DVSignal ApproachingSignal { get; set; }
         public float DistanceToSignal { get; set; }
         public float DistanceToObstacle { get; set; }
+        public float EffectiveObstacleDistance
+        {
+            get { return Mathf.Min(DistanceToObstacle, Mathf.Min(_corridorHoldDistance, _switchHoldDistance)); }
+        }
         public float DistanceToDestination { get; set; }
         public bool IsStationDestination { get; set; }
         public bool IsTerminusDestination { get; set; }
@@ -201,6 +205,7 @@ namespace AITraffic.Driver
         private string _corridorHoldReason;
         private float _corridorCheckCooldown;
         private float _corridorHoldDistance = float.PositiveInfinity; // Separate from DistanceToObstacle; not cleared by obstacle sensor
+        private float _switchHoldDistance = float.PositiveInfinity; // Facing switch stop buffer; not cleared by obstacle sensor
         private bool _portsInitialized;
 
         private readonly List<Port> _temperaturePorts = new List<Port>();
@@ -452,6 +457,8 @@ namespace AITraffic.Driver
             float distTraveled = CurrentSpeedMs * dt;
             if (!float.IsInfinity(DistanceToSignal)) DistanceToSignal = Mathf.Max(0f, DistanceToSignal - distTraveled);
             if (!float.IsInfinity(DistanceToObstacle)) DistanceToObstacle = Mathf.Max(0f, DistanceToObstacle - distTraveled);
+            if (!float.IsInfinity(_corridorHoldDistance)) _corridorHoldDistance = Mathf.Max(0f, _corridorHoldDistance - distTraveled);
+            if (!float.IsInfinity(_switchHoldDistance)) _switchHoldDistance = Mathf.Max(0f, _switchHoldDistance - distTraveled);
             if (!float.IsInfinity(DistanceToDestination)) DistanceToDestination = Mathf.Max(0f, DistanceToDestination - distTraveled);
 
             _heavySensorUpdateCooldown -= dt;
@@ -734,6 +741,7 @@ namespace AITraffic.Driver
                 // 3a. Proactively align and lock switches along upcoming planned route (up to 900m ahead / 15 tracks)
                 float accumulatedSwitchDist = 0.0f;
                 RailTrack prevSwitchTrack = curTrack;
+                _switchHoldDistance = float.PositiveInfinity;
 
                 for (int i = 0; i < _upcomingTracks.Count; i++)
                 {
@@ -789,10 +797,7 @@ namespace AITraffic.Driver
                             if (!switchAligned && isFacingMove && routeDist >= 30.0f && routeDist < 600f)
                             {
                                 float stopBufferDist = Mathf.Max(15.0f, routeDist - 25.0f);
-                                if (stopBufferDist < DistanceToObstacle)
-                                {
-                                    DistanceToObstacle = stopBufferDist;
-                                }
+                                _switchHoldDistance = Mathf.Min(_switchHoldDistance, stopBufferDist);
                             }
 
                             // Critical Approach Lock: within 250m ahead of train along route (or immediate proximity)
@@ -1478,7 +1483,7 @@ namespace AITraffic.Driver
                 direction: TargetDirection,
                 upcomingTracks: UpcomingTracks,
                 upcomingSignals: _upcomingSignals,
-                distanceToObstacle: Mathf.Min(DistanceToObstacle, _corridorHoldDistance),
+                distanceToObstacle: EffectiveObstacleDistance,
                 distanceToDestination: DistanceToDestination,
                 isStationStop: IsStationDestination,
                 isTerminusStop: IsTerminusDestination
@@ -2501,7 +2506,7 @@ namespace AITraffic.Driver
                     float brakeOutput = BrakePID.Update(CurrentSpeedKmh, TargetSpeedKmh, dt);
 
                     // Dynamic stopping urgency calculation for Red Signals (Hp 0), Obstacles, Corridor Holds, and Buffer Stops
-                    float distToStop = Mathf.Min(DistanceToSignal, Mathf.Min(Mathf.Min(DistanceToObstacle, _corridorHoldDistance), DistanceToDestination));
+                    float distToStop = Mathf.Min(DistanceToSignal, Mathf.Min(EffectiveObstacleDistance, DistanceToDestination));
                     if (distToStop < 600.0f && TargetSpeedKmh <= 15.0f)
                     {
                         // Stop target buffer: 20m before signal mast / buffer stop
@@ -2630,7 +2635,7 @@ namespace AITraffic.Driver
             }
 
             // Independent locomotive direct brake assists at low speeds / final stop
-            float distToStop = Mathf.Min(DistanceToSignal, Mathf.Min(Mathf.Min(DistanceToObstacle, _corridorHoldDistance), DistanceToDestination));
+            float distToStop = Mathf.Min(DistanceToSignal, Mathf.Min(EffectiveObstacleDistance, DistanceToDestination));
             if (TargetSpeedKmh <= 0.5f || distToStop < 100.0f)
             {
                 if (CurrentSpeedKmh < 18.0f)
@@ -2649,7 +2654,7 @@ namespace AITraffic.Driver
 
             // Imminent physical obstacle / corridor hold emergency clamping
             // Only force emergency application if critically close or carrying dangerous excess speed
-            float effObstDist = Mathf.Min(DistanceToObstacle, _corridorHoldDistance);
+            float effObstDist = EffectiveObstacleDistance;
             if (effObstDist < 30.0f || (effObstDist < 80.0f && CurrentSpeedKmh > 25.0f))
             {
                 _commandedTrainBrake = 1.0f;
@@ -2790,11 +2795,11 @@ namespace AITraffic.Driver
             // 2. Train Air Brake Rate-Limiting
             // Fast application (3.5/s) when increasing brake, gentle smooth release (0.45/s) to conserve reservoir air
             float brakeSlew = (_commandedTrainBrake > _currentTrainBrake) ? 3.5f : 0.45f;
-            float distToStop = Mathf.Min(DistanceToSignal, Mathf.Min(Mathf.Min(DistanceToObstacle, _corridorHoldDistance), DistanceToDestination));
+            float distToStop = Mathf.Min(DistanceToSignal, Mathf.Min(EffectiveObstacleDistance, DistanceToDestination));
 
             // Instant full application for emergency, stationary holding, or rollback arrest:
             if (_commandedTrainBrake >= 0.85f &&
-                (distToStop < 160.0f || Mathf.Min(DistanceToObstacle, _corridorHoldDistance) < 160.0f ||
+                (distToStop < 160.0f || EffectiveObstacleDistance < 160.0f ||
                  _isRollbackDetected || _hillRollbackHoldTimer > 0.0f ||
                  State == EngineState.Idle || State == EngineState.Starting || State == EngineState.StationHold || State == EngineState.TerminusStop))
             {
