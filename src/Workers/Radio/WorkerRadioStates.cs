@@ -476,7 +476,8 @@ namespace AITraffic.Workers.Radio
                 Requester = loco,
                 RequesterTrainset = loco.trainset,
                 PreferSpeedOverDistance = true,
-                AvoidOccupiedTracks = false,
+                AvoidOccupiedTracks = true,
+                StrictlyAvoidOccupied = true,
                 PreventPlayerOvertake = false,
                 MaxSearchDistance = 5000000f
             };

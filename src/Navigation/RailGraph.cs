@@ -566,37 +566,59 @@ namespace AITraffic.Navigation
                                 string trackPart = logicTrack.ID.TrackPartOnly ?? string.Empty;
 
                                 string tName = edge.Track.name ?? string.Empty;
-                                bool isDeadEnd = (edge.FromNode != null && edge.FromNode.IsDeadEnd) || 
-                                                 (edge.ToNode != null && edge.ToNode.IsDeadEnd) ||
-                                                 (edge.Track.inJunction == null && edge.Track.outJunction == null);
+                                bool isDoubleTrackMod = tName.IndexOf("doubletrack", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                                        tName.IndexOf("[#]", StringComparison.OrdinalIgnoreCase) >= 0;
 
-                                bool isStorageOrLoading = tName.StartsWith("[Y]", StringComparison.OrdinalIgnoreCase) ||
-                                                          tName.StartsWith("[L]", StringComparison.OrdinalIgnoreCase) ||
-                                                          tName.StartsWith("[C]", StringComparison.OrdinalIgnoreCase) ||
-                                                          trackPart.StartsWith("Y", StringComparison.OrdinalIgnoreCase) ||
-                                                          trackPart.StartsWith("L", StringComparison.OrdinalIgnoreCase) ||
-                                                          trackPart.StartsWith("C", StringComparison.OrdinalIgnoreCase);
-
-                                // Passing sidings [S] and platform loops [P] connected at both ends are through-running lines, not yard tracks
-                                if (isDeadEnd || isStorageOrLoading)
+                                if (isDoubleTrackMod)
                                 {
-                                    edge.IsYardTrack = true;
+                                    edge.IsDoubleTrackMainline = true;
+                                    edge.IsYardTrack = false;
+                                }
+                                else
+                                {
+                                    bool isDeadEnd = (edge.FromNode != null && edge.FromNode.IsDeadEnd) || 
+                                                     (edge.ToNode != null && edge.ToNode.IsDeadEnd) ||
+                                                     (edge.Track.inJunction == null && edge.Track.outJunction == null);
+
+                                    bool isStorageOrLoading = tName.StartsWith("[Y]", StringComparison.OrdinalIgnoreCase) ||
+                                                              tName.StartsWith("[L]", StringComparison.OrdinalIgnoreCase) ||
+                                                              tName.StartsWith("[C]", StringComparison.OrdinalIgnoreCase) ||
+                                                              trackPart.StartsWith("Y", StringComparison.OrdinalIgnoreCase) ||
+                                                              trackPart.StartsWith("L", StringComparison.OrdinalIgnoreCase) ||
+                                                              trackPart.StartsWith("C", StringComparison.OrdinalIgnoreCase);
+
+                                    // Passing sidings [S] and platform loops [P] connected at both ends are through-running lines, not yard tracks
+                                    if (isDeadEnd || isStorageOrLoading)
+                                    {
+                                        edge.IsYardTrack = true;
+                                    }
                                 }
                             }
                         }
                         else
                         {
                             string tName = edge.Track.name ?? string.Empty;
-                            bool isDeadEnd = (edge.FromNode != null && edge.FromNode.IsDeadEnd) || 
-                                             (edge.ToNode != null && edge.ToNode.IsDeadEnd);
+                            bool isDoubleTrackMod = tName.IndexOf("doubletrack", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                                    tName.IndexOf("[#]", StringComparison.OrdinalIgnoreCase) >= 0;
 
-                            if (isDeadEnd ||
-                                tName.StartsWith("[yard", StringComparison.OrdinalIgnoreCase) ||
-                                tName.StartsWith("[Y]", StringComparison.OrdinalIgnoreCase) ||
-                                tName.StartsWith("[L]", StringComparison.OrdinalIgnoreCase) ||
-                                tName.StartsWith("[C]", StringComparison.OrdinalIgnoreCase))
+                            if (isDoubleTrackMod)
                             {
-                                edge.IsYardTrack = true;
+                                edge.IsDoubleTrackMainline = true;
+                                edge.IsYardTrack = false;
+                            }
+                            else
+                            {
+                                bool isDeadEnd = (edge.FromNode != null && edge.FromNode.IsDeadEnd) || 
+                                                 (edge.ToNode != null && edge.ToNode.IsDeadEnd);
+
+                                if (isDeadEnd ||
+                                    tName.StartsWith("[yard", StringComparison.OrdinalIgnoreCase) ||
+                                    tName.StartsWith("[Y]", StringComparison.OrdinalIgnoreCase) ||
+                                    tName.StartsWith("[L]", StringComparison.OrdinalIgnoreCase) ||
+                                    tName.StartsWith("[C]", StringComparison.OrdinalIgnoreCase))
+                                {
+                                    edge.IsYardTrack = true;
+                                }
                             }
                         }
                     }
@@ -673,6 +695,20 @@ namespace AITraffic.Navigation
             const float minParallelDistance = 2.5f;
             const float maxParallelDistance = 12.0f;
             const float minTangentAlignment = 0.85f;
+
+            for (int e = 0; e < Edges.Count; e++)
+            {
+                var edge = Edges[e];
+                if (edge != null && edge.Track != null && edge.Track.name != null)
+                {
+                    if (edge.Track.name.IndexOf("doubletrack", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                        edge.Track.name.IndexOf("[#]", StringComparison.OrdinalIgnoreCase) >= 0)
+                    {
+                        edge.IsDoubleTrackMainline = true;
+                        edge.IsYardTrack = false;
+                    }
+                }
+            }
 
             var mainlineEdges = Edges.Where(e => !e.IsYardTrack && e.Length >= 20f).ToList();
 
@@ -969,13 +1005,69 @@ namespace AITraffic.Navigation
 
         #region Reservations & Occupancy
 
-        public bool IsTrackOccupied(RailTrack track, Trainset ignoreTrainset = null)
+        /// <summary>
+        /// Builds a snapshot set of all tracks physically occupied by cars in the world,
+        /// optionally ignoring cars belonging to ignoreTrainset.
+        /// Call once before a batch of pathfinding/occupancy queries to achieve O(1) checks.
+        /// </summary>
+        public static HashSet<RailTrack> BuildOccupiedTracksSnapshot(Trainset ignoreTrainset = null)
+        {
+            var occupied = new HashSet<RailTrack>();
+            try
+            {
+                if (CarSpawner.Instance != null && CarSpawner.Instance.AllCars != null)
+                {
+                    var allCars = CarSpawner.Instance.AllCars;
+                    int count = allCars.Count;
+                    for (int i = 0; i < count; i++)
+                    {
+                        var car = allCars[i];
+                        if (car == null) continue;
+                        if (ignoreTrainset != null && (car.trainset == ignoreTrainset || (ignoreTrainset.cars != null && ignoreTrainset.cars.Contains(car))))
+                            continue;
+
+                        if (car.FrontBogie != null && car.FrontBogie.track != null)
+                            occupied.Add(car.FrontBogie.track);
+                        if (car.RearBogie != null && car.RearBogie.track != null)
+                            occupied.Add(car.RearBogie.track);
+                    }
+                }
+            }
+            catch { }
+            return occupied;
+        }
+
+        private static HashSet<RailTrack> s_cachedFrameOccupiedTracks = null;
+        private static int s_lastOccupiedSnapshotFrame = -1;
+        private static readonly object s_snapshotLock = new object();
+
+        private static HashSet<RailTrack> GetOrCreateFrameOccupiedSnapshot()
+        {
+            int currentFrame = Time.frameCount;
+            if (s_cachedFrameOccupiedTracks == null || s_lastOccupiedSnapshotFrame != currentFrame)
+            {
+                lock (s_snapshotLock)
+                {
+                    if (s_cachedFrameOccupiedTracks == null || s_lastOccupiedSnapshotFrame != currentFrame)
+                    {
+                        s_cachedFrameOccupiedTracks = BuildOccupiedTracksSnapshot(null);
+                        s_lastOccupiedSnapshotFrame = currentFrame;
+                    }
+                }
+            }
+            return s_cachedFrameOccupiedTracks;
+        }
+
+        /// <summary>
+        /// O(1) check whether a track is physically occupied using a precomputed snapshot and direct bogie query.
+        /// </summary>
+        public bool IsTrackOccupied(RailTrack track, HashSet<RailTrack> occupiedSnapshot, Trainset ignoreTrainset = null)
         {
             if (track == null) return false;
 
             try
             {
-                // 1. Direct physical bogie registry on track (fastest and most comprehensive)
+                // 1. Direct physical bogie check on track (O(1))
                 var bogies = track.BogiesOnTrack();
                 if (bogies != null && bogies.Count > 0)
                 {
@@ -994,35 +1086,47 @@ namespace AITraffic.Navigation
                     }
                 }
 
-                // 2. Physical train car bogie fallback check
-                if (CarSpawner.Instance != null && CarSpawner.Instance.AllCars != null)
+                // 2. Snapshot lookup (O(1))
+                if (occupiedSnapshot != null)
                 {
-                    var allCars = CarSpawner.Instance.AllCars;
-                    int count = allCars.Count;
-                    for (int i = 0; i < count; i++)
-                    {
-                        var car = allCars[i];
-                        if (car == null) continue;
-                        if (ignoreTrainset != null && (car.trainset == ignoreTrainset || (ignoreTrainset.cars != null && ignoreTrainset.cars.Contains(car))))
-                            continue;
+                    return occupiedSnapshot.Contains(track);
+                }
+            }
+            catch { }
 
-                        if ((car.FrontBogie != null && car.FrontBogie.track == track) ||
-                            (car.RearBogie != null && car.RearBogie.track == track))
+            return false;
+        }
+
+        public bool IsTrackOccupied(RailTrack track, Trainset ignoreTrainset = null)
+        {
+            if (track == null) return false;
+
+            try
+            {
+                // 1. Direct physical bogie registry on track (fastest and most comprehensive, O(1))
+                var bogies = track.BogiesOnTrack();
+                if (bogies != null && bogies.Count > 0)
+                {
+                    if (ignoreTrainset == null) return true;
+
+                    foreach (var bogie in bogies)
+                    {
+                        if (bogie != null && bogie.Car != null)
                         {
-                            return true;
+                            if (bogie.Car.trainset != ignoreTrainset &&
+                                (ignoreTrainset.cars == null || !ignoreTrainset.cars.Contains(bogie.Car)))
+                            {
+                                return true;
+                            }
                         }
                     }
                 }
 
-                // 3. Logic track check
-                if (RailTrackRegistry.RailTrackToLogicTrack != null)
+                // 2. Fast frame-cached snapshot lookup (O(1))
+                var snapshot = (ignoreTrainset == null) ? GetOrCreateFrameOccupiedSnapshot() : BuildOccupiedTracksSnapshot(ignoreTrainset);
+                if (snapshot != null && snapshot.Contains(track))
                 {
-                    DV.Logic.Job.Track logicTrack;
-                    if (RailTrackRegistry.RailTrackToLogicTrack.TryGetValue(track, out logicTrack))
-                    {
-                        if (logicTrack != null && !logicTrack.IsFree())
-                            return true;
-                    }
+                    return true;
                 }
             }
             catch
@@ -1051,6 +1155,27 @@ namespace AITraffic.Navigation
                 if (_trackReservations.TryGetValue(track, out holder))
                 {
                     return holder != requester;
+                }
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// Returns the AIEngineer (or other object) that holds the reservation on this track,
+        /// as long as it is not the requester itself. Returns null if unreserved or self-reserved.
+        /// Used for direction-aware conflict detection in corridor protection.
+        /// </summary>
+        public bool TryGetTrackReservationHolder(RailTrack track, object requester, out object holder)
+        {
+            holder = null;
+            if (track == null) return false;
+            lock (_lock)
+            {
+                object h;
+                if (_trackReservations.TryGetValue(track, out h) && h != null && h != requester)
+                {
+                    holder = h;
+                    return true;
                 }
                 return false;
             }

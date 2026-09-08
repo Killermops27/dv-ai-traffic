@@ -2,6 +2,9 @@ using System;
 using System.Collections;
 using System.Collections.Generic;
 using DV.Simulation.Cars;
+using DV.ThingTypes;
+using LocoSim.Definitions;
+using LocoSim.Implementations;
 using Signals.Game;
 using UnityEngine;
 using DVSignal = Signals.Game.Signal;
@@ -153,11 +156,60 @@ namespace AITraffic.Driver
         private float _brakeHoldTimer;
 
         // Wheel slip recovery & sander interval control
+        public bool IsWheelSlipping { get { return _isWheelSlipping; } }
+        public float SlipThrottleReduction { get { return _slipThrottleReduction; } }
         private bool _isWheelSlipping;
         private float _sanderActiveTimer;
         private float _sanderRestTimer;
         private bool _sanderRequested;
+        private float _sandHoldTimer;
         private float _slipThrottleReduction;
+
+        // Powertrain Protection: Thermal, Over-Current & Anti-Rollback
+        public float CurrentMaxTemperature { get; private set; }
+        public float CurrentAmpsPerTM { get; private set; }
+        public float ThermalThrottleLimit { get; private set; }
+        public float OvercurrentThrottleLimit { get; private set; }
+        public bool IsOverheated { get; private set; }
+        public bool IsRollbackDetected { get; private set; }
+        public bool IsHillStarting { get; private set; }
+
+        public bool IsLocoDM3
+        {
+            get
+            {
+                if (_dm3Controller != null && _dm3Controller.IsDM3) return true;
+                if (_trainCar != null)
+                {
+                    if (_trainCar.carType == TrainCarType.LocoDM3) return true;
+                    string lId = _trainCar.carLivery != null ? _trainCar.carLivery.id : "";
+                    if (lId.IndexOf("DM3", StringComparison.OrdinalIgnoreCase) >= 0) return true;
+                }
+                return false;
+            }
+        }
+
+        // Single-Track Corridor & Deadlock Prevention
+        public bool IsHoldingForCorridor { get { return _isHoldingForCorridor; } }
+        public string CorridorHoldReason { get { return _corridorHoldReason; } }
+
+        private float _thermalThrottleLimit;
+        private float _overcurrentThrottleLimit;
+        private bool _isOverheated;
+        private bool _isRollbackDetected;
+        private bool _isHoldingForCorridor;
+        private string _corridorHoldReason;
+        private float _corridorCheckCooldown;
+        private float _corridorHoldDistance = float.PositiveInfinity; // Separate from DistanceToObstacle; not cleared by obstacle sensor
+        private bool _portsInitialized;
+
+        private readonly List<Port> _temperaturePorts = new List<Port>();
+        private readonly List<Port> _amperagePorts = new List<Port>();
+        private Port _portAmpsPerTM;
+        private Port _portTotalAmps;
+        private Port _portEngineOn;
+        private Port _portEngineRpm;
+        private float _rollbackClearTimer;
 
         // Acceleration feedback & soft-launch throttle
         public float CurrentAccelerationMs2 { get; private set; }
@@ -165,6 +217,7 @@ namespace AITraffic.Driver
         private float _smoothAccMs2;
         private float _rampThrottle;
         private float _hillAssistBoost;
+        private float _hillRollbackHoldTimer;
         private float _stallRestartCooldown;
 
         // Level crossing horn sequence
@@ -182,6 +235,8 @@ namespace AITraffic.Driver
         private readonly List<AITraffic.Navigation.SignalRegistry.UpcomingSignal> _upcomingSignals = new List<AITraffic.Navigation.SignalRegistry.UpcomingSignal>();
         private readonly HashSet<RailTrack> _reservedTracks = new HashSet<RailTrack>();
         private readonly HashSet<DVSignal> _reservedDVSignals = new HashSet<DVSignal>();
+        private RailTrack _obstacleTrack;
+        private float _obstacleRerouteCooldown;
 
         #endregion
 
@@ -200,6 +255,8 @@ namespace AITraffic.Driver
             BrakeSlewRate = 0.85f;
             DynamicBrakeSlewRate = 0.85f;
             _slipThrottleReduction = 1.0f;
+            _thermalThrottleLimit = 1.0f;
+            _overcurrentThrottleLimit = 1.0f;
             _rampThrottle = 0.0f;
             SpawnTime = Time.time;
             StationaryTimer = 0.0f;
@@ -281,7 +338,9 @@ namespace AITraffic.Driver
 
             UpdateSensors(dt);
             UpdatePathAndJunctions(dt);
+            UpdateSingleTrackCorridorProtection(dt);
             UpdateWheelSlipProtection(dt);
+            UpdatePowertrainProtection(dt);
             UpdateLevelCrossingHorn(dt);
             UpdateSpeedProfile(dt);
             UpdateStateMachine(dt);
@@ -340,6 +399,7 @@ namespace AITraffic.Driver
             if (_trainCar.SimController != null)
             {
                 _controlsOverrider = _trainCar.SimController.controlsOverrider;
+                InitializeSimulationPorts();
             }
 
             if (_controlsOverrider != null)
@@ -347,6 +407,8 @@ namespace AITraffic.Driver
                 _hasDynamicBrake = _controlsOverrider.DynamicBrake != null;
                 EnsureEngineRunning();
             }
+
+            ReleaseAllConsistHandbrakes();
         }
 
         #endregion
@@ -450,7 +512,24 @@ namespace AITraffic.Driver
 
                 Vector3 desiredMoveVector = tangent * TargetDirection;
                 float dot = Vector3.Dot(_trainCar.transform.forward, desiredMoveVector);
-                _desiredReverser = (dot >= 0.0f) ? 1.0f : -1.0f;
+
+                // Lock reverser while rolling to prevent curvature tangent flutter from flipping reverser on mainlines
+                if (CurrentSpeedMs > 0.4f)
+                {
+                    // Maintain current desired reverser orientation while moving forward
+                }
+                else
+                {
+                    // Only change reverser while stationary if dot product is decisive (hysteresis prevents flip-flopping)
+                    if (dot > 0.25f)
+                    {
+                        _desiredReverser = 1.0f;
+                    }
+                    else if (dot < -0.25f)
+                    {
+                        _desiredReverser = -1.0f;
+                    }
+                }
             }
             else if (TargetDirection == 0.0f)
             {
@@ -472,13 +551,16 @@ namespace AITraffic.Driver
 
             // Look up physical obstacles / other train cars on route ahead (double-layer collision prevention)
             float distObstacle;
-            if (AITraffic.Navigation.SignalRegistry.TryFindUpcomingObstacle(currentTrack, currentSpan, TargetDirection, UpcomingTracks, _trainCar != null ? _trainCar.trainset : null, out distObstacle))
+            RailTrack obstTrack;
+            if (AITraffic.Navigation.SignalRegistry.TryFindUpcomingObstacle(currentTrack, currentSpan, TargetDirection, UpcomingTracks, _trainCar != null ? _trainCar.trainset : null, out distObstacle, _trainCar, out obstTrack))
             {
                 DistanceToObstacle = distObstacle;
+                _obstacleTrack = obstTrack;
             }
             else
             {
                 DistanceToObstacle = float.PositiveInfinity;
+                _obstacleTrack = null;
             }
 
             // Calculate upcoming Signal Blocks along active route (Block 1: Train -> S1, Block 2: S1 -> S2)
@@ -516,10 +598,19 @@ namespace AITraffic.Driver
                 }
             }
 
-            // 1b. Check if player has aligned station switches for an open through-track/passing route
-            if (curTrack != null)
+            // 1b. Legacy passing route adoption disabled: AI must maintain planned mainline corridor
+            // and throw switches to its own path rather than adopting diverging yard sidings.
+            // If the route ahead is blocked, dynamic obstacle detour handles rerouting below.
+
+            // 1c. Dynamic Obstacle Detour: if route ahead is blocked by cars on an intermediate track
+            if (curTrack != null && _obstacleTrack != null && _obstacleTrack != curTrack && DistanceToObstacle < 600f)
             {
-                TryAdoptPlayerAlignedPassingRoute(curTrack);
+                _obstacleRerouteCooldown -= dt;
+                if (_obstacleRerouteCooldown <= 0.0f)
+                {
+                    bool rerouted = TryDynamicObstacleReroute(curTrack, _obstacleTrack);
+                    _obstacleRerouteCooldown = rerouted ? 4.0f : 8.0f;
+                }
             }
 
             // 2. Populate UpcomingTracks list for SignalRegistry & SpeedProfiler
@@ -580,12 +671,23 @@ namespace AITraffic.Driver
                 }
 
                 // 2c. Compute locomotive reverser requirement based on physical locomotive heading vs track travel direction
-                double curLocoSpan = (_trainCar != null && _trainCar.FrontBogie != null && _trainCar.FrontBogie.traveller != null) ? _trainCar.FrontBogie.traveller.Span : 0.0;
-                float locoFrac = (float)Mathf.Clamp01((float)(curLocoSpan / curTrack.curve.length));
-                Vector3 curTangent = curTrack.curve.GetTangentAt(locoFrac);
-                Vector3 desiredMoveVector = curTangent * TargetDirection;
-                float dot = (_trainCar != null) ? Vector3.Dot(_trainCar.transform.forward, desiredMoveVector) : 1.0f;
-                _desiredReverser = (dot >= 0.0f) ? 1.0f : -1.0f;
+                // Only evaluate reverser while essentially stationary to lock out curvature coordinate flutter at speed
+                if (CurrentSpeedMs <= 0.3f)
+                {
+                    double curLocoSpan = (_trainCar != null && _trainCar.FrontBogie != null && _trainCar.FrontBogie.traveller != null) ? _trainCar.FrontBogie.traveller.Span : 0.0;
+                    float locoFrac = (float)Mathf.Clamp01((float)(curLocoSpan / curTrack.curve.length));
+                    Vector3 curTangent = curTrack.curve.GetTangentAt(locoFrac);
+                    Vector3 desiredMoveVector = curTangent * TargetDirection;
+                    float dot = (_trainCar != null) ? Vector3.Dot(_trainCar.transform.forward, desiredMoveVector) : 1.0f;
+                    if (dot > 0.25f)
+                    {
+                        _desiredReverser = 1.0f;
+                    }
+                    else if (dot < -0.25f)
+                    {
+                        _desiredReverser = -1.0f;
+                    }
+                }
             }
 
             // 2d. Dynamically compute exact remaining distance along route based on TargetDirection
@@ -651,7 +753,7 @@ namespace AITraffic.Driver
                     curSpan = _trainCar.FrontBogie.traveller.Span;
                 }
 
-                // 3a. Proactively align and lock ALL switches along the entire upcoming planned route (through station throat to mainline)
+                // 3a. Proactively align and lock switches along upcoming planned route (up to 900m ahead / 15 tracks)
                 float accumulatedSwitchDist = 0.0f;
                 RailTrack prevSwitchTrack = curTrack;
 
@@ -667,6 +769,7 @@ namespace AITraffic.Driver
                         if (AITraffic.Navigation.SignalRegistry.TryGetJunctionBetweenTracks(trackA, trackB, out junction, out requiredBranch))
                         {
                             float dist = Vector3.Distance(trainPos, junction.position);
+                            float routeDist = accumulatedSwitchDist;
 
                             // Check if junction is occupied by player or belongs to a player-occupied signal block
                             bool isJunctionInPlayerBlock = false;
@@ -694,21 +797,35 @@ namespace AITraffic.Driver
                                 continue;
                             }
 
-                            // Advance Alignment: set switch immediately so whole station exit/entry route is aligned
-                            if (junction.selectedBranch != requiredBranch)
+                            // Advance Alignment: set switch immediately so station exit/entry route is aligned
+                            bool switchAligned = (junction.selectedBranch == requiredBranch);
+                            if (!switchAligned)
                             {
-                                AITraffic.Navigation.JunctionController.Instance.RequestJunctionAlignment(junction, requiredBranch, this);
+                                switchAligned = AITraffic.Navigation.JunctionController.Instance.RequestJunctionAlignment(junction, requiredBranch, this);
                             }
 
-                            // Critical Approach Lock: within 250m ahead of train
-                            if (dist < 250f)
+                            // If an upcoming junction within 600m along route is NOT aligned to our route (e.g. occupied or locked by another train):
+                            // Treat the switch fouling point as a protective stop boundary!
+                            // Only apply when outside the switch entry zone (routeDist >= 30m) and facing (diverging move).
+                            bool isFacingMove = (junction.inBranch != null && junction.inBranch.track == trackA);
+                            if (!switchAligned && isFacingMove && routeDist >= 30.0f && routeDist < 600f)
                             {
-                                AITraffic.Navigation.JunctionController.Instance.TryLockJunction(junction, this, 45f);
+                                float stopBufferDist = Mathf.Max(15.0f, routeDist - 25.0f);
+                                if (stopBufferDist < DistanceToObstacle)
+                                {
+                                    DistanceToObstacle = stopBufferDist;
+                                }
+                            }
+
+                            // Critical Approach Lock: within 250m ahead of train along route (or immediate proximity)
+                            if (routeDist < 250f || dist < 200f)
+                            {
+                                AITraffic.Navigation.JunctionController.Instance.TryLockJunction(junction, this, 60f);
 
                                 // Register passing clearance for rear bogie when entering switch zone
-                                if (dist < 40f && rearBogie != null)
+                                if ((routeDist < 40f || dist < 40f) && rearBogie != null)
                                 {
-                                    AITraffic.Navigation.JunctionController.Instance.RegisterTrainPassing(this, junction, rearBogie, trackB, 45f);
+                                    AITraffic.Navigation.JunctionController.Instance.RegisterTrainPassing(this, junction, rearBogie, trackB, 90f);
                                 }
                             }
                         }
@@ -719,7 +836,7 @@ namespace AITraffic.Driver
                     {
                         accumulatedSwitchDist += trackB.curve.length;
                     }
-                    if (accumulatedSwitchDist > 2500f || i > 40)
+                    if (accumulatedSwitchDist > 900f || i > 15)
                     {
                         break;
                     }
@@ -755,57 +872,56 @@ namespace AITraffic.Driver
                 }
 
                 // 3c. DVSignals Interlocking Route Reservation (Hp 0 -> Hp 1 / Hp 2 transition)
-                // When switches along upcoming signal blocks are aligned, reserve the signals so DVSignals SpecialRequireReservationAspect clears to Hp 1/Hp 2!
+                // Strictly reserve ONLY the immediate governing signal directly in front of the train!
+                // Reserving downstream exit/departure signals prematurely overlaps station track reservations,
+                // causing DVSignals TrackReserver.IsSignalReservedByAnother to drop the station entry signal to Hp 0.
                 var desiredSignalReservations = new HashSet<DVSignal>();
 
-                for (int b = 0; b < _upcomingSignalBlocks.Count; b++)
-                {
-                    var block = _upcomingSignalBlocks[b];
-                    if (block == null) continue;
+                DVSignal targetSignalToReserve = null;
 
-                    // If switches are aligned and block is clear:
-                    if (block.AreSwitchesAligned && block.IsClear)
+                // Priority 1: If immediate upcoming signal is a shunting signal within 600m
+                if (_upcomingSignals.Count > 0 && _upcomingSignals[0].Signal != null && _upcomingSignals[0].Signal.IsShunting)
+                {
+                    if (_upcomingSignals[0].Distance < 600f)
                     {
-                        if (block.EntrySignal != null && block.DistanceToEntry < 1500f)
+                        if (_upcomingSignalBlocks.Count > 0 && _upcomingSignalBlocks[0].AreSwitchesAligned && _upcomingSignalBlocks[0].IsClear)
                         {
-                            desiredSignalReservations.Add(block.EntrySignal);
-                            if (!_reservedDVSignals.Contains(block.EntrySignal))
-                            {
-                                if (AITraffic.Navigation.SignalRegistry.TryReserveDVSignal(block.EntrySignal))
-                                {
-                                    _reservedDVSignals.Add(block.EntrySignal);
-                                }
-                            }
+                            targetSignalToReserve = _upcomingSignals[0].Signal;
+                        }
+                    }
+                }
+                // Priority 2: Reserve the immediate next Main Signal ahead of the train
+                else if (_upcomingSignalBlocks.Count > 0 && _upcomingSignalBlocks[0].ExitSignal != null)
+                {
+                    var block1 = _upcomingSignalBlocks[0];
+                    float distToMainSignal = block1.DistanceToExit;
+
+                    // Reserve when within lookahead horizon (1200m) and switches up to the signal are aligned and clear
+                    if (distToMainSignal < 1200f && block1.AreSwitchesAligned && block1.IsClear)
+                    {
+                        var candidateSig = block1.ExitSignal;
+
+                        // Check downstream block governed by candidateSig (e.g. station track)
+                        bool downstreamReady = true;
+                        if (_upcomingSignalBlocks.Count > 1 && _upcomingSignalBlocks[1].EntrySignal == candidateSig)
+                        {
+                            var block2 = _upcomingSignalBlocks[1];
+                            downstreamReady = block2.AreSwitchesAligned && block2.IsClear;
                         }
 
-                        if (block.ExitSignal != null && block.DistanceToExit < 1500f)
+                        if (downstreamReady)
                         {
-                            desiredSignalReservations.Add(block.ExitSignal);
-                            if (!_reservedDVSignals.Contains(block.ExitSignal))
-                            {
-                                if (AITraffic.Navigation.SignalRegistry.TryReserveDVSignal(block.ExitSignal))
-                                {
-                                    _reservedDVSignals.Add(block.ExitSignal);
-                                }
-                            }
+                            targetSignalToReserve = candidateSig;
                         }
                     }
                 }
 
-                // Also reserve immediate ApproachingSignal if within lookahead and all intermediate switches are aligned
-                if (ApproachingSignal != null && DistanceToSignal < 1500f)
+                if (targetSignalToReserve != null)
                 {
-                    desiredSignalReservations.Add(ApproachingSignal);
-                    if (!_reservedDVSignals.Contains(ApproachingSignal))
-                    {
-                        if (AITraffic.Navigation.SignalRegistry.TryReserveDVSignal(ApproachingSignal))
-                        {
-                            _reservedDVSignals.Add(ApproachingSignal);
-                        }
-                    }
+                    desiredSignalReservations.Add(targetSignalToReserve);
                 }
 
-                // Progressive release of passed signals
+                // Progressive release of passed or unneeded signal reservations FIRST
                 List<DVSignal> sigsToRelease = null;
                 foreach (var sig in _reservedDVSignals)
                 {
@@ -821,6 +937,15 @@ namespace AITraffic.Driver
                     {
                         AITraffic.Navigation.SignalRegistry.ClearDVSignalReservation(sigsToRelease[s]);
                         _reservedDVSignals.Remove(sigsToRelease[s]);
+                    }
+                }
+
+                // Now reserve the governing signal if not already held
+                if (targetSignalToReserve != null && !_reservedDVSignals.Contains(targetSignalToReserve))
+                {
+                    if (AITraffic.Navigation.SignalRegistry.TryReserveDVSignal(targetSignalToReserve))
+                    {
+                        _reservedDVSignals.Add(targetSignalToReserve);
                     }
                 }
 
@@ -902,23 +1027,17 @@ namespace AITraffic.Driver
 
             RailTrack alignedFirstTrack = alignedBranch.track;
 
-            // Check if the switch is set to an alternative branch, or if our planned route ahead is blocked by player
-            RailTrack plannedNextTrack = (divergePathIdx + 1 < CurrentPath.Tracks.Count) ? CurrentPath.Tracks[divergePathIdx + 1] : null;
-            bool isSwitchSetToAlternative = (plannedNextTrack != null && alignedFirstTrack != plannedNextTrack);
-
-            if (!isSwitchSetToAlternative)
+            // Enforce that our planned route ahead MUST be physically blocked by player or obstacles before even considering an alternative
+            bool isPlannedBlocked = false;
+            for (int p = divergePathIdx + 1; p < CurrentPath.Tracks.Count && p < divergePathIdx + 6; p++)
             {
-                bool isPlannedBlocked = false;
-                for (int p = divergePathIdx + 1; p < CurrentPath.Tracks.Count && p < divergePathIdx + 6; p++)
+                if (AITraffic.Navigation.SignalRegistry.IsTrackOccupiedByPlayer(CurrentPath.Tracks[p], _trainCar != null ? _trainCar.trainset : null))
                 {
-                    if (AITraffic.Navigation.SignalRegistry.IsTrackOccupiedByPlayer(CurrentPath.Tracks[p], _trainCar != null ? _trainCar.trainset : null))
-                    {
-                        isPlannedBlocked = true;
-                        break;
-                    }
+                    isPlannedBlocked = true;
+                    break;
                 }
-                if (!isPlannedBlocked) return false;
             }
+            if (!isPlannedBlocked) return false;
 
             // 1. Trace the physically aligned route through the station
             var alignedRouteTracks = new List<RailTrack>();
@@ -969,9 +1088,11 @@ namespace AITraffic.Driver
             }
 
             // 2. Validate Aligned Route:
-            // 2a. No track in the aligned route may be occupied by the player
+            // 2a. NEVER adopt yard, siding, or shunting tracks; no track may be occupied by player
             for (int i = 0; i < alignedRouteTracks.Count; i++)
             {
+                if (AITraffic.Navigation.Pathfinder.IsYardOrShuntingTrack(alignedRouteTracks[i]))
+                    return false;
                 if (AITraffic.Navigation.SignalRegistry.IsTrackOccupiedByPlayer(alignedRouteTracks[i], _trainCar != null ? _trainCar.trainset : null))
                     return false;
             }
@@ -1000,9 +1121,10 @@ namespace AITraffic.Driver
                 var options = new AITraffic.Navigation.PathfinderOptions
                 {
                     Requester = this,
+                    RequesterTrainset = _trainCar != null ? _trainCar.trainset : null,
                     PreventPlayerOvertake = false,
                     AvoidOccupiedTracks = true,
-                    StrictlyAvoidOccupied = false
+                    StrictlyAvoidOccupied = true
                 };
 
                 var pathfinder = new AITraffic.Navigation.Pathfinder(AITraffic.Navigation.RailGraph.Instance);
@@ -1065,6 +1187,277 @@ namespace AITraffic.Driver
             return false;
         }
 
+        /// <summary>
+        /// Dynamic Obstacle Detour:
+        /// If an upcoming intermediate track on our planned route is physically blocked by stationary cars
+        /// (e.g. from freshly populated station tracks or unexpected stopped stock), dynamically calculates
+        /// an alternative route avoiding the occupied track and splices it into CurrentPath.
+        /// </summary>
+        private bool TryDynamicObstacleReroute(RailTrack curTrack, RailTrack blockedTrack)
+        {
+            if (curTrack == null || blockedTrack == null || CurrentPath == null || CurrentPath.Tracks == null || CurrentPath.Tracks.Count <= 1)
+                return false;
+
+            if (_trainCar == null) return false;
+
+            // Destination track
+            RailTrack destTrack = CurrentPath.Tracks[CurrentPath.Tracks.Count - 1];
+            if (destTrack == null || blockedTrack == destTrack)
+                return false; // Cannot detour around final destination track
+
+            // Ensure blocked track is actually in our upcoming route
+            int blockedIdx = CurrentPath.Tracks.IndexOf(blockedTrack);
+            if (blockedIdx <= CurrentPathTrackIndex)
+                return false;
+
+            var pathOptions = new AITraffic.Navigation.PathfinderOptions
+            {
+                Requester = this,
+                RequesterTrainset = _trainCar.trainset,
+                PreferSpeedOverDistance = true,
+                AvoidOccupiedTracks = true,
+                StrictlyAvoidOccupied = true,
+                AvoidReservedTracks = true,
+                StrictlyAvoidReserved = false,
+                PreventPlayerOvertake = false,
+                MaxSearchDistance = 5000000f,
+                ExcludedTracks = new HashSet<RailTrack> { blockedTrack }
+            };
+
+            var pathfinder = new AITraffic.Navigation.Pathfinder(AITraffic.Navigation.RailGraph.Instance);
+            var alternativePath = pathfinder.FindPath(curTrack, destTrack, pathOptions);
+
+            if (alternativePath == null || !alternativePath.IsValid || alternativePath.Tracks == null || alternativePath.Tracks.Count < 2)
+                return false;
+
+            // Verify that the alternative route does NOT contain the blocked track
+            if (alternativePath.Tracks.Contains(blockedTrack))
+                return false;
+
+            // Adopt the alternative detour route!
+            var combinedTracks = new List<RailTrack>();
+            for (int i = 0; i <= CurrentPathTrackIndex; i++)
+            {
+                combinedTracks.Add(CurrentPath.Tracks[i]);
+            }
+            for (int i = 1; i < alternativePath.Tracks.Count; i++)
+            {
+                var trk = alternativePath.Tracks[i];
+                if (!combinedTracks.Contains(trk))
+                {
+                    combinedTracks.Add(trk);
+                }
+            }
+
+            var fullPathfinder = new AITraffic.Navigation.Pathfinder(AITraffic.Navigation.RailGraph.Instance);
+            var newFullPath = fullPathfinder.BuildPathFromTracks(combinedTracks);
+
+            if (newFullPath != null && newFullPath.IsValid)
+            {
+                CurrentPath = newFullPath;
+                _upcomingTracks.Clear();
+                int newIdx = CurrentPath.Tracks.IndexOf(curTrack);
+                if (newIdx >= 0) CurrentPathTrackIndex = newIdx;
+                for (int i = CurrentPathTrackIndex; i < CurrentPath.Tracks.Count; i++)
+                {
+                    _upcomingTracks.Add(CurrentPath.Tracks[i]);
+                }
+
+                _obstacleTrack = null;
+                DistanceToObstacle = float.PositiveInfinity;
+
+                if (Main.ModEntry != null && Main.ModEntry.Logger != null)
+                {
+                    Main.ModEntry.Logger.Log(string.Format("[AITraffic] Dynamic Detour: Route ahead was blocked by cars on '{0}'. Successfully re-routed via alternative clear path ({1} tracks) to destination '{2}'.",
+                        blockedTrack.name, CurrentPath.Tracks.Count, DestinationStationName ?? destTrack.name));
+                }
+                return true;
+            }
+
+            return false;
+        }
+
+        /// <summary>
+        /// Single-Track Corridor & Anti-Deadlock Interlocking:
+        /// Scans the upcoming single-track corridor bounded by passing loops, sidings, or stations.
+        /// If an opposing AI train or oncoming/occupying player train is detected in the corridor,
+        /// commands the train to hold at the passing loop / siding signal before entering the single track.
+        /// Once clear, acquires track reservations across the corridor to protect it from opposing traffic.
+        /// Respects Ride-Along mode exemption when player is riding the AI train.
+        /// </summary>
+        private void UpdateSingleTrackCorridorProtection(float dt)
+        {
+            if (CurrentPath == null || CurrentPath.Tracks == null || _trainCar == null) return;
+            if (AITraffic.Navigation.RailGraph.Instance == null || !AITraffic.Navigation.RailGraph.Instance.IsInitialized) return;
+
+            _corridorCheckCooldown -= dt;
+            if (_corridorCheckCooldown > 0.0f) return;
+            _corridorCheckCooldown = 0.35f; // Evaluate 3 times per second
+
+            RailTrack curTrack = null;
+            if (_trainCar.FrontBogie != null) curTrack = _trainCar.FrontBogie.track;
+            if (curTrack == null && _trainCar.RearBogie != null) curTrack = _trainCar.RearBogie.track;
+            if (curTrack == null) return;
+
+            // 1. Identify contiguous upcoming single-track corridor segments ahead
+            var corridorTracks = new List<RailTrack>();
+            float distToCorridorStart = 0.0f;
+            float accumulatedDist = 0.0f;
+            bool enteredCorridor = false;
+
+            double curSpan = (_trainCar.FrontBogie != null && _trainCar.FrontBogie.traveller != null) ? _trainCar.FrontBogie.traveller.Span : 0.0;
+            float curTrackLen = (curTrack.curve != null) ? curTrack.curve.length : 50.0f;
+            float distRemainingOnCur = (TargetDirection >= 0.0f) ? Mathf.Max(0.0f, curTrackLen - (float)curSpan) : Mathf.Max(0.0f, (float)curSpan);
+            accumulatedDist = distRemainingOnCur;
+
+            var curEdge = AITraffic.Navigation.RailGraph.Instance.GetEdge(curTrack);
+            bool isCurDouble = (curEdge != null && curEdge.IsDoubleTrackMainline) ||
+                               (curTrack != null && curTrack.name != null && (curTrack.name.IndexOf("doubletrack", StringComparison.OrdinalIgnoreCase) >= 0 || curTrack.name.IndexOf("[#]", StringComparison.OrdinalIgnoreCase) >= 0));
+            bool isCurrentTrackSingle = (curEdge != null && !isCurDouble && !curEdge.IsYardTrack);
+
+            if (isCurrentTrackSingle)
+            {
+                enteredCorridor = true;
+                distToCorridorStart = 0.0f;
+                corridorTracks.Add(curTrack);
+            }
+
+            for (int i = 0; i < _upcomingTracks.Count; i++)
+            {
+                var trk = _upcomingTracks[i];
+                if (trk == null || trk == curTrack) continue;
+
+                var edge = AITraffic.Navigation.RailGraph.Instance.GetEdge(trk);
+                bool isDouble = (edge != null && edge.IsDoubleTrackMainline) ||
+                                (trk != null && trk.name != null && (trk.name.IndexOf("doubletrack", StringComparison.OrdinalIgnoreCase) >= 0 || trk.name.IndexOf("[#]", StringComparison.OrdinalIgnoreCase) >= 0));
+                bool isSingle = (edge != null && !isDouble && !edge.IsYardTrack);
+
+                if (isSingle)
+                {
+                    if (!enteredCorridor)
+                    {
+                        enteredCorridor = true;
+                        distToCorridorStart = accumulatedDist;
+                    }
+                    corridorTracks.Add(trk);
+                }
+                else
+                {
+                    if (enteredCorridor)
+                    {
+                        // Reached a passing siding, station loop, or double-track line at the end of the corridor!
+                        break;
+                    }
+                }
+
+                accumulatedDist += (trk.curve != null ? trk.curve.length : 50.0f);
+                if (accumulatedDist > 2500.0f) break;
+            }
+
+            if (corridorTracks.Count == 0)
+            {
+                _isHoldingForCorridor = false;
+                _corridorHoldReason = null;
+                _corridorHoldDistance = float.PositiveInfinity;
+                return;
+            }
+
+            // 2. Check for Conflicts in the upcoming single-track corridor
+            bool isPlayerInCorridor = false;
+            bool isReservedByOther = false;
+            string conflictDetails = null;
+
+            bool rideAlong = (Main.Settings != null && Main.Settings.RideAlongMode);
+
+            for (int c = 0; c < corridorTracks.Count; c++)
+            {
+                var cTrk = corridorTracks[c];
+
+                // 2a. Check Player Train Conflict (respects Ride-Along mode exemption)
+                if (!rideAlong && AITraffic.Navigation.SignalRegistry.IsTrackOccupiedByPlayer(cTrk, _trainCar.trainset))
+                {
+                    isPlayerInCorridor = true;
+                    conflictDetails = "Player train in corridor ahead";
+                    break;
+                }
+
+                // 2b. Check AI Train Conflict — direction-aware to avoid false locks on same-direction followers.
+                // Only block if the holding engineer is travelling AGAINST us (opposing direction) or is
+                // physically stopped ahead (speed < 1.5 km/h), which would mean a head-on or a genuine blockage.
+                // Same-direction trains sharing a corridor are allowed — they'll naturally follow each other.
+                object holderObj;
+                if (AITraffic.Navigation.RailGraph.Instance.TryGetTrackReservationHolder(cTrk, this, out holderObj))
+                {
+                    var holderEng = holderObj as AIEngineer;
+                    if (holderEng == null)
+                    {
+                        // Non-AIEngineer holder — treat as blocking to be safe
+                        isReservedByOther = true;
+                        conflictDetails = "Corridor reserved by unknown agent";
+                        break;
+                    }
+
+                    bool isOpposing = (holderEng.TargetDirection * this.TargetDirection < 0.0f);
+                    bool isStopped  = (holderEng.CurrentSpeedKmh < 1.5f);
+
+                    if (isOpposing || isStopped)
+                    {
+                        isReservedByOther = true;
+                        conflictDetails = isOpposing ? "Opposing AI train in corridor" : "Stopped AI train blocking corridor";
+                        break;
+                    }
+                    // else: same-direction moving train — no hold, let it run
+                }
+            }
+
+            // 3. Resolve Conflict or Acquire Corridor
+            if (isPlayerInCorridor || isReservedByOther)
+            {
+                // Conflict detected!
+                // If we have NOT yet entered the single-track corridor (holding in passing loop / siding):
+                // We MUST HOLD at the passing point / signal before entering the single track!
+                if (!isCurrentTrackSingle || distToCorridorStart > 10.0f)
+                {
+                    _isHoldingForCorridor = true;
+                    _corridorHoldReason = conflictDetails;
+
+                    // Stop safely before the start of the single-track section.
+                    // Write to _corridorHoldDistance (not DistanceToObstacle!) so the obstacle
+                    // sensor's periodic refresh (every 0.25s) cannot clear this hold each cycle.
+                    float holdStopDist = Mathf.Max(5.0f, distToCorridorStart - 25.0f);
+                    _corridorHoldDistance = Mathf.Min(_corridorHoldDistance, holdStopDist);
+                    return;
+                }
+                else
+                {
+                    // We are already inside the single track: cannot hold at passing loop, rely on obstacle sensor
+                    _isHoldingForCorridor = false;
+                    _corridorHoldReason = null;
+                    _corridorHoldDistance = float.PositiveInfinity;
+                }
+            }
+            else
+            {
+                // Corridor is completely clear!
+                _isHoldingForCorridor = false;
+                _corridorHoldReason = null;
+                _corridorHoldDistance = float.PositiveInfinity;
+
+                // Acquire track reservations for the corridor to protect it from opposing traffic
+                for (int c = 0; c < corridorTracks.Count; c++)
+                {
+                    var cTrk = corridorTracks[c];
+                    if (!_reservedTracks.Contains(cTrk))
+                    {
+                        if (AITraffic.Navigation.RailGraph.Instance.TryReserveTrack(cTrk, this))
+                        {
+                            _reservedTracks.Add(cTrk);
+                        }
+                    }
+                }
+            }
+        }
+
         private float _speedProfileUpdateCooldown = 0.0f;
 
         private void UpdateSpeedProfile(float dt)
@@ -1107,7 +1500,7 @@ namespace AITraffic.Driver
                 direction: TargetDirection,
                 upcomingTracks: UpcomingTracks,
                 upcomingSignals: _upcomingSignals,
-                distanceToObstacle: DistanceToObstacle,
+                distanceToObstacle: Mathf.Min(DistanceToObstacle, _corridorHoldDistance),
                 distanceToDestination: DistanceToDestination,
                 isStationStop: IsStationDestination,
                 isTerminusStop: IsTerminusDestination
@@ -1120,7 +1513,89 @@ namespace AITraffic.Driver
 
         #endregion
 
-        #region Wheel Slip & Traction Control
+        #region Wheel Slip, Traction & Powertrain Protection
+
+        private void InitializeSimulationPorts()
+        {
+            _temperaturePorts.Clear();
+            _amperagePorts.Clear();
+            _portAmpsPerTM = null;
+            _portTotalAmps = null;
+            _portEngineOn = null;
+            _portsInitialized = false;
+
+            if (_trainCar == null || _trainCar.SimController == null || _trainCar.SimController.SimulationFlow == null)
+                return;
+
+            var allPorts = _trainCar.SimController.SimulationFlow.AllPorts;
+            if (allPorts == null) return;
+
+            for (int i = 0; i < allPorts.Count; i++)
+            {
+                var port = allPorts[i];
+                if (port == null || string.IsNullOrEmpty(port.id)) continue;
+
+                // 1. Temperature Ports (Engine, Oil, Water, Transmission, TM)
+                if (port.valueType == PortValueType.TEMPERATURE ||
+                    port.id.IndexOf("TEMPERATURE", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                    port.id.IndexOf("engineTemp", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                    port.id.IndexOf("oilTemp", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                    port.id.IndexOf("waterTemp", StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    _temperaturePorts.Add(port);
+                }
+
+                // 2. Amperage Ports (Traction motor load on Diesel-Electric / Electric locomotives)
+                if ((port.valueType == PortValueType.AMPS ||
+                     port.id.IndexOf("AMPS", StringComparison.OrdinalIgnoreCase) >= 0) &&
+                    port.id.IndexOf("MAX", StringComparison.OrdinalIgnoreCase) < 0)
+                {
+                    _amperagePorts.Add(port);
+                    if (port.id.IndexOf("AMPS_PER_TM", StringComparison.OrdinalIgnoreCase) >= 0)
+                    {
+                        _portAmpsPerTM = port;
+                    }
+                    else if (port.id.IndexOf("TOTAL_AMPS", StringComparison.OrdinalIgnoreCase) >= 0)
+                    {
+                        _portTotalAmps = port;
+                    }
+                }
+
+                // 3. Engine Running & RPM Ports
+                if (_portEngineOn == null && (port.id.IndexOf("ENGINE_ON", StringComparison.OrdinalIgnoreCase) >= 0 || port.id.IndexOf("engineOn", StringComparison.OrdinalIgnoreCase) >= 0))
+                {
+                    _portEngineOn = port;
+                }
+                else if (_portEngineRpm == null && (port.id.IndexOf("ENGINE_RPM", StringComparison.OrdinalIgnoreCase) >= 0 || port.id.IndexOf("engineRpm", StringComparison.OrdinalIgnoreCase) >= 0 || port.id.EndsWith(".RPM", StringComparison.OrdinalIgnoreCase)))
+                {
+                    _portEngineRpm = port;
+                }
+            }
+
+            _portsInitialized = true;
+        }
+
+        public bool IsEngineRunning()
+        {
+            if (_controlsOverrider != null && _controlsOverrider.EngineOnReader != null)
+            {
+                return _controlsOverrider.EngineOnReader.IsOn;
+            }
+            if (_portEngineOn != null)
+            {
+                return _portEngineOn.Value > 0.5f;
+            }
+            if (_portEngineRpm != null)
+            {
+                return _portEngineRpm.Value > 100.0f;
+            }
+            return true;
+        }
+
+        private float GetTractionAuthorityMultiplier()
+        {
+            return Mathf.Min(_slipThrottleReduction, Mathf.Min(_thermalThrottleLimit, _overcurrentThrottleLimit));
+        }
 
         private void UpdateWheelSlipProtection(float dt)
         {
@@ -1150,14 +1625,23 @@ namespace AITraffic.Driver
             if (_isWheelSlipping)
             {
                 _sanderRequested = true;
+                _sandHoldTimer = 2.5f; // Maintain sand application to restore firm track grip
 
-                // Reduce throttle to regain traction
-                _slipThrottleReduction = Mathf.MoveTowards(_slipThrottleReduction, 0.45f, 2.0f * dt);
+                // Rapidly cut back throttle authority to break wheel slip cycle
+                // For DM3 at low speeds on grades, avoid choking below 0.60f to prevent engine stall / fluid coupling drop
+                float minSlipAuth = (IsLocoDM3 && CurrentSpeedKmh < 8.0f) ? 0.60f : 0.20f;
+                _slipThrottleReduction = Mathf.MoveTowards(_slipThrottleReduction, minSlipAuth, 4.0f * dt);
             }
             else
             {
-                // Smoothly restore throttle authority
-                _slipThrottleReduction = Mathf.MoveTowards(_slipThrottleReduction, 1.0f, 0.5f * dt);
+                if (_sandHoldTimer > 0.0f)
+                {
+                    _sandHoldTimer -= dt;
+                    _sanderRequested = true; // Continue applying sand while regaining full grip
+                }
+
+                // Smoothly restore traction authority
+                _slipThrottleReduction = Mathf.MoveTowards(_slipThrottleReduction, 1.0f, 0.40f * dt);
             }
 
             UpdateSanderActuation(dt);
@@ -1167,8 +1651,9 @@ namespace AITraffic.Driver
         {
             if (_controlsOverrider == null || _controlsOverrider.Sander == null) return;
 
-            // Immediate hard shutoff when stopped, station holding, or idle
-            if (CurrentSpeedKmh < 0.2f || State == EngineState.Idle || State == EngineState.StationHold || State == EngineState.TerminusStop)
+            // Hard shutoff only when train is parked, station holding, or idle with no throttle demanded
+            if ((CurrentSpeedKmh < 0.2f && _commandedThrottle < 0.01f && !_isWheelSlipping) ||
+                State == EngineState.Idle || State == EngineState.StationHold || State == EngineState.TerminusStop)
             {
                 _sanderRequested = false;
                 _sanderActiveTimer = 0.0f;
@@ -1181,16 +1666,16 @@ namespace AITraffic.Driver
             {
                 if (_sanderRestTimer <= 0.0f)
                 {
-                    // Active sander interval (pulse up to 2.5s)
+                    // Active sander interval (pulse up to 3.0s)
                     _controlsOverrider.Sander.Set(1.0f);
                     _sanderActiveTimer += dt;
 
-                    if (_sanderActiveTimer >= 2.5f)
+                    if (_sanderActiveTimer >= 3.0f)
                     {
-                        // Pulse duration reached: cut sander off and start rest interval (1.5s)
+                        // Pulse duration reached: cut sander off and start short rest interval (1.0s)
                         _controlsOverrider.Sander.Set(0.0f);
                         _sanderActiveTimer = 0.0f;
-                        _sanderRestTimer = 1.5f;
+                        _sanderRestTimer = 1.0f;
                     }
                 }
                 else
@@ -1213,6 +1698,276 @@ namespace AITraffic.Driver
 
             // Clear request flag for next frame
             _sanderRequested = false;
+        }
+
+        private void UpdatePowertrainProtection(float dt)
+        {
+            if (!_portsInitialized && _trainCar != null && _trainCar.SimController != null && _trainCar.SimController.SimulationFlow != null)
+            {
+                InitializeSimulationPorts();
+            }
+
+            // 1. Thermal Management (Engine, Oil, Water & Transmission Temperatures)
+            float maxTemp = 0.0f;
+            for (int i = 0; i < _temperaturePorts.Count; i++)
+            {
+                float t = _temperaturePorts[i].Value;
+                if (t > maxTemp) maxTemp = t;
+            }
+            CurrentMaxTemperature = maxTemp;
+
+            // Thermal derating curve:
+            // Under 95°C: 100% authority
+            // 95°C - 105°C: proportional linear throttle reduction (from 1.0 down to 0.25)
+            // >= 105°C: Hard cutoff to idle (0.0) until cooled down below 95°C to prevent engine explosion
+            if (maxTemp >= 105.0f)
+            {
+                _isOverheated = true;
+            }
+            else if (maxTemp < 95.0f)
+            {
+                _isOverheated = false;
+            }
+
+            IsOverheated = _isOverheated;
+
+            if (_isOverheated)
+            {
+                _thermalThrottleLimit = 0.0f; // Cut to idle for cooling
+            }
+            else if (maxTemp > 95.0f)
+            {
+                float factor = (maxTemp - 95.0f) / 10.0f;
+                _thermalThrottleLimit = Mathf.Lerp(1.0f, 0.25f, factor);
+            }
+            else
+            {
+                _thermalThrottleLimit = 1.0f;
+            }
+            ThermalThrottleLimit = _thermalThrottleLimit;
+
+            // 2. Over-Current Protection (Traction Motor Amperage on Diesel-Electric Locomotives)
+            string liveryId = _trainCar.carLivery != null ? _trainCar.carLivery.id : "";
+            bool isDE2 = _trainCar.carType == TrainCarType.LocoShunter ||
+                         liveryId.IndexOf("DE2", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                         liveryId.IndexOf("Shunter", StringComparison.OrdinalIgnoreCase) >= 0;
+            bool isDE6 = _trainCar.carType == TrainCarType.LocoDiesel ||
+                         liveryId.IndexOf("DE6", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                         liveryId.IndexOf("Diesel", StringComparison.OrdinalIgnoreCase) >= 0;
+            bool isBE2 = _trainCar.carType == TrainCarType.LocoMicroshunter ||
+                         liveryId.IndexOf("BE2", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                         liveryId.IndexOf("Microshunter", StringComparison.OrdinalIgnoreCase) >= 0;
+
+            int numMotors = 1;
+            if (isDE2) numMotors = 2;
+            else if (isDE6) numMotors = 6;
+            else if (isBE2) numMotors = 1;
+
+            float maxAmpsPerTm = 0.0f;
+            if (_portAmpsPerTM != null)
+            {
+                maxAmpsPerTm = _portAmpsPerTM.Value;
+            }
+            else if (_portTotalAmps != null)
+            {
+                maxAmpsPerTm = _portTotalAmps.Value / Mathf.Max(1, numMotors);
+            }
+            else if (_amperagePorts.Count > 0)
+            {
+                for (int i = 0; i < _amperagePorts.Count; i++)
+                {
+                    var p = _amperagePorts[i];
+                    if (p.id.IndexOf("MAX", StringComparison.OrdinalIgnoreCase) >= 0) continue;
+                    float a = p.Value;
+                    if (p.id.IndexOf("TOTAL", StringComparison.OrdinalIgnoreCase) >= 0)
+                    {
+                        a /= Mathf.Max(1, numMotors);
+                    }
+                    if (a > maxAmpsPerTm) maxAmpsPerTm = a;
+                }
+            }
+            CurrentAmpsPerTM = maxAmpsPerTm;
+
+            // Over-current derating:
+            // 1) Non-electric locos (DH4, DM3, Steam): no traction motor fuse -> full authority (1.0f).
+            // 2) DE6: Heavy mainline freight hauler.
+            //    - Rolling (>= 3.0 km/h): 100% full throttle authority! In Derail Valley, DE6 traction motors
+            //      safely haul at 100% throttle under counter-EMF. There is no fragile TM fuse to blow while rolling.
+            //    - Stationary / hill-start (< 3.0 km/h): only if current is dangerously extreme (> 550A per motor)
+            //      softly derate to 0.50f, never choking down to 5%.
+            // 3) DE2: Shunter with fragile traction motor fuse.
+            //    - Rolling (>= 5.0 km/h): 100% throttle authority.
+            //    - Stationary / hill-start (< 5.0 km/h): If maxAmpsPerTm >= 420A, clamp throttle limit to 0.30f
+            //      to protect the fuse.
+            if (!isDE2 && !isDE6 && !isBE2)
+            {
+                _overcurrentThrottleLimit = 1.0f;
+            }
+            else if (isDE6)
+            {
+                if (CurrentSpeedKmh >= 3.0f)
+                {
+                    _overcurrentThrottleLimit = 1.0f;
+                }
+                else
+                {
+                    if (maxAmpsPerTm >= 550.0f)
+                    {
+                        _overcurrentThrottleLimit = 0.50f;
+                    }
+                    else if (maxAmpsPerTm > 450.0f)
+                    {
+                        float factor = (maxAmpsPerTm - 450.0f) / 100.0f;
+                        _overcurrentThrottleLimit = Mathf.Lerp(1.0f, 0.50f, factor);
+                    }
+                    else
+                    {
+                        _overcurrentThrottleLimit = 1.0f;
+                    }
+                }
+            }
+            else if (isDE2)
+            {
+                if (CurrentSpeedKmh >= 5.0f)
+                {
+                    _overcurrentThrottleLimit = 1.0f;
+                }
+                else
+                {
+                    if (maxAmpsPerTm >= 420.0f)
+                    {
+                        _overcurrentThrottleLimit = 0.30f;
+                        _rampThrottle = Mathf.Min(_rampThrottle, 0.30f);
+                    }
+                    else if (maxAmpsPerTm > 380.0f)
+                    {
+                        float overcurrentFactor = (maxAmpsPerTm - 380.0f) / (420.0f - 380.0f);
+                        _overcurrentThrottleLimit = Mathf.Lerp(1.0f, 0.40f, overcurrentFactor);
+                    }
+                    else
+                    {
+                        _overcurrentThrottleLimit = 1.0f;
+                    }
+                }
+            }
+            else // BE2
+            {
+                _overcurrentThrottleLimit = (CurrentSpeedKmh >= 4.0f || maxAmpsPerTm < 400.0f) ? 1.0f : 0.50f;
+            }
+            OvercurrentThrottleLimit = _overcurrentThrottleLimit;
+
+            // 3. Anti-Rollback & Runaway Protection on Grades
+            float forwardSpeedMs = _trainCar.GetForwardSpeed();
+            // Compare against actual commanded reverser lever orientation to prevent tangent flutter inversions
+            float activeReverser = (_commandedReverser != 0.0f) ? _commandedReverser : _desiredReverser;
+            float directedSpeedMs = forwardSpeedMs * activeReverser; // positive = moving in commanded gear direction, negative = rolling backwards
+
+            bool engineRunning = IsEngineRunning();
+
+            // Settle timer: if train has been essentially stopped for > 0.4s, clear rollback clamp
+            if (Mathf.Abs(forwardSpeedMs) < 0.15f)
+            {
+                _rollbackClearTimer += dt;
+            }
+            else
+            {
+                _rollbackClearTimer = 0.0f;
+            }
+
+            // Forward Driving Confirmation:
+            // If train is moving forward in commanded gear (> 0.15 m/s or speed > 3 km/h while cruising/accelerating),
+            // rollback is impossible! Clear clamp immediately!
+            bool isDrivingForwardInGear = (directedSpeedMs > 0.15f) || (CurrentSpeedKmh > 3.0f && (State == EngineState.Cruising || State == EngineState.Accelerating));
+            if (isDrivingForwardInGear)
+            {
+                _isRollbackDetected = false;
+            }
+            else
+            {
+                // Detect unintended reverse rollback:
+                if (!engineRunning)
+                {
+                    if (directedSpeedMs < -0.30f)
+                    {
+                        _isRollbackDetected = true;
+                    }
+                    else if (directedSpeedMs > -0.10f || _rollbackClearTimer > 0.4f)
+                    {
+                        _isRollbackDetected = false;
+                    }
+                }
+                else
+                {
+                    // For running engines: only genuine reverse roll (> 0.60 m/s backwards) trips runaway clamp
+                    if (directedSpeedMs < -0.60f && (State == EngineState.Accelerating || State == EngineState.Cruising || State == EngineState.Starting))
+                    {
+                        _isRollbackDetected = true;
+                    }
+                    else if (directedSpeedMs > -0.10f || _rollbackClearTimer > 0.4f)
+                    {
+                        _isRollbackDetected = false;
+                    }
+                }
+            }
+            IsRollbackDetected = _isRollbackDetected;
+
+            // DE2 & General Anti-Rollback Zero-Throttle Interlock:
+            // If the train has ANY backward drift relative to reverser (< -0.02 m/s), NEVER apply throttle!
+            // Applying forward power to reverse-spinning traction motors causes instant current surge and blows TM fuse.
+            if (directedSpeedMs < -0.02f && (State == EngineState.Accelerating || State == EngineState.Starting))
+            {
+                _commandedThrottle = 0.0f;
+                _rampThrottle = 0.0f;
+                _commandedIndependentBrake = 1.0f;
+                _commandedTrainBrake = 1.0f; // Firmly clamp train air brake across all cars!
+                _currentIndependentBrake = 1.0f;
+                _currentTrainBrake = 1.0f;
+            }
+
+            if (_isRollbackDetected)
+            {
+                // Immediately clamp the train with service + independent brakes to arrest runaway descent
+                _commandedThrottle = 0.0f;
+                _rampThrottle = 0.0f;
+                _commandedTrainBrake = 1.0f;
+                _commandedIndependentBrake = 1.0f;
+                _currentIndependentBrake = 1.0f;
+                _currentTrainBrake = 1.0f;
+            }
+
+            // 4. Stalled Engine Grade-Hold Protection
+            // When engine stalls on a hill, do NOT release brakes while attempting restart!
+            if (!engineRunning && (State == EngineState.Accelerating || State == EngineState.Cruising || State == EngineState.Starting))
+            {
+                _commandedThrottle = 0.0f;
+                _rampThrottle = 0.0f;
+                _commandedIndependentBrake = Mathf.Max(_commandedIndependentBrake, 0.8f);
+                _commandedTrainBrake = Mathf.Max(_commandedTrainBrake, 0.5f);
+            }
+
+            // 5. Automatic TM Fuse Recovery:
+            // If stationary and throttle is at idle, automatically reset any tripped fuses
+            if (Mathf.Abs(forwardSpeedMs) < 0.05f && _commandedThrottle <= 0.01f &&
+                _trainCar != null && _trainCar.SimController != null && _trainCar.SimController.SimulationFlow != null)
+            {
+                var fuses = _trainCar.SimController.SimulationFlow.AllFuses;
+                if (fuses != null)
+                {
+                    for (int f = 0; f < fuses.Count; f++)
+                    {
+                        var fuse = fuses[f];
+                        if (fuse != null && !fuse.State)
+                        {
+                            fuse.ChangeState(true);
+                            if (Main.ModEntry != null && Main.ModEntry.Logger != null)
+                            {
+                                Main.ModEntry.Logger.Log(string.Format("[AITraffic] Reset tripped fuse '{0}' on '{1}'.",
+                                    fuse.id ?? "TM Fuse", _trainCar.ID));
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         #endregion
@@ -1297,44 +2052,77 @@ namespace AITraffic.Driver
                 return 0.0f;
             }
 
-            // 1. Base speed-based current/overload ceiling
+            // 1. Incline and Locomotive Dynamics:
+            float activeRev = (_commandedReverser != 0.0f) ? _commandedReverser : ((_desiredReverser != 0.0f) ? _desiredReverser : TargetDirection);
+            if (activeRev == 0.0f) activeRev = 1.0f;
+
+            float travelPitch = 0.0f;
+            if (_trainCar != null)
+            {
+                // Positive pitch along travel direction = uphill climb
+                travelPitch = _trainCar.transform.forward.y * activeRev;
+            }
+
+            bool isLocoDM3 = IsLocoDM3;
+            bool isUphill = travelPitch > 0.0015f; // > 0.15% grade (sensitive uphill detection)
+            bool isSluggish = CurrentAccelerationMs2 < 0.08f && speedDeltaKmh > 3.0f;
+
+            string liveryId = _trainCar != null && _trainCar.carLivery != null ? _trainCar.carLivery.id : "";
+            bool isLocoDE2 = _trainCar != null && (_trainCar.carType == TrainCarType.LocoShunter ||
+                             liveryId.IndexOf("DE2", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                             liveryId.IndexOf("Shunter", StringComparison.OrdinalIgnoreCase) >= 0);
+
+            // 2. Base speed-based current/overload ceiling
             float baseCeiling = 0.28f;
             if (CurrentSpeedKmh < 6.0f)
             {
-                baseCeiling = 0.28f; // Soft launch notch 1-2 on level track
+                if (isUphill)
+                {
+                    // Uphill launch needs substantial tractive effort to overcome gravity
+                    if (isLocoDM3)
+                    {
+                        // DM3 mechanical diesel requires high engine RPM (0.90 - 1.00 throttle) to build
+                        // sufficient hydraulic torque across the fluid coupling on an uphill gradient
+                        baseCeiling = (travelPitch > 0.010f) ? 1.00f : 0.90f;
+                    }
+                    else if (isLocoDE2)
+                    {
+                        baseCeiling = 0.40f;
+                    }
+                    else
+                    {
+                        baseCeiling = (travelPitch > 0.015f) ? 0.85f : 0.70f;
+                    }
+                }
+                else
+                {
+                    // Level / gentle track: DM3 still needs enough power to overcome transmission inertia
+                    baseCeiling = isLocoDM3 ? 0.60f : 0.28f;
+                }
             }
             else if (CurrentSpeedKmh < 15.0f)
             {
-                baseCeiling = Mathf.Lerp(0.28f, 0.60f, (CurrentSpeedKmh - 6.0f) / 9.0f);
+                float lowSpeedFloor = isUphill ? (isLocoDM3 ? 0.90f : 0.65f) : (isLocoDM3 ? 0.65f : 0.28f);
+                baseCeiling = Mathf.Lerp(lowSpeedFloor, isLocoDM3 ? 1.00f : 0.75f, (CurrentSpeedKmh - 6.0f) / 9.0f);
             }
             else if (CurrentSpeedKmh < 25.0f)
             {
-                baseCeiling = Mathf.Lerp(0.60f, 1.00f, (CurrentSpeedKmh - 15.0f) / 10.0f);
+                baseCeiling = Mathf.Lerp(isLocoDM3 ? 0.90f : 0.75f, 1.00f, (CurrentSpeedKmh - 15.0f) / 10.0f);
             }
             else
             {
                 baseCeiling = 1.00f;
             }
 
-            // 2. Dynamic Hill-Start & Heavy-Load Acceleration Assist:
-            // Detect if the locomotive is climbing an uphill incline or acceleration is critically sluggish (< 0.08 m/s^2)
-            float travelPitch = 0.0f;
-            if (_trainCar != null)
-            {
-                // Positive pitch along travel direction = uphill climb
-                travelPitch = _trainCar.transform.forward.y * _desiredReverser;
-            }
-
-            bool isUphill = travelPitch > 0.008f; // > 0.8% grade
-            bool isSluggish = CurrentAccelerationMs2 < 0.08f && speedDeltaKmh > 3.0f;
-
+            // 3. Dynamic Hill-Start & Heavy-Load Acceleration Assist:
             if (CurrentSpeedKmh < 20.0f && (isUphill || isSluggish))
             {
                 if (CurrentAccelerationMs2 < 0.10f)
                 {
                     // Acceleration is super slow on hill/heavy load -> progressively ramp up hill boost ceiling
-                    float boostRate = (isUphill && travelPitch > 0.015f) ? 0.09f : 0.05f;
-                    _hillAssistBoost = Mathf.MoveTowards(_hillAssistBoost, 0.60f, boostRate * dt);
+                    float boostRate = (isUphill && travelPitch > 0.015f) ? 0.16f : 0.10f;
+                    float maxBoost = isLocoDM3 ? 0.85f : 0.60f;
+                    _hillAssistBoost = Mathf.MoveTowards(_hillAssistBoost, maxBoost, boostRate * dt);
                 }
                 else if (CurrentAccelerationMs2 > 0.20f)
                 {
@@ -1350,22 +2138,30 @@ namespace AITraffic.Driver
 
             float maxThrottleCeiling = Mathf.Clamp01(baseCeiling + _hillAssistBoost);
 
-            // 3. Acceleration Feedback: only ramp up if there isn't enough acceleration felt
+            // 4. Acceleration Feedback: only ramp up if there isn't enough acceleration felt
             const float minDesiredAcc = 0.12f; // m/s^2 (~0.43 km/h/s)
             const float maxAllowedAcc = 0.30f; // m/s^2 (~1.08 km/h/s)
 
-            if (_rampThrottle < 0.12f && CurrentSpeedKmh < 1.0f)
+            if (_rampThrottle < 0.15f && CurrentSpeedKmh < 1.0f)
             {
-                _rampThrottle = 0.12f; // Initial soft launch notch
+                if (isLocoDM3)
+                {
+                    // DM3: instantly spool up to 0.70f (or 0.80f on steep grade) to pre-charge fluid coupling
+                    _rampThrottle = isUphill ? (travelPitch > 0.010f ? 0.80f : 0.70f) : 0.35f;
+                }
+                else
+                {
+                    _rampThrottle = isUphill ? (isLocoDE2 ? 0.22f : 0.35f) : 0.12f; // Initial launch notch
+                }
             }
 
             if (CurrentAccelerationMs2 < minDesiredAcc)
             {
                 // Not accelerating enough -> notch up throttle
-                float notchRate = (CurrentSpeedKmh < 6.0f) ? 0.040f : 0.070f;
+                float notchRate = (CurrentSpeedKmh < 6.0f) ? 0.050f : 0.070f;
                 if ((isUphill || isSluggish) && CurrentAccelerationMs2 < 0.05f)
                 {
-                    notchRate = 0.085f; // Notch up faster if stalled or barely moving on steep gradient
+                    notchRate = isLocoDM3 ? 0.22f : 0.12f; // DM3 notches up rapidly to build pre-charge holding torque
                 }
                 _rampThrottle += notchRate * dt;
             }
@@ -1384,7 +2180,13 @@ namespace AITraffic.Driver
             }
 
             _rampThrottle = Mathf.Clamp(_rampThrottle, 0.0f, maxThrottleCeiling);
-            return _rampThrottle * _slipThrottleReduction;
+
+            float tractionAuthority = GetTractionAuthorityMultiplier();
+            if (_rampThrottle > maxThrottleCeiling * tractionAuthority)
+            {
+                _rampThrottle = Mathf.MoveTowards(_rampThrottle, maxThrottleCeiling * tractionAuthority, 2.0f * dt);
+            }
+            return _rampThrottle * tractionAuthority;
         }
 
         private float ComputeCruisingThrottle(float dt)
@@ -1393,7 +2195,7 @@ namespace AITraffic.Driver
 
             float pidCruise = ThrottlePID.Update(TargetSpeedKmh, CurrentSpeedKmh, dt);
             _rampThrottle = Mathf.MoveTowards(_rampThrottle, pidCruise, 0.06f * dt);
-            return _rampThrottle * _slipThrottleReduction;
+            return _rampThrottle * GetTractionAuthorityMultiplier();
         }
 
         #endregion
@@ -1428,9 +2230,27 @@ namespace AITraffic.Driver
             }
 
             // Universal Terminus / Station Arrival Check:
+            bool isOnFinalTrack = (CurrentPath != null && CurrentPath.Tracks != null && CurrentPath.Tracks.Count > 0 && CurrentPathTrackIndex >= CurrentPath.Tracks.Count - 1);
+            
+            // Also check if current physical bogie track matches destination track
+            RailTrack curPhysTrack = null;
+            if (_trainCar != null)
+            {
+                if (_trainCar.FrontBogie != null && _trainCar.FrontBogie.track != null) curPhysTrack = _trainCar.FrontBogie.track;
+                else if (_trainCar.RearBogie != null && _trainCar.RearBogie.track != null) curPhysTrack = _trainCar.RearBogie.track;
+            }
+            if (!isOnFinalTrack && curPhysTrack != null && CurrentPath != null && CurrentPath.Tracks != null && CurrentPath.Tracks.Count > 0)
+            {
+                var destPathTrack = CurrentPath.Tracks[CurrentPath.Tracks.Count - 1];
+                if (curPhysTrack == destPathTrack || (!string.IsNullOrEmpty(DestinationTrackName) && curPhysTrack.name == DestinationTrackName))
+                {
+                    isOnFinalTrack = true;
+                }
+            }
+
             bool isAtFinalDestination = (IsStationDestination || IsTerminusDestination) && 
                 ((DistanceToDestination <= 8.0f) || 
-                 (CurrentPath != null && CurrentPath.Tracks != null && CurrentPathTrackIndex >= CurrentPath.Tracks.Count - 1 && DistanceToDestination <= 25.0f));
+                 (isOnFinalTrack && (DistanceToDestination <= 80.0f || CurrentSpeedKmh < 0.5f || StationaryTimer > 1.0f)));
 
             if (isAtFinalDestination && CurrentSpeedKmh < 1.0f && State != EngineState.TerminusStop && State != EngineState.StationHold)
             {
@@ -1451,25 +2271,33 @@ namespace AITraffic.Driver
                 case EngineState.Idle:
                     _commandedThrottle = 0.0f;
                     _commandedDynamicBrake = 0.0f;
-                    _commandedTrainBrake = 0.4f;
-                    _commandedIndependentBrake = 1.0f;
-                    _commandedReverser = _desiredReverser;
                     _rampThrottle = 0.0f;
+                    _commandedReverser = _desiredReverser;
+
+                    // 100% Rock-Solid Holding Brake on Slopes:
+                    // Any track incline requires full train air brake across all cars to prevent consist creep.
+                    float idlePitch = (_trainCar != null) ? _trainCar.transform.forward.y : 0.0f;
+                    bool isOnSlope = Mathf.Abs(idlePitch) > 0.002f;
+                    _commandedTrainBrake = isOnSlope ? 1.0f : 0.85f;
+                    _commandedIndependentBrake = 1.0f;
 
                     if (TargetSpeedKmh > 1.0f && !_isEmergencyStop)
                     {
-                        _commandedTrainBrake = 0.0f;
-                        _commandedIndependentBrake = 0.0f;
+                        // Transitioning to Starting: DO NOT release train brake yet!
+                        // Maintain full clamp until reverser is aligned and tractive effort builds in Accelerating.
                         State = EngineState.Starting;
                     }
                     break;
 
                 case EngineState.Starting:
                     _commandedReverser = _desiredReverser;
-                    _commandedIndependentBrake = 0.0f;
-                    _commandedTrainBrake = 0.0f;
+                    _commandedIndependentBrake = 1.0f; // Hill-hold: keep locomotive clamped while reverser aligns
+                    float startPitch = (_trainCar != null) ? _trainCar.transform.forward.y * _desiredReverser : 0.0f;
+                    bool startOnSlope = Mathf.Abs(startPitch) > 0.002f || (_trainCar != null && Mathf.Abs(_trainCar.transform.forward.y) > 0.002f);
+                    _commandedTrainBrake = startOnSlope ? 1.0f : 0.85f; // Hold full train brake to prevent any consist drift
                     _commandedDynamicBrake = 0.0f;
                     _rampThrottle = 0.0f;
+                    ReleaseAllConsistHandbrakes();
 
                     if (Mathf.Abs(_currentReverser - _desiredReverser) < 0.1f)
                     {
@@ -1479,11 +2307,135 @@ namespace AITraffic.Driver
 
                 case EngineState.Accelerating:
                     _commandedReverser = _desiredReverser;
-                    _commandedIndependentBrake = 0.0f;
-                    _commandedTrainBrake = 0.0f;
                     _commandedDynamicBrake = 0.0f;
 
-                    _commandedThrottle = ComputeAcceleratingThrottle(dt);
+                    // Hill-hold assist & DM3 launch hold: hold brakes until tractive effort is established
+                    float activeRev = (_commandedReverser != 0.0f) ? _commandedReverser : ((_desiredReverser != 0.0f) ? _desiredReverser : TargetDirection);
+                    if (activeRev == 0.0f) activeRev = 1.0f;
+                    float launchPitch = (_trainCar != null) ? _trainCar.transform.forward.y * activeRev : 0.0f;
+                    float forwardSpd = (_trainCar != null) ? _trainCar.GetForwardSpeed() : 0.0f;
+                    float dirSpeed = forwardSpd * activeRev;
+                    bool isLocoDM3 = IsLocoDM3;
+                    bool isDM3Launching = isLocoDM3 && (_dm3Controller == null || _dm3Controller.IsInNeutral || _dm3Controller.IsShifting || _dm3Controller.CurrentGearIndex <= 1);
+                    bool isUphillLaunch = (launchPitch > 0.0015f);
+                    bool isDownhillLaunch = (launchPitch < -0.003f);
+                    bool needsHillHold = (isUphillLaunch || isDM3Launching) && CurrentSpeedKmh < 5.0f;
+                    IsHillStarting = needsHillHold && (dirSpeed < 0.20f);
+
+                    if (dirSpeed < -0.02f)
+                    {
+                        // Train is actively drifting backward down the gradient:
+                        // 1. Cut throttle to 0 to prevent blowing TM fuse or shocking drivetrain
+                        _commandedThrottle = 0.0f;
+                        _rampThrottle = 0.0f;
+                        // 2. Firmly clamp BOTH independent and train air brakes to 100% across all cars!
+                        _commandedIndependentBrake = 1.0f;
+                        _commandedTrainBrake = 1.0f;
+                        _currentIndependentBrake = 1.0f; // Instant snap
+                        _currentTrainBrake = 1.0f;
+                        // 3. Set rollback arrest hold timer: must remain stationary for 1.5s to settle slack before relaunch
+                        _hillRollbackHoldTimer = 1.5f;
+                        // 4. Boost starting power ceiling for the next attempt
+                        _hillAssistBoost = Mathf.Min(isLocoDM3 ? 0.85f : 0.65f, _hillAssistBoost + 0.20f);
+                    }
+                    else if (_hillRollbackHoldTimer > 0.0f)
+                    {
+                        // Waiting in stationary arrest hold for slack and brake pipe to stabilize
+                        _hillRollbackHoldTimer -= dt;
+                        _commandedThrottle = 0.0f;
+                        _rampThrottle = 0.0f;
+                        _commandedIndependentBrake = 1.0f;
+                        _commandedTrainBrake = 1.0f;
+                    }
+                    else if (needsHillHold)
+                    {
+                        // Active Hill-Start Sequence:
+                        // Apply sander for traction grip
+                        _sanderRequested = true;
+
+                        if (_dm3Controller != null && _dm3Controller.IsDM3 && (_dm3Controller.IsInNeutral || _dm3Controller.IsShifting))
+                        {
+                            _commandedIndependentBrake = 1.0f;
+                            _commandedTrainBrake = 0.85f;
+                            _commandedThrottle = 0.0f;
+                            _rampThrottle = 0.0f;
+                        }
+                        else
+                        {
+                            // Compute accelerating throttle with hill assist
+                            _commandedThrottle = ComputeAcceleratingThrottle(dt);
+
+                            if (dirSpeed >= 0.03f || CurrentSpeedKmh >= 0.4f)
+                            {
+                                // Forward motion established: release all launch brakes completely!
+                                _commandedIndependentBrake = 0.0f;
+                                _commandedTrainBrake = 0.0f;
+                            }
+                            else
+                            {
+                                // Stationary pre-charge: throttle builds UP WAY BEFORE brakes begin releasing!
+                                string lId = _trainCar != null && _trainCar.carLivery != null ? _trainCar.carLivery.id : "";
+                                bool isLocoDE2 = _trainCar != null && (_trainCar.carType == TrainCarType.LocoShunter ||
+                                                 lId.IndexOf("DE2", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                                 lId.IndexOf("Shunter", StringComparison.OrdinalIgnoreCase) >= 0);
+
+                                float throttlePrechargeThreshold;
+                                float throttleFullReleaseThreshold;
+
+                                if (isLocoDM3)
+                                {
+                                    // DM3 mechanical shunter: must spool up to high RPM (>= 0.60) before train air releases,
+                                    // and hold independent brake until full tractive torque (>= 0.85) is established
+                                    throttlePrechargeThreshold = 0.60f;
+                                    throttleFullReleaseThreshold = 0.85f;
+                                }
+                                else if (isLocoDE2)
+                                {
+                                    throttlePrechargeThreshold = 0.25f;
+                                    throttleFullReleaseThreshold = 0.38f;
+                                }
+                                else
+                                {
+                                    throttlePrechargeThreshold = 0.42f;
+                                    throttleFullReleaseThreshold = 0.65f;
+                                }
+
+                                if (_rampThrottle < throttlePrechargeThreshold)
+                                {
+                                    // Stage 1: Absolute clamp. Throttle spools up against 100% locked brakes!
+                                    _commandedIndependentBrake = 1.0f;
+                                    _commandedTrainBrake = 0.85f;
+                                }
+                                else
+                                {
+                                    // Stage 2 & 3: Throttle is well established.
+                                    // First release train air brake while locomotive independent brake holds firmly.
+                                    // Then gradually graduate independent brake as engine tractive power takes the full load.
+                                    float progress = Mathf.Clamp01((_rampThrottle - throttlePrechargeThreshold) / (throttleFullReleaseThreshold - throttlePrechargeThreshold));
+                                    _commandedTrainBrake = Mathf.Clamp01(0.85f * (1.0f - progress * 1.6f));
+
+                                    // Independent brake holds firmly until progress > indHoldThreshold (>= 0.72 on DM3, >= 0.51 on DE6)
+                                    float indHoldThreshold = isLocoDM3 ? 0.45f : 0.40f;
+                                    float indReleaseProgress = Mathf.Clamp01((progress - indHoldThreshold) / (1.0f - indHoldThreshold));
+                                    _commandedIndependentBrake = Mathf.Clamp01(1.0f - indReleaseProgress);
+                                }
+                            }
+                        }
+                    }
+                    else if (isDownhillLaunch && CurrentSpeedKmh < 3.0f)
+                    {
+                        // Controlled downhill release: release brakes progressively to prevent consist run-in shock
+                        _commandedThrottle = ComputeAcceleratingThrottle(dt);
+                        _commandedTrainBrake = Mathf.MoveTowards(_commandedTrainBrake, 0.0f, 0.35f * dt);
+                        _commandedIndependentBrake = Mathf.MoveTowards(_commandedIndependentBrake, 0.0f, 0.50f * dt);
+                    }
+                    else
+                    {
+                        // Level normal launch
+                        _commandedIndependentBrake = 0.0f;
+                        _commandedTrainBrake = 0.0f;
+                        _commandedThrottle = ComputeAcceleratingThrottle(dt);
+                    }
                     BrakePID.Reset();
 
                     if (TargetSpeedKmh <= 0.01f || speedDeltaKmh < -3.5f)
@@ -1570,52 +2522,45 @@ namespace AITraffic.Driver
 
                     float brakeOutput = BrakePID.Update(CurrentSpeedKmh, TargetSpeedKmh, dt);
 
-                    // Dynamic stopping urgency calculation for Red Signals (Hp 0), Obstacles, and Buffer Stops
-                    float distToStop = Mathf.Min(DistanceToSignal, Mathf.Min(DistanceToObstacle, DistanceToDestination));
-                    if (distToStop < 500.0f)
+                    // Dynamic stopping urgency calculation for Red Signals (Hp 0), Obstacles, Corridor Holds, and Buffer Stops
+                    float distToStop = Mathf.Min(DistanceToSignal, Mathf.Min(Mathf.Min(DistanceToObstacle, _corridorHoldDistance), DistanceToDestination));
+                    if (distToStop < 600.0f && TargetSpeedKmh <= 15.0f)
                     {
-                        if (TargetSpeedKmh <= 0.5f)
+                        // Stop target buffer: 20m before signal mast / buffer stop
+                        float effectiveDist = Mathf.Max(0.5f, distToStop - 20.0f);
+                        float reqDecel = (CurrentSpeedMs * CurrentSpeedMs) / (2.0f * effectiveDist);
+
+                        // Anticipatory pneumatic braking: prime train air line early so cylinders have pressure before reaching stop zone
+                        if (reqDecel > 0.15f)
                         {
-                            // In final deceleration & stop zone (< 17m to signal mast / buffer stop)
-                            float effectiveDist = Mathf.Max(0.5f, distToStop - 9.0f);
-                            float reqDecel = (CurrentSpeedMs * CurrentSpeedMs) / (2.0f * effectiveDist);
-
-                            // Scale braking demand up progressively to halt precisely at the 9m stop mark
-                            if (reqDecel > 0.15f)
-                            {
-                                float stopRatio = Mathf.Clamp01((reqDecel - 0.15f) / 0.30f);
-                                brakeOutput = Mathf.Max(brakeOutput, 0.40f + stopRatio * 0.60f);
-                            }
-
-                            // Emergency clamps if over-speeding close to the stop line:
-                            if (distToStop < 17.0f && CurrentSpeedKmh > 10.0f)
-                            {
-                                brakeOutput = 1.0f; // Full emergency stopping brake
-                            }
-                            else if (distToStop < 11.0f && CurrentSpeedKmh > 3.5f)
-                            {
-                                brakeOutput = 1.0f;
-                                _sanderRequested = true; // Request sand rails for maximum adhesion
-                            }
-                            else if (distToStop <= 9.0f)
-                            {
-                                brakeOutput = 1.0f;
-                            }
-
-                            // Maintain solid holding brake while stopped at the signal
-                            if (CurrentSpeedKmh < 0.4f)
-                            {
-                                brakeOutput = Mathf.Max(0.50f, brakeOutput);
-                            }
+                            float stopRatio = Mathf.Clamp01((reqDecel - 0.15f) / 0.30f);
+                            brakeOutput = Mathf.Max(brakeOutput, 0.45f + stopRatio * 0.55f);
                         }
-                        else
+
+                        // Safety stop boundaries:
+                        if (distToStop <= 20.0f)
                         {
-                            // In service deceleration or crawl approach phase (75m -> 12m)
-                            // Emergency clamp only if approaching far too fast
-                            if (distToStop < 45.0f && CurrentSpeedKmh > 20.0f)
-                            {
-                                brakeOutput = 1.0f;
-                            }
+                            brakeOutput = 1.0f; // Absolute stop at 20m safety line
+                        }
+                        else if (distToStop < 35.0f && CurrentSpeedKmh > 6.0f)
+                        {
+                            brakeOutput = 1.0f;
+                            _sanderRequested = true; // Deploy sand to prevent wheel slide on final stop
+                        }
+                        else if (distToStop < 60.0f && CurrentSpeedKmh > 15.0f)
+                        {
+                            brakeOutput = 1.0f;
+                            _sanderRequested = true;
+                        }
+                        else if (distToStop < 120.0f && CurrentSpeedKmh > 30.0f)
+                        {
+                            brakeOutput = 0.85f;
+                        }
+
+                        // Maintain solid holding brake while stopped at signal/target
+                        if (CurrentSpeedKmh < 0.4f)
+                        {
+                            brakeOutput = Mathf.Max(0.60f, brakeOutput);
                         }
                     }
 
@@ -1707,7 +2652,7 @@ namespace AITraffic.Driver
             }
 
             // Independent locomotive direct brake assists at low speeds / final stop
-            float distToStop = Mathf.Min(DistanceToSignal, Mathf.Min(DistanceToObstacle, DistanceToDestination));
+            float distToStop = Mathf.Min(DistanceToSignal, Mathf.Min(Mathf.Min(DistanceToObstacle, _corridorHoldDistance), DistanceToDestination));
             if (TargetSpeedKmh <= 0.5f || distToStop < 100.0f)
             {
                 if (CurrentSpeedKmh < 18.0f)
@@ -1724,16 +2669,18 @@ namespace AITraffic.Driver
                 _commandedIndependentBrake = 0.0f;
             }
 
-            // Imminent physical obstacle emergency clamping
-            if (DistanceToObstacle < 150.0f)
+            // Imminent physical obstacle / corridor hold emergency clamping
+            // Only force emergency application if critically close or carrying dangerous excess speed
+            float effObstDist = Mathf.Min(DistanceToObstacle, _corridorHoldDistance);
+            if (effObstDist < 30.0f || (effObstDist < 80.0f && CurrentSpeedKmh > 25.0f))
             {
                 _commandedTrainBrake = 1.0f;
                 _commandedIndependentBrake = 1.0f;
                 if (_hasDynamicBrake) _commandedDynamicBrake = 1.0f;
             }
 
-            // Absolute holding brake when stopped
-            if (CurrentSpeedKmh < 0.5f && (TargetSpeedKmh <= 0.1f || DistanceToObstacle < 150.0f))
+            // Absolute holding brake when stopped at destination or behind obstacle / corridor hold
+            if (CurrentSpeedKmh < 0.5f && (TargetSpeedKmh <= 0.1f || effObstDist <= 45.0f))
             {
                 _commandedTrainBrake = Mathf.Max(0.6f, brakeDemand);
                 _commandedIndependentBrake = 1.0f;
@@ -1798,6 +2745,23 @@ namespace AITraffic.Driver
         {
             if (_controlsOverrider == null) return;
 
+            // 0. Safety Interlocks: Rollback clamp & Overheat throttle cut
+            if (_isRollbackDetected)
+            {
+                _commandedThrottle = 0.0f;
+                _rampThrottle = 0.0f;
+                _currentThrottle = 0.0f;
+                _commandedIndependentBrake = 1.0f;
+                _commandedTrainBrake = 1.0f;
+                _currentIndependentBrake = 1.0f;
+                _currentTrainBrake = 1.0f;
+            }
+            else if (_isOverheated)
+            {
+                _commandedThrottle = 0.0f;
+                _rampThrottle = 0.0f;
+            }
+
             // 1. Throttle Rate-Limiting (slew rate)
             float targetThrottle = _commandedThrottle;
             if (_dm3Controller != null && _dm3Controller.IsDM3 && _dm3Controller.IsShifting)
@@ -1817,10 +2781,13 @@ namespace AITraffic.Driver
             // 2. Train Air Brake Rate-Limiting
             // Fast application (3.5/s) when increasing brake, gentle smooth release (0.45/s) to conserve reservoir air
             float brakeSlew = (_commandedTrainBrake > _currentTrainBrake) ? 3.5f : 0.45f;
-            float distToStop = Mathf.Min(DistanceToSignal, Mathf.Min(DistanceToObstacle, DistanceToDestination));
+            float distToStop = Mathf.Min(DistanceToSignal, Mathf.Min(Mathf.Min(DistanceToObstacle, _corridorHoldDistance), DistanceToDestination));
 
-            // Instant full application for emergency / signal stop danger zone:
-            if (_commandedTrainBrake >= 0.90f && (distToStop < 160.0f || DistanceToObstacle < 160.0f))
+            // Instant full application for emergency, stationary holding, or rollback arrest:
+            if (_commandedTrainBrake >= 0.85f &&
+                (distToStop < 160.0f || Mathf.Min(DistanceToObstacle, _corridorHoldDistance) < 160.0f ||
+                 _isRollbackDetected || _hillRollbackHoldTimer > 0.0f ||
+                 State == EngineState.Idle || State == EngineState.Starting || State == EngineState.StationHold || State == EngineState.TerminusStop))
             {
                 _currentTrainBrake = _commandedTrainBrake; // Instant full application
             }
@@ -1842,7 +2809,18 @@ namespace AITraffic.Driver
             }
 
             // 4. Independent Brake
-            _currentIndependentBrake = Mathf.MoveTowards(_currentIndependentBrake, _commandedIndependentBrake, 0.8f * dt);
+            // Fast application (4.0/s) to clamp loco quickly; smooth release (1.0/s)
+            float indBrakeSlew = (_commandedIndependentBrake > _currentIndependentBrake) ? 4.0f : 1.0f;
+            if (_commandedIndependentBrake >= 0.90f && 
+                (CurrentSpeedMs < 0.15f || _isRollbackDetected || _hillRollbackHoldTimer > 0.0f || 
+                 State == EngineState.Idle || State == EngineState.Starting || State == EngineState.StationHold || State == EngineState.TerminusStop))
+            {
+                _currentIndependentBrake = _commandedIndependentBrake; // Instant snap clamp
+            }
+            else
+            {
+                _currentIndependentBrake = Mathf.MoveTowards(_currentIndependentBrake, _commandedIndependentBrake, indBrakeSlew * dt);
+            }
             if (_controlsOverrider.IndependentBrake != null)
             {
                 _controlsOverrider.IndependentBrake.Set(_currentIndependentBrake);
@@ -1856,6 +2834,12 @@ namespace AITraffic.Driver
                 {
                     _controlsOverrider.Reverser.Set(_currentReverser);
                 }
+            }
+
+            // 6. Continuous Handbrake Release while in active driving service
+            if (_controlsOverrider.Handbrake != null && State != EngineState.TerminusStop)
+            {
+                _controlsOverrider.Handbrake.Set(0.0f);
             }
         }
 
@@ -1980,6 +2964,11 @@ namespace AITraffic.Driver
                 }
             }
 
+            if (_trainCar.brakeSystem != null)
+            {
+                _trainCar.brakeSystem.SetHandbrakePosition(1.0f, true);
+            }
+
             // Also shut down any helper / multi-unit locomotives in this trainset
             if (_trainCar.trainset != null && _trainCar.trainset.cars != null)
             {
@@ -1998,6 +2987,44 @@ namespace AITraffic.Driver
                         if (overrider.CabLight != null) overrider.CabLight.Set(0.0f);
                         if (overrider.Starter != null) overrider.Starter.Set(0.0f);
                         if (overrider.PowerOff != null) overrider.PowerOff.Set(1.0f);
+                    }
+                    if (car != null && car != _trainCar && car.brakeSystem != null)
+                    {
+                        car.brakeSystem.SetHandbrakePosition(1.0f, true);
+                    }
+                }
+            }
+        }
+
+        /// <summary>
+        /// Ensures all handbrakes across the locomotive, helper locomotives, and all cars in the consist are released.
+        /// </summary>
+        public void ReleaseAllConsistHandbrakes()
+        {
+            if (_controlsOverrider != null && _controlsOverrider.Handbrake != null)
+            {
+                _controlsOverrider.Handbrake.Set(0.0f);
+            }
+            if (_trainCar != null && _trainCar.brakeSystem != null)
+            {
+                _trainCar.brakeSystem.SetHandbrakePosition(0.0f, true);
+            }
+            if (_trainCar != null && _trainCar.trainset != null && _trainCar.trainset.cars != null)
+            {
+                for (int i = 0; i < _trainCar.trainset.cars.Count; i++)
+                {
+                    var car = _trainCar.trainset.cars[i];
+                    if (car == null) continue;
+                    if (car.brakeSystem != null)
+                    {
+                        car.brakeSystem.SetHandbrakePosition(0.0f, true);
+                    }
+                    if (car.SimController != null && car.SimController.controlsOverrider != null)
+                    {
+                        if (car.SimController.controlsOverrider.Handbrake != null)
+                        {
+                            car.SimController.controlsOverrider.Handbrake.Set(0.0f);
+                        }
                     }
                 }
             }

@@ -46,6 +46,7 @@ namespace AITraffic.Compat
         private const string ModIdSelfShunt = "SelfShunt";
         private const string ModIdYardMaster = "YardMaster";
         private const string ModIdPassengerJobs = "PassengerJobs";
+        private const string ModIdZCouplers = "ZCouplers";
 
         #region Presence Checks
 
@@ -129,6 +130,18 @@ namespace AITraffic.Compat
             }
         }
 
+        /// <summary>
+        /// True if Zeibach's Couplers (ZCouplers) is installed and active.
+        /// </summary>
+        public static bool IsZCouplersLoaded
+        {
+            get
+            {
+                var mod = UnityModManager.FindMod(ModIdZCouplers);
+                return mod != null && mod.Active;
+            }
+        }
+
         #endregion
 
         #region Initialization
@@ -150,6 +163,12 @@ namespace AITraffic.Compat
                     Main.ModEntry.Logger.Log(string.Format(" • PersistentJobs: {0}", IsPersistentJobsLoaded ? "Active [Dynamic Car Isolation Enabled]" : "Not Detected"));
                     Main.ModEntry.Logger.Log(string.Format(" • SelfShunt (YardMaster): {0}", IsYardMasterLoaded ? "Active [Active Yard Protection Enabled]" : "Not Detected"));
                     Main.ModEntry.Logger.Log(string.Format(" • PassengerJobs: {0}", IsPassengerJobsLoaded ? "Active [Passenger Platform Routing Enabled]" : "Not Detected"));
+                    Main.ModEntry.Logger.Log(string.Format(" • ZCouplers: {0}", IsZCouplersLoaded ? "Active [Coupler Stress Exemption Enabled]" : "Not Detected"));
+
+                    if (IsZCouplersLoaded)
+                    {
+                        InitializeZCouplersPatch(Main.ModEntry);
+                    }
                 }
             }
             catch (Exception ex)
@@ -157,6 +176,81 @@ namespace AITraffic.Compat
                 if (Main.ModEntry != null && Main.ModEntry.Logger != null)
                     Main.ModEntry.Logger.Error(string.Format("Error during ModCompatManager initialization: {0}", ex));
             }
+        }
+
+        private static void InitializeZCouplersPatch(UnityModManager.ModEntry modEntry)
+        {
+            try
+            {
+                Type breakerType = null;
+                foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
+                {
+                    breakerType = asm.GetType("DvMod.ZCouplers.Physics.CouplerBreaker");
+                    if (breakerType != null) break;
+                }
+
+                if (breakerType == null)
+                {
+                    if (modEntry != null && modEntry.Logger != null)
+                        modEntry.Logger.Warning("[ModCompatManager] ZCouplers mod was detected but CouplerBreaker type could not be found.");
+                    return;
+                }
+
+                MethodInfo fixedUpdateMethod = breakerType.GetMethod("FixedUpdate", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                if (fixedUpdateMethod == null)
+                {
+                    if (modEntry != null && modEntry.Logger != null)
+                        modEntry.Logger.Warning("[ModCompatManager] CouplerBreaker.FixedUpdate method could not be found.");
+                    return;
+                }
+
+                MethodInfo prefixMethod = typeof(ModCompatManager).GetMethod("CouplerBreaker_FixedUpdate_Prefix", BindingFlags.NonPublic | BindingFlags.Static);
+                if (prefixMethod == null) return;
+
+                var harmony = new Harmony("dv_ai_traffic.zcouplers_compat");
+                harmony.Patch(fixedUpdateMethod, prefix: new HarmonyMethod(prefixMethod));
+
+                if (modEntry != null && modEntry.Logger != null)
+                    modEntry.Logger.Log("[ModCompatManager] Successfully patched ZCouplers.CouplerBreaker.FixedUpdate with AI stress exemption.");
+            }
+            catch (Exception ex)
+            {
+                if (modEntry != null && modEntry.Logger != null)
+                    modEntry.Logger.Warning(string.Format("[ModCompatManager] Failed to apply ZCouplers patch: {0}", ex));
+            }
+        }
+
+        private static bool CouplerBreaker_FixedUpdate_Prefix(MonoBehaviour __instance)
+        {
+            if (__instance == null) return true;
+
+            try
+            {
+                var coupler = __instance.GetComponent<Coupler>();
+                if (coupler != null && coupler.train != null)
+                {
+                    var car = coupler.train;
+                    if (IsAITrain(car) || (Main.Settings != null && Main.Settings.AIDamageImmunity && car.playerSpawnedCar))
+                    {
+                        return false;
+                    }
+
+                    if (car.trainset != null && car.trainset.cars != null)
+                    {
+                        for (int i = 0; i < car.trainset.cars.Count; i++)
+                        {
+                            var c = car.trainset.cars[i];
+                            if (c != null && c.GetComponent<AITraffic.Driver.AIEngineer>() != null)
+                            {
+                                return false;
+                            }
+                        }
+                    }
+                }
+            }
+            catch { }
+
+            return true;
         }
 
         #endregion
@@ -488,6 +582,8 @@ namespace AITraffic.Compat
                     }
                 }
             }
+
+            if (AITraffic.Workers.WorkerManager.IsTrainCarInAnyWorkerTask(car)) return true;
 
             return false;
         }

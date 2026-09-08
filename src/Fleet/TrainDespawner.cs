@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using UnityEngine;
 using AITraffic.Compat;
 using AITraffic.Driver;
+using AITraffic.Workers;
 
 namespace AITraffic.Fleet
 {
@@ -28,6 +29,17 @@ namespace AITraffic.Fleet
         {
             if (trainset == null || trainset.cars == null || trainset.cars.Count == 0)
                 return true;
+
+            // 0. Worker trains or player consists must NEVER be despawned!
+            for (int i = 0; i < trainset.cars.Count; i++)
+            {
+                var car = trainset.cars[i];
+                if (car == null) continue;
+                if (ModCompatManager.IsWorkerTrain(car) || WorkerManager.IsTrainCarInAnyWorkerTask(car))
+                {
+                    return false;
+                }
+            }
 
             Transform playerTransform = PlayerManager.PlayerTransform;
             if (playerTransform == null)
@@ -115,6 +127,19 @@ namespace AITraffic.Fleet
                 if (Main.ModEntry != null && Main.ModEntry.Logger != null)
                     Main.ModEntry.Logger.Error("TrainDespawner: CarSpawner instance is null.");
                 return false;
+            }
+
+            // Safety guard: NEVER despawn a player consist or worker train!
+            for (int i = 0; i < trainset.cars.Count; i++)
+            {
+                var car = trainset.cars[i];
+                if (car == null) continue;
+                if (ModCompatManager.IsWorkerTrain(car) || WorkerManager.IsTrainCarInAnyWorkerTask(car))
+                {
+                    if (Main.ModEntry != null && Main.ModEntry.Logger != null)
+                        Main.ModEntry.Logger.Warning(string.Format("[TrainDespawner] Aborting despawn of trainset: car '{0}' is part of an AI worker task or player consist!", car.ID));
+                    return false;
+                }
             }
 
             try

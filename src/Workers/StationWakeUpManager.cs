@@ -177,6 +177,28 @@ namespace AITraffic.Workers
                 }
             }
 
+            var completedTasks = WorkerManager.Instance.CompletedTasks;
+            if (completedTasks != null && completedTasks.Count > 0)
+            {
+                Vector3 center = range.stationCenterAnchor != null ? range.stationCenterAnchor.position : station.transform.position;
+                float destroySqrDist = Mathf.Max(range.destroyGeneratedJobsSqrDistanceRegular, 2560000f);
+
+                for (int i = 0; i < completedTasks.Count; i++)
+                {
+                    var task = completedTasks[i];
+                    if (task == null || task.LeadLocomotive == null) continue;
+
+                    if (task.DestinationStation == station)
+                    {
+                        float distSq = (task.LeadLocomotive.transform.position - center).sqrMagnitude;
+                        if (distSq <= destroySqrDist)
+                        {
+                            return true;
+                        }
+                    }
+                }
+            }
+
             return false;
         }
 

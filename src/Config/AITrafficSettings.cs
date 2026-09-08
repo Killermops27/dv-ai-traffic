@@ -125,7 +125,7 @@ namespace AITraffic.Config
 
                 // --- TRAFFIC MODE ---
                 GUILayout.Label("Traffic Operating Mode: <b>Ambient Immersion</b>", subHeaderStyle);
-                GUILayout.Label("Ambient trains run on schedules for valley immersion. Player-employed AI Workers can be commissioned separately via the Worker Dispatcher.", descStyle);
+                GUILayout.Label("Ambient trains run on background schedules for valley immersion. Player-employed AI Workers can be hired diegetically in-game using the Comms Radio (switch mode to 'AI WORKER').", descStyle);
                 GUILayout.Space(8);
 
                 // --- TRAFFIC DENSITY ---
@@ -209,7 +209,8 @@ namespace AITraffic.Config
                 // --- MOD COMPATIBILITY STATUS ---
                 GUILayout.Label("Mod Compatibility Status", subHeaderStyle);
                 DrawCompatItem("DVSignals (Signaling & Interlocking)", ModCompatManager.IsDVSignalsLoaded, true);
-                DrawCompatItem("CommsRadioAPI (In-Game Dispatcher Mode)", ModCompatManager.IsCommsRadioAPILoaded, true);
+                DrawCompatItem("CommsRadioAPI (In-Game AI Worker Radio Mode)", ModCompatManager.IsCommsRadioAPILoaded, true);
+                DrawCompatItem("ZCouplers (Knuckle coupler stress exemption)", ModCompatManager.IsZCouplersLoaded, false);
                 DrawCompatItem("DoubleTrack (Multi-track mainline routing)", ModCompatManager.IsDoubleTrackLoaded, false);
                 DrawCompatItem("PersistentJobs (Job-car isolation)", ModCompatManager.IsPersistentJobsLoaded, false);
                 DrawCompatItem("SelfShunt / YardMaster (Yard shunting exclusion)", ModCompatManager.IsYardMasterLoaded, false);

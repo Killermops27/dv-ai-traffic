@@ -247,7 +247,8 @@ namespace AITraffic.Workers
                 Requester = leadLoco,
                 RequesterTrainset = leadLoco != null ? leadLoco.trainset : null,
                 PreferSpeedOverDistance = true,
-                AvoidOccupiedTracks = false,
+                AvoidOccupiedTracks = true,
+                StrictlyAvoidOccupied = true,
                 PreventPlayerOvertake = false,
                 MaxSearchDistance = 5000000f
             };
@@ -418,7 +419,8 @@ namespace AITraffic.Workers
                 Requester = leadLoco,
                 RequesterTrainset = leadLoco != null ? leadLoco.trainset : null,
                 PreferSpeedOverDistance = true,
-                AvoidOccupiedTracks = false,
+                AvoidOccupiedTracks = true,
+                StrictlyAvoidOccupied = true,
                 PreventPlayerOvertake = false,
                 MaxSearchDistance = 5000000f
             };
@@ -462,7 +464,14 @@ namespace AITraffic.Workers
                 var car = consist[i];
                 if (car == null) continue;
 
-                var controls = car.GetComponent<BaseControlsOverrider>();
+                if (car.brakeSystem != null)
+                {
+                    car.brakeSystem.SetHandbrakePosition(0f, true);
+                }
+
+                BaseControlsOverrider controls = null;
+                if (car.SimController != null) controls = car.SimController.controlsOverrider;
+                if (controls == null) controls = car.GetComponent<BaseControlsOverrider>();
                 if (controls != null && controls.Handbrake != null)
                 {
                     controls.Handbrake.Set(0f);
@@ -594,19 +603,62 @@ namespace AITraffic.Workers
         }
 
         /// <summary>
+        /// Checks if a train car belongs to any active or completed AI worker haul task.
+        /// Used by despawn systems to strictly preserve player-owned trains and consists.
+        /// </summary>
+        public static bool IsTrainCarInAnyWorkerTask(TrainCar car)
+        {
+            if (car == null || Instance == null) return false;
+
+            if (Instance.ActiveTasks != null)
+            {
+                for (int i = 0; i < Instance.ActiveTasks.Count; i++)
+                {
+                    var task = Instance.ActiveTasks[i];
+                    if (task == null) continue;
+                    if (task.LeadLocomotive == car) return true;
+                    if (task.Consist != null && task.Consist.Contains(car)) return true;
+                }
+            }
+
+            if (Instance.CompletedTasks != null)
+            {
+                for (int i = 0; i < Instance.CompletedTasks.Count; i++)
+                {
+                    var task = Instance.CompletedTasks[i];
+                    if (task == null) continue;
+                    if (task.LeadLocomotive == car) return true;
+                    if (task.Consist != null && task.Consist.Contains(car)) return true;
+                }
+            }
+
+            return false;
+        }
+
+        /// <summary>
         /// Invoked when the AI engineer has brought the consist to a halt on the destination track.
         /// </summary>
         private void HandleTaskTerminusArrival(AIEngineer engineer)
         {
-            if (engineer == null) return;
+            HandleTaskTerminusArrival(engineer, null);
+        }
 
-            AtoBHaulTask matchedTask = null;
-            for (int i = 0; i < ActiveTasks.Count; i++)
+        /// <summary>
+        /// Shuts down the engine, secures the train with brakes, releases control to player, and shows a toast banner.
+        /// </summary>
+        private void HandleTaskTerminusArrival(AIEngineer engineer, AtoBHaulTask task)
+        {
+            AtoBHaulTask matchedTask = task;
+            if (matchedTask == null)
             {
-                if (ActiveTasks[i].Engineer == engineer || ActiveTasks[i].LeadLocomotive == engineer.TrainCar)
+                if (engineer == null) return;
+                for (int i = 0; i < ActiveTasks.Count; i++)
                 {
-                    matchedTask = ActiveTasks[i];
-                    break;
+                    if (ActiveTasks[i].Engineer == engineer || ActiveTasks[i].LeadLocomotive == engineer.TrainCar)
+                    {
+                        matchedTask = ActiveTasks[i];
+                        break;
+                    }
                 }
             }
 
@@ -614,22 +666,92 @@ namespace AITraffic.Workers
 
             try
             {
-                engineer.OnTerminusArrival -= HandleTaskTerminusArrival;
+                if (engineer != null)
+                {
+                    engineer.OnTerminusArrival -= HandleTaskTerminusArrival;
+                    engineer.ShutdownEngine();
+                }
 
-                // Secure locomotive with full parking handbrake
+                // Extra safety: make sure lead locomotive engine is shut down and brakes secured
                 if (matchedTask.LeadLocomotive != null)
                 {
-                    var controls = matchedTask.LeadLocomotive.GetComponent<BaseControlsOverrider>();
-                    if (controls != null && controls.Handbrake != null)
+                    var lead = matchedTask.LeadLocomotive;
+                    var controls = lead.GetComponent<BaseControlsOverrider>();
+                    if (controls == null && lead.SimController != null)
                     {
-                        controls.Handbrake.Set(1.0f);
+                        controls = lead.SimController.controlsOverrider;
+                    }
+                    if (controls != null)
+                    {
+                        if (controls.Throttle != null) controls.Throttle.Set(0.0f);
+                        if (controls.DynamicBrake != null) controls.DynamicBrake.Set(0.0f);
+                        if (controls.Brake != null) controls.Brake.Set(1.0f);
+                        if (controls.IndependentBrake != null) controls.IndependentBrake.Set(1.0f);
+                        if (controls.Handbrake != null) controls.Handbrake.Set(1.0f);
+                        if (controls.Reverser != null) controls.Reverser.Set(0.0f);
+                        if (controls.Starter != null) controls.Starter.Set(0.0f);
+                        if (controls.PowerOff != null) controls.PowerOff.Set(1.0f);
+                        if (controls.HeadlightsFront != null) controls.HeadlightsFront.Set(0.0f);
+                        if (controls.HeadlightsRear != null) controls.HeadlightsRear.Set(0.0f);
+                        if (controls.CabLight != null) controls.CabLight.Set(0.0f);
+                        if (controls.Wipers != null) controls.Wipers.Set(0.0f);
+                    }
+                    if (lead.brakeSystem != null)
+                    {
+                        lead.brakeSystem.SetHandbrakePosition(1.0f, true);
+                    }
+                }
+
+                // Also shut down helper locomotives in consist and clamp handbrakes
+                if (matchedTask.Consist != null)
+                {
+                    foreach (var car in matchedTask.Consist)
+                    {
+                        if (car != null && car != matchedTask.LeadLocomotive && car.IsLoco)
+                        {
+                            var hControls = car.GetComponent<BaseControlsOverrider>();
+                            if (hControls == null && car.SimController != null)
+                            {
+                                hControls = car.SimController.controlsOverrider;
+                            }
+                            if (hControls != null)
+                            {
+                                if (hControls.Throttle != null) hControls.Throttle.Set(0.0f);
+                                if (hControls.DynamicBrake != null) hControls.DynamicBrake.Set(0.0f);
+                                if (hControls.Brake != null) hControls.Brake.Set(1.0f);
+                                if (hControls.IndependentBrake != null) hControls.IndependentBrake.Set(1.0f);
+                                if (hControls.Handbrake != null) hControls.Handbrake.Set(1.0f);
+                                if (hControls.Reverser != null) hControls.Reverser.Set(0.0f);
+                                if (hControls.Starter != null) hControls.Starter.Set(0.0f);
+                                if (hControls.PowerOff != null) hControls.PowerOff.Set(1.0f);
+                                if (hControls.HeadlightsFront != null) hControls.HeadlightsFront.Set(0.0f);
+                                if (hControls.HeadlightsRear != null) hControls.HeadlightsRear.Set(0.0f);
+                                if (hControls.CabLight != null) hControls.CabLight.Set(0.0f);
+                            }
+                            if (car.brakeSystem != null)
+                            {
+                                car.brakeSystem.SetHandbrakePosition(1.0f, true);
+                            }
+                        }
                     }
                 }
 
                 // Unregister and destroy AIEngineer component so control returns cleanly to player
-                TrafficManager.Instance.UnregisterEngineer(engineer);
-                UnityEngine.Object.Destroy(engineer);
-                matchedTask.Engineer = null;
+                if (engineer != null)
+                {
+                    TrafficManager.Instance.UnregisterEngineer(engineer);
+                    UnityEngine.Object.Destroy(engineer);
+                    matchedTask.Engineer = null;
+                }
+                else if (matchedTask.LeadLocomotive != null)
+                {
+                    var remEng = matchedTask.LeadLocomotive.GetComponent<AIEngineer>();
+                    if (remEng != null)
+                    {
+                        TrafficManager.Instance.UnregisterEngineer(remEng);
+                        UnityEngine.Object.Destroy(remEng);
+                    }
+                }
 
                 matchedTask.Status = HaulTaskStatus.Arrived;
                 matchedTask.CompletedTime = Time.time;
@@ -641,15 +763,18 @@ namespace AITraffic.Workers
                 string destName = matchedTask.DestinationStation != null && matchedTask.DestinationStation.stationInfo != null
                     ? matchedTask.DestinationStation.stationInfo.Name
                     : "Destination";
+                string trackName = matchedTask.DestinationTrack != null ? matchedTask.DestinationTrack.name : "Yard";
+                string locoId = matchedTask.LeadLocomotive != null ? matchedTask.LeadLocomotive.ID : "Consist";
 
-                string finishToast = string.Format("AI Worker completed! Consist delivered to {0} on track '{1}'!",
-                    destName, matchedTask.DestinationTrack != null ? matchedTask.DestinationTrack.name : "Yard");
+                string finishToast = string.Format("AI Worker completed! Train {0} delivered to {1} on track '{2}'. Engine shut down, control returned to player.",
+                    locoId, destName, trackName);
 
                 ShowToast(finishToast);
 
                 if (Main.ModEntry != null && Main.ModEntry.Logger != null)
                 {
-                    Main.ModEntry.Logger.Log(string.Format("[WorkerManager] Completed haul task '{0}' at {1}.", matchedTask.Id, destName));
+                    Main.ModEntry.Logger.Log(string.Format("[WorkerManager] Completed haul task '{0}' ({1}) at {2} on track '{3}'.",
+                        matchedTask.Id, locoId, destName, trackName));
                 }
             }
             catch (Exception ex)
@@ -677,10 +802,28 @@ namespace AITraffic.Workers
                     continue;
                 }
 
-                // Secondary arrival detection if engineer reached terminus stop
-                if (task.Engineer != null && task.Engineer.State == EngineState.TerminusStop && task.Engineer.CurrentSpeedKmh < 0.2f)
+                // Check if train has arrived and stopped on its destination track
+                bool isStoppedOnDestTrack = false;
+                if (task.DestinationTrack != null && task.LeadLocomotive != null)
                 {
-                    HandleTaskTerminusArrival(task.Engineer);
+                    var leadTrack = GetCurrentTrack(task.LeadLocomotive);
+                    if (leadTrack == task.DestinationTrack)
+                    {
+                        float speed = task.Engineer != null ? task.Engineer.CurrentSpeedKmh : Mathf.Abs(task.LeadLocomotive.GetForwardSpeed() * 3.6f);
+                        if (speed < 0.5f)
+                        {
+                            isStoppedOnDestTrack = true;
+                        }
+                    }
+                }
+
+                // Primary or secondary arrival detection
+                bool isTerminusStopped = (task.Engineer != null && task.Engineer.State == EngineState.TerminusStop && task.Engineer.CurrentSpeedKmh < 0.5f);
+                bool isIdleOnDest = (task.Engineer != null && task.Engineer.State == EngineState.Idle && isStoppedOnDestTrack);
+
+                if (isTerminusStopped || isStoppedOnDestTrack || isIdleOnDest)
+                {
+                    HandleTaskTerminusArrival(task.Engineer, task);
                 }
             }
         }

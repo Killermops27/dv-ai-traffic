@@ -97,7 +97,7 @@ namespace AITraffic.Driver
         /// <summary>
         /// Default service deceleration rate (m/s^2) for comfortable, early braking initiation.
         /// </summary>
-        public const float DefaultDeceleration = 0.35f;
+        public const float DefaultDeceleration = 0.45f;
 
         /// <summary>
         /// Maximum line speed allowed anywhere on the network (km/h).
@@ -121,24 +121,24 @@ namespace AITraffic.Driver
 
         /// <summary>
         /// Safety distance buffer before stop line / signal mast (meters).
-        /// Halts locomotive front 9.0 meters in front of the signal mast / buffer stop.
+        /// Halts locomotive front 20.0 meters in front of the signal mast / buffer stop to eliminate SPAD overruns.
         /// </summary>
-        public const float StopBufferDistance = 9.0f;
+        public const float StopBufferDistance = 20.0f;
 
         /// <summary>
         /// Distance at which the train transitions into the low-speed crawl approach phase (meters).
         /// </summary>
-        public const float CrawlStartDistance = 75.0f;
+        public const float CrawlStartDistance = 120.0f;
 
         /// <summary>
         /// Steady low crawl speed when approaching a red signal / stop target (km/h).
         /// </summary>
-        public const float CrawlSpeedKmh = 10.0f;
+        public const float CrawlSpeedKmh = 12.0f;
 
         /// <summary>
         /// Distance at which crawl speed begins final tapering to 0 stop (meters).
         /// </summary>
-        public const float FinalDecelDistance = 17.0f;
+        public const float FinalDecelDistance = 40.0f;
 
         #endregion
 
@@ -390,33 +390,34 @@ namespace AITraffic.Driver
             }
 
             // 3. True storage/industrial loading tracks (only slow shunting spurs)
-            bool isYardOrLoading = trackName.StartsWith("[Y]", StringComparison.OrdinalIgnoreCase) ||
-                                   trackName.StartsWith("[L]", StringComparison.OrdinalIgnoreCase) ||
-                                   trackName.StartsWith("[C]", StringComparison.OrdinalIgnoreCase);
+            bool isStorageOrLoading = trackName.StartsWith("[L]", StringComparison.OrdinalIgnoreCase) ||
+                                      trackName.StartsWith("[C]", StringComparison.OrdinalIgnoreCase);
 
-            if (isYardOrLoading)
-            {
-                trackLimit = Mathf.Min(trackLimit, DefaultYardSpeedKmh); // 30 km/h
-            }
-
-            // 4. Overwrite/respect precalculated RailGraph edge speed limit if edge is NOT a yard track
             if (AITraffic.Navigation.RailGraph.Instance != null)
             {
                 var edge = AITraffic.Navigation.RailGraph.Instance.GetEdge(track);
-                if (edge != null && !edge.IsYardTrack && edge.SpeedLimit > 0.0f)
+                if (edge != null)
                 {
-                    if (isPlatformTrack)
+                    if (edge.IsYardTrack)
                     {
-                        trackLimit = Mathf.Min(80.0f, edge.SpeedLimit);
+                        trackLimit = Mathf.Min(trackLimit, DefaultYardSpeedKmh); // 30 km/h
                     }
-                    else
+                    else if (edge.SpeedLimit > 0.0f)
                     {
-                        trackLimit = Mathf.Min(trackLimit, edge.SpeedLimit);
+                        trackLimit = Mathf.Min(trackLimit, isPlatformTrack ? Mathf.Min(80.0f, edge.SpeedLimit) : edge.SpeedLimit);
                     }
                 }
+                else if (isStorageOrLoading || trackName.StartsWith("[Y]", StringComparison.OrdinalIgnoreCase))
+                {
+                    trackLimit = Mathf.Min(trackLimit, DefaultYardSpeedKmh);
+                }
+            }
+            else if (isStorageOrLoading || trackName.StartsWith("[Y]", StringComparison.OrdinalIgnoreCase))
+            {
+                trackLimit = Mathf.Min(trackLimit, DefaultYardSpeedKmh);
             }
 
-            // Enforce hard 40 km/h cap on any diverging switch track
+            // Enforce safe 40 km/h cap on any diverging switch track
             if (trackName.IndexOf("diverging", StringComparison.OrdinalIgnoreCase) >= 0 ||
                 trackName.IndexOf("turnout", StringComparison.OrdinalIgnoreCase) >= 0 ||
                 trackName.IndexOf("switch", StringComparison.OrdinalIgnoreCase) >= 0)
@@ -837,15 +838,17 @@ namespace AITraffic.Driver
             // Enforces strict absolute block separation: decelerates down to 0 km/h stop line before the obstacle/block boundary
             if (distanceToObstacle > 0.0f && distanceToObstacle < 2000.0f)
             {
-                float obstacleDecel = Mathf.Max(ServiceDeceleration, 0.50f);
-                float obstacleStopSpeedMs = CalculateStopBrakingSpeed(distanceToObstacle, obstacleDecel);
+                // Stop 45m behind obstacle ahead to guarantee ample buffer against rear-end collisions
+                float effectiveObstacleDist = Mathf.Max(0.0f, distanceToObstacle - 25.0f);
+                float obstacleDecel = Mathf.Max(ServiceDeceleration, 0.45f);
+                float obstacleStopSpeedMs = CalculateStopBrakingSpeed(effectiveObstacleDist, obstacleDecel);
                 float obstacleStopSpeedKmh = MsToKmH(obstacleStopSpeedMs);
 
                 if (obstacleStopSpeedKmh < finalTargetKmh)
                 {
                     finalTargetKmh = obstacleStopSpeedKmh;
                     result.StopLimitKmh = obstacleStopSpeedKmh;
-                    result.DistanceToStop = distanceToObstacle;
+                    result.DistanceToStop = effectiveObstacleDist;
                     result.LimitingReason = SpeedLimitReason.BufferStop;
                 }
             }

@@ -2,7 +2,7 @@
   "Id": "AITraffic",
   "DisplayName": "AI Traffic",
   "Author": "Killermops27",
-  "Version": "0.2.1",
+  "Version": "0.2.2",
   "Requirements": [
     "DVSignals",
     "CommsRadioAPI"
@@ -13,7 +13,8 @@
     "DoubleTrack",
     "PassengerJobs",
     "PersistentJobsMod",
-    "SelfShunt"
+    "SelfShunt",
+    "ZCouplers"
   ],
   "EntryMethod": "AITraffic.Main.Load",
   "AssemblyName": "AITraffic.dll"

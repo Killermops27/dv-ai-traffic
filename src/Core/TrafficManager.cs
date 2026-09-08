@@ -727,7 +727,27 @@ namespace AITraffic.Core
         private GUIStyle _signalTagBoxStyle;
         private string _lastDispatchStatus = "";
         private bool _stylesInitialized = false;
-        private Camera _mainCamera;
+        private Camera GetActiveCamera()
+        {
+            // 1. Derail Valley PlayerManager: ActiveCamera returns PlayerCameraOverride when PhotoMode/Freecam/OrbitCam is engaged
+            try
+            {
+                Camera activeCam = PlayerManager.ActiveCamera;
+                if (activeCam != null && activeCam.isActiveAndEnabled)
+                    return activeCam;
+            }
+            catch { }
+
+            // 2. Fallback to Camera.main if valid and enabled
+            if (Camera.main != null && Camera.main.isActiveAndEnabled)
+                return Camera.main;
+
+            // 3. Fallback to Camera.current during GUI rendering events
+            if (Camera.current != null && Camera.current.isActiveAndEnabled)
+                return Camera.current;
+
+            return null;
+        }
 
         private void InitStyles()
         {
@@ -761,13 +781,13 @@ namespace AITraffic.Core
 
         private void OnGUI()
         {
+            // Draw floating toast notifications for worker hiring and arrival (always shown even if ambient traffic is Off)
+            AITraffic.Workers.WorkerManager.Instance.DrawToastGUI();
+
             if (_settings != null && _settings.Density == TrafficDensity.Off)
                 return;
 
             InitStyles();
-
-            // Draw floating toast notifications for worker hiring and arrival
-            AITraffic.Workers.WorkerManager.Instance.DrawToastGUI();
 
             // 1. Draw Master Debug Monitor (HUD)
             bool showHud = _settings != null && _settings.DebugVisuals;
@@ -818,8 +838,15 @@ namespace AITraffic.Core
                 GUILayout.BeginHorizontal();
                 if (GUILayout.Button("Spawn Ambient", GUILayout.Height(22)))
                 {
-                    bool ok = TrafficScheduler.Instance.DispatchTier1Ambient();
-                    _lastDispatchStatus = ok ? "<color=#00FF88>Ambient train dispatched successfully!</color>" : "<color=#FF4444>No clear corridor / departure track available.</color>";
+                    _lastDispatchStatus = "<color=#FFFF00>Evaluating clear corridor & dispatching...</color>";
+                    bool started = TrafficScheduler.Instance.DispatchTier1Ambient((ok) =>
+                    {
+                        _lastDispatchStatus = ok ? "<color=#00FF88>Ambient train dispatched successfully!</color>" : "<color=#FF4444>No clear corridor / departure track available.</color>";
+                    });
+                    if (!started)
+                    {
+                        _lastDispatchStatus = "<color=#FFAA00>Dispatch already in progress or max active trains reached.</color>";
+                    }
                 }
                 if (GUILayout.Button("Despawn All", GUILayout.Height(22)))
                 {
@@ -911,6 +938,34 @@ namespace AITraffic.Core
                         string obsStr = float.IsInfinity(eng.DistanceToObstacle) ? "Clear" : string.Format("<color=#FF5555>{0:F0}m</color>", eng.DistanceToObstacle);
                         GUILayout.Label(string.Format("   Thr: <b>{0:F0}%</b> | Brk: <b>{1:F0}%</b> | Dyn: <b>{2:F0}%</b> | Signal: {3} | Obstacle: {4}", throttle, trainBrake, dynBrake, sigStr, obsStr));
 
+                        // Powertrain telemetry (Thermal, Traction Motor Amperage, Wheel Slip & Rollback)
+                        string thermalStr = (eng.CurrentMaxTemperature > 0.1f) 
+                            ? (eng.IsOverheated ? string.Format("<color=#FF4444><b>Temp: {0:F0}°C [OVERHEAT CUT]</b></color>", eng.CurrentMaxTemperature) : string.Format("Temp: <b>{0:F0}°C</b>", eng.CurrentMaxTemperature))
+                            : "";
+                        string ampsStr = (eng.CurrentAmpsPerTM > 1.0f)
+                            ? (eng.OvercurrentThrottleLimit < 0.95f ? string.Format("<color=#FFA500><b>Amps: {0:F0}A [Limit {1:F0}%]</b></color>", eng.CurrentAmpsPerTM, eng.OvercurrentThrottleLimit * 100f) : string.Format("Amps: <b>{0:F0}A</b>", eng.CurrentAmpsPerTM))
+                            : "";
+                        string slipStr = eng.IsWheelSlipping ? " | <color=#FF5555><b>[SLIP]</b></color>" : "";
+                        string rollbackStr = eng.IsRollbackDetected ? " | <color=#FF0000><b>[ROLLBACK CLAMP]</b></color>" : "";
+                        string hillStr = eng.IsHillStarting ? " | <color=#FFD700><b>[HILL START]</b></color>" : "";
+
+                        if (!string.IsNullOrEmpty(thermalStr) || !string.IsNullOrEmpty(ampsStr) || eng.IsWheelSlipping || eng.IsRollbackDetected || eng.IsHillStarting)
+                        {
+                            string telemetry = string.Format("   Powertrain: {0}{1}{2}{3}{4}{5}",
+                                thermalStr,
+                                (!string.IsNullOrEmpty(thermalStr) && !string.IsNullOrEmpty(ampsStr) ? " | " : ""),
+                                ampsStr,
+                                slipStr,
+                                rollbackStr,
+                                hillStr);
+                            GUILayout.Label(telemetry);
+                        }
+
+                        if (eng.IsHoldingForCorridor)
+                        {
+                            GUILayout.Label(string.Format("   <color=#FFA500><b>[HOLD: Single Track ({0})]</b></color>", eng.CorridorHoldReason ?? "Corridor Conflict"));
+                        }
+
                         // --- Signal Blocks Section (Collapsible) ---
                         if (isBlocksExpanded)
                         {
@@ -1000,8 +1055,7 @@ namespace AITraffic.Core
             }
 
             // 2. Draw World-Space Floating Nametags over Active AI Trains & 3D Signal Tags
-            if (_mainCamera == null) _mainCamera = Camera.main;
-            Camera cam = _mainCamera;
+            Camera cam = GetActiveCamera();
             if (cam != null)
             {
                 // Active AI Train Nametags (rendered only when toggled on in debug monitor or settings)

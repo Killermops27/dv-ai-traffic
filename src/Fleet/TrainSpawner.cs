@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using UnityEngine;
+using DV.MultipleUnit;
 using DV.Simulation.Cars;
 using DV.ThingTypes;
 using AITraffic.Compat;
@@ -57,6 +58,98 @@ namespace AITraffic.Fleet
             }
 
             return SpawnAITrain(track, specs, startSpan, flipTrainConsist);
+        }
+
+        /// <summary>
+        /// Asynchronously spawns an AI train consist, time-slicing car instantiations 1 car per frame
+        /// to eliminate main-thread lag spikes.
+        /// </summary>
+        public static System.Collections.IEnumerator SpawnAITrainCoroutine(
+            RailTrack track,
+            ConsistType consistType,
+            string originYard = null,
+            string destYard = null,
+            double startSpan = 15.0,
+            bool flipTrainConsist = false,
+            System.Random rng = null,
+            Action<AIEngineer> onComplete = null)
+        {
+            if (track == null)
+            {
+                if (Main.ModEntry != null && Main.ModEntry.Logger != null)
+                    Main.ModEntry.Logger.Error("TrainSpawner.SpawnAITrainCoroutine failed: Target track is null.");
+                if (onComplete != null) onComplete(null);
+                yield break;
+            }
+
+            if (rng == null) rng = new System.Random();
+            List<ConsistCarSpec> specs = ConsistDefinitions.GetConsistSpecs(consistType, originYard, destYard, rng);
+            if (specs == null || specs.Count == 0)
+            {
+                if (Main.ModEntry != null && Main.ModEntry.Logger != null)
+                    Main.ModEntry.Logger.Error(string.Format("TrainSpawner.SpawnAITrainCoroutine failed: No specs generated for consist type {0}.", consistType));
+                if (onComplete != null) onComplete(null);
+                yield break;
+            }
+
+            List<TrainCarLivery> liveries = new List<TrainCarLivery>(specs.Count);
+            for (int i = 0; i < specs.Count; i++)
+            {
+                if (specs[i].Livery != null)
+                {
+                    liveries.Add(specs[i].Livery);
+                }
+            }
+
+            if (Core.TrafficManager.Instance != null)
+            {
+                yield return Core.TrafficManager.Instance.StartCoroutine(
+                    SpawnAITrainInternalCoroutine(track, liveries, specs, startSpan, flipTrainConsist, onComplete));
+            }
+            else
+            {
+                var eng = SpawnAITrainInternal(track, liveries, specs, startSpan, flipTrainConsist);
+                if (onComplete != null) onComplete(eng);
+            }
+        }
+
+        /// <summary>
+        /// Asynchronously spawns an AI train consist with custom car specs, time-slicing across frames.
+        /// </summary>
+        public static System.Collections.IEnumerator SpawnAITrainCoroutine(
+            RailTrack track,
+            List<ConsistCarSpec> specs,
+            double startSpan = 15.0,
+            bool flipTrainConsist = false,
+            Action<AIEngineer> onComplete = null)
+        {
+            if (track == null || specs == null || specs.Count == 0)
+            {
+                if (Main.ModEntry != null && Main.ModEntry.Logger != null)
+                    Main.ModEntry.Logger.Error("TrainSpawner.SpawnAITrainCoroutine failed: Invalid arguments.");
+                if (onComplete != null) onComplete(null);
+                yield break;
+            }
+
+            List<TrainCarLivery> liveries = new List<TrainCarLivery>(specs.Count);
+            for (int i = 0; i < specs.Count; i++)
+            {
+                if (specs[i].Livery != null)
+                {
+                    liveries.Add(specs[i].Livery);
+                }
+            }
+
+            if (Core.TrafficManager.Instance != null)
+            {
+                yield return Core.TrafficManager.Instance.StartCoroutine(
+                    SpawnAITrainInternalCoroutine(track, liveries, specs, startSpan, flipTrainConsist, onComplete));
+            }
+            else
+            {
+                var eng = SpawnAITrainInternal(track, liveries, specs, startSpan, flipTrainConsist);
+                if (onComplete != null) onComplete(eng);
+            }
         }
 
         /// <summary>
@@ -120,6 +213,291 @@ namespace AITraffic.Fleet
             }
 
             return SpawnAITrainInternal(track, liveries, specs, startSpan, flipTrainConsist);
+        }
+
+        private static System.Collections.IEnumerator SpawnAITrainInternalCoroutine(
+            RailTrack track,
+            List<TrainCarLivery> liveries,
+            List<ConsistCarSpec> specs,
+            double startSpan,
+            bool flipTrainConsist,
+            Action<AIEngineer> onComplete)
+        {
+            if (track == null || liveries == null || liveries.Count == 0)
+            {
+                if (Main.ModEntry != null && Main.ModEntry.Logger != null)
+                    Main.ModEntry.Logger.Error("TrainSpawner.SpawnAITrainInternalCoroutine failed: Invalid arguments.");
+                if (onComplete != null) onComplete(null);
+                yield break;
+            }
+
+            if (CarSpawner.Instance == null)
+            {
+                if (Main.ModEntry != null && Main.ModEntry.Logger != null)
+                    Main.ModEntry.Logger.Error("TrainSpawner.SpawnAITrainInternalCoroutine failed: CarSpawner instance not available.");
+                if (onComplete != null) onComplete(null);
+                yield break;
+            }
+
+            // Validate consist and track lengths for forward vs reverse span
+            float totalConsistLength = CarSpawner.Instance.GetTotalCarLiveriesLength(liveries);
+            float trackLength = track.curve != null ? track.curve.length : 0f;
+
+            if (trackLength > 0f)
+            {
+                if (!flipTrainConsist)
+                {
+                    // Forward travel (0 -> L): start near 0, extend towards L
+                    if (startSpan + totalConsistLength > trackLength)
+                    {
+                        if (totalConsistLength + 10f <= trackLength)
+                        {
+                            startSpan = Math.Max(5.0, (trackLength - totalConsistLength) * 0.5);
+                        }
+                    }
+                }
+                else
+                {
+                    // Reverse travel (L -> 0): start near L, extend towards 0
+                    if (startSpan < totalConsistLength + 5.0 || startSpan > trackLength)
+                    {
+                        startSpan = Math.Max(totalConsistLength + 5.0, trackLength - 15.0);
+                    }
+                }
+            }
+
+            // Build orientation list matching flipTrainConsist so locomotives and cars physically face the travel direction
+            List<bool> orientationList = new List<bool>(liveries.Count);
+            for (int i = 0; i < liveries.Count; i++)
+            {
+                orientationList.Add(flipTrainConsist);
+            }
+
+            // Precalculate track curve placements mathematically (instantaneous, < 1ms)
+            CarSpawner.SpawnData spawnData = default(CarSpawner.SpawnData);
+            bool dataGenerated = false;
+            try
+            {
+                spawnData = CarSpawner.GetTrackMiddleBasedSpawnData(
+                    liveries,
+                    orientationList,
+                    track,
+                    startSpan,
+                    flipTrainConsist);
+                dataGenerated = (spawnData.result == CarSpawner.SpawnDataResult.OK && spawnData.carData != null && spawnData.carData.Length > 0);
+            }
+            catch (Exception ex)
+            {
+                if (Main.ModEntry != null && Main.ModEntry.Logger != null)
+                    Main.ModEntry.Logger.Error(string.Format("TrainSpawner: GetTrackMiddleBasedSpawnData exception: {0}", ex));
+            }
+
+            if (!dataGenerated || spawnData.carData == null || spawnData.carData.Length == 0)
+            {
+                if (Main.ModEntry != null && Main.ModEntry.Logger != null)
+                    Main.ModEntry.Logger.Error(string.Format("TrainSpawner: Failed to compute spawn data (result: {0}) on track '{1}'.", spawnData.result, track.name));
+                if (onComplete != null) onComplete(null);
+                yield break;
+            }
+
+            List<TrainCar> spawnedCars = new List<TrainCar>(spawnData.carData.Length);
+            IsSpawningAmbientConsist = true;
+
+            try
+            {
+                for (int i = 0; i < spawnData.carData.Length; i++)
+                {
+                    var cData = spawnData.carData[i];
+                    if (cData.prefab == null) continue;
+
+                    TrainCar car = null;
+                    try
+                    {
+                        car = CarSpawner.Instance.SpawnCar(
+                            cData.prefab,
+                            spawnData.track,
+                            cData.position,
+                            cData.forward,
+                            playerSpawnedCar: true,
+                            uniqueCar: false
+                        );
+                    }
+                    catch (Exception spawnEx)
+                    {
+                        if (Main.ModEntry != null && Main.ModEntry.Logger != null)
+                            Main.ModEntry.Logger.Error(string.Format("Error spawning car {0} in consist: {1}", i, spawnEx));
+                    }
+
+                    if (car != null)
+                    {
+                        spawnedCars.Add(car);
+
+                        // Clamp handbrake immediately so newly spawned car stays rock-solid stationary on grades while consist assembles
+                        if (car.brakeSystem != null)
+                        {
+                            car.brakeSystem.SetHandbrakePosition(1.0f, true);
+                        }
+
+                        car.playerSpawnedCar = true;
+                        car.preventDebtDisplay = true;
+
+                        var cdc = car.GetComponent<DV.ServicePenalty.CarDebtController>();
+                        if (cdc != null) cdc.SetDummyDebtTracker();
+
+                        if (Main.Settings != null && Main.Settings.AIDamageImmunity)
+                        {
+                            ApplyAIDamageImmunity(car, true);
+                        }
+                    }
+
+                    // Time-slice: yield 1 frame between car instantiations to spread GameObject cloning smoothly
+                    yield return null;
+                }
+            }
+            finally
+            {
+                IsSpawningAmbientConsist = false;
+            }
+
+            if (spawnedCars.Count == 0)
+            {
+                if (Main.ModEntry != null && Main.ModEntry.Logger != null)
+                    Main.ModEntry.Logger.Error(string.Format("TrainSpawner: No cars spawned successfully on track '{0}'.", track.name));
+                if (onComplete != null) onComplete(null);
+                yield break;
+            }
+
+            // Yield 1 frame for physics / bogie registering and initial coupler settling
+            yield return null;
+
+            // Locate lead locomotive
+            TrainCar leadLoco = null;
+            for (int i = 0; i < spawnedCars.Count; i++)
+            {
+                var car = spawnedCars[i];
+                if (car != null && IsSupportedAILocomotive(car))
+                {
+                    leadLoco = car;
+                    break;
+                }
+            }
+            if (leadLoco == null) leadLoco = spawnedCars[0];
+
+            // Tag trainset for AI save segregation
+            if (leadLoco.trainset != null)
+            {
+                ModCompatManager.TagTrainAsAITraffic(leadLoco.trainset);
+            }
+
+            // Connect couplers, air hoses, open angle cocks, tighten chains
+            ConfigureConsistCouplers(spawnedCars);
+
+            // Yield 1 frame for coupler joint settling
+            yield return null;
+
+            // Connect Multiple Unit (MU) cables between all adjacent locomotives/slugs
+            for (int i = 0; i < spawnedCars.Count - 1; i++)
+            {
+                var carA = spawnedCars[i];
+                var carB = spawnedCars[i + 1];
+                if (carA != null && carB != null && carA.IsMultipleUnit && carB.IsMultipleUnit)
+                {
+                    ConnectMUCablesBetween(carA, carB);
+                }
+            }
+
+            // Pre-charge the air brake system across all cars and locomotives in the consist
+            for (int i = 0; i < spawnedCars.Count; i++)
+            {
+                var car = spawnedCars[i];
+                if (car == null || car.brakeSystem == null) continue;
+
+                try
+                {
+                    if (car.IsLoco)
+                    {
+                        car.brakeSystem.SetMainReservoirPressure(9.5f);
+                    }
+                    car.brakeSystem.SetBrakePipePressure(5.0f);
+                    car.brakeSystem.SetAuxReservoirPressure(5.0f);
+                    car.brakeSystem.SetControlReservoirPressure(5.0f);
+                }
+                catch { }
+            }
+
+            // Release temporary holding handbrakes and clean up debt records
+            for (int i = 0; i < spawnedCars.Count; i++)
+            {
+                var car = spawnedCars[i];
+                if (car == null) continue;
+
+                if (car.brakeSystem != null)
+                {
+                    car.brakeSystem.SetHandbrakePosition(0f, true);
+                }
+
+                var controls = (car.SimController != null) ? car.SimController.controlsOverrider : car.GetComponent<BaseControlsOverrider>();
+                if (controls != null && controls.Handbrake != null)
+                {
+                    controls.Handbrake.Set(0f);
+                }
+
+                if (car.IsLoco && DV.ServicePenalty.LocoDebtController.Instance != null && DV.ServicePenalty.LocoDebtController.Instance.trackedLocosDebts != null)
+                {
+                    var existingDebt = DV.ServicePenalty.LocoDebtController.Instance.trackedLocosDebts.Find(d => d != null && d.car == car);
+                    if (existingDebt != null)
+                    {
+                        DV.ServicePenalty.LocoDebtController.Instance.trackedLocosDebts.Remove(existingDebt);
+                        if (DV.ServicePenalty.CareerManagerDebtController.Instance != null)
+                        {
+                            DV.ServicePenalty.CareerManagerDebtController.Instance.UnregisterDebt(existingDebt);
+                        }
+                    }
+                }
+            }
+
+            // Yield 1 frame before heavy loco init (SimController port discovery, brake system init, engine startup)
+            yield return null;
+
+            // Initialize locomotives (startup prime movers, reverser, lights)
+            for (int i = 0; i < spawnedCars.Count; i++)
+            {
+                var car = spawnedCars[i];
+                if (car != null && car.IsLoco)
+                {
+                    InitializeLocomotive(car);
+                }
+            }
+
+            // Yield 1 frame for SimController to settle before AIEngineer component initialization
+            yield return null;
+
+            // Attach AIEngineer component
+            AIEngineer engineer = leadLoco.gameObject.GetComponent<AIEngineer>();
+            if (engineer == null)
+            {
+                engineer = leadLoco.gameObject.AddComponent<AIEngineer>();
+            }
+
+            // Stagger cargo loading across frames in background
+            if (engineer != null && specs != null && specs.Count > 0)
+            {
+                engineer.StartCoroutine(PopulateConsistCargoAsync(spawnedCars, specs));
+            }
+
+            // Yield 1 final frame so AIEngineer Awake/Start complete before caller accesses the engineer
+            yield return null;
+
+            if (Main.ModEntry != null && Main.ModEntry.Logger != null)
+            {
+                Main.ModEntry.Logger.Log(string.Format("[TrainSpawner] Successfully time-sliced spawned AI train ({0} cars, Lead Loco: {1}) on track '{2}'.",
+                    spawnedCars.Count, leadLoco.ID, track.name));
+            }
+
+            if (onComplete != null)
+            {
+                onComplete(engineer);
+            }
         }
 
         private static AIEngineer SpawnAITrainInternal(
@@ -268,8 +646,12 @@ namespace AITraffic.Fleet
                         ApplyAIDamageImmunity(car, true);
                     }
 
-                    // Release handbrake
-                    var controls = car.GetComponent<BaseControlsOverrider>();
+                    // Release handbrake across train car and controls
+                    if (car.brakeSystem != null)
+                    {
+                        car.brakeSystem.SetHandbrakePosition(0f, true);
+                    }
+                    var controls = (car.SimController != null) ? car.SimController.controlsOverrider : car.GetComponent<BaseControlsOverrider>();
                     if (controls != null && controls.Handbrake != null)
                     {
                         controls.Handbrake.Set(0f);
@@ -283,6 +665,17 @@ namespace AITraffic.Fleet
                     if (car != null && car.IsLoco)
                     {
                         InitializeLocomotive(car);
+                    }
+                }
+
+                // 6.5 Ensure Multiple Unit (MU) cables are connected between all adjacent locomotives/slugs
+                for (int i = 0; i < spawnedCars.Count - 1; i++)
+                {
+                    var carA = spawnedCars[i];
+                    var carB = spawnedCars[i + 1];
+                    if (carA != null && carB != null && carA.IsMultipleUnit && carB.IsMultipleUnit)
+                    {
+                        ConnectMUCablesBetween(carA, carB);
                     }
                 }
 
@@ -346,11 +739,8 @@ namespace AITraffic.Fleet
                             Main.ModEntry.Logger.Warning(string.Format("Failed loading cargo '{0}' onto car '{1}': {2}", cargoToLoad, car.ID, ex.Message));
                     }
 
-                    // Stagger: yield every 2 cars to distribute 3D mesh instantiation and texture uploads across frames seamlessly
-                    if (loadedCarCount % 2 == 0)
-                    {
-                        yield return null;
-                    }
+                    // Stagger: yield every car to distribute 3D mesh instantiation and texture uploads across frames
+                    yield return null;
                 }
             }
 
@@ -443,11 +833,98 @@ namespace AITraffic.Fleet
                     bestB.IsCockOpen = true;
                     bestA.SetChainTight(true);
                     bestB.SetChainTight(true);
+
+                    // Connect Multiple Unit (MU) cable if both adjacent units support it
+                    ConnectMUCablesBetween(carA, carB);
+
+                    // ZCouplers compatibility: remove any CouplerBreaker components attached during coupling
+                    // to prevent initial frame settling impulses from tearing AI consist joints apart
+                    try
+                    {
+                        var cbA = bestA.GetComponent("CouplerBreaker");
+                        if (cbA != null) UnityEngine.Object.DestroyImmediate(cbA);
+                        var cbB = bestB.GetComponent("CouplerBreaker");
+                        if (cbB != null) UnityEngine.Object.DestroyImmediate(cbB);
+                    }
+                    catch { }
                 }
                 catch (Exception ex)
                 {
                     if (Main.ModEntry != null && Main.ModEntry.Logger != null)
                         Main.ModEntry.Logger.Warning(string.Format("Warning coupling cars '{0}' and '{1}': {2}", carA.ID, carB.ID, ex.Message));
+                }
+            }
+        }
+
+        /// <summary>
+        /// Connects the Multiple Unit (MU) cable between two adjacent locomotives/slugs if both support MU.
+        /// </summary>
+        public static void ConnectMUCablesBetween(TrainCar carA, TrainCar carB)
+        {
+            if (carA == null || carB == null) return;
+            if (!carA.IsMultipleUnit || !carB.IsMultipleUnit) return;
+            if (carA.muModule == null || carB.muModule == null) return;
+
+            Coupler cA = null;
+            Coupler cB = null;
+
+            if (carA.frontCoupler != null && carA.frontCoupler.GetCoupled() != null && carA.frontCoupler.GetCoupled().train == carB)
+            {
+                cA = carA.frontCoupler;
+                cB = carA.frontCoupler.GetCoupled();
+            }
+            else if (carA.rearCoupler != null && carA.rearCoupler.GetCoupled() != null && carA.rearCoupler.GetCoupled().train == carB)
+            {
+                cA = carA.rearCoupler;
+                cB = carA.rearCoupler.GetCoupled();
+            }
+            else
+            {
+                Coupler[] couplersA = new Coupler[] { carA.frontCoupler, carA.rearCoupler };
+                Coupler[] couplersB = new Coupler[] { carB.frontCoupler, carB.rearCoupler };
+                float bestDistSq = float.MaxValue;
+                for (int i = 0; i < couplersA.Length; i++)
+                {
+                    if (couplersA[i] == null) continue;
+                    for (int j = 0; j < couplersB.Length; j++)
+                    {
+                        if (couplersB[j] == null) continue;
+                        float d = (couplersA[i].transform.position - couplersB[j].transform.position).sqrMagnitude;
+                        if (d < bestDistSq)
+                        {
+                            bestDistSq = d;
+                            cA = couplersA[i];
+                            cB = couplersB[j];
+                        }
+                    }
+                }
+                if (bestDistSq > 25.0f) return;
+            }
+
+            if (cA == null || cB == null) return;
+
+            var cableA = cA.isFrontCoupler ? carA.muModule.FrontCable : carA.muModule.RearCable;
+            var cableB = cB.isFrontCoupler ? carB.muModule.FrontCable : carB.muModule.RearCable;
+
+            if (cableA != null && cableB != null && !cableA.IsConnected && !cableB.IsConnected)
+            {
+                try
+                {
+                    cableA.Connect(cableB, playAudio: false);
+                    if (Main.ModEntry != null && Main.ModEntry.Logger != null)
+                    {
+                        Main.ModEntry.Logger.Log(string.Format("[TrainSpawner] Successfully connected MU cable between '{0}' ({1}) and '{2}' ({3}).",
+                            carA.ID, cA.isFrontCoupler ? "Front" : "Rear",
+                            carB.ID, cB.isFrontCoupler ? "Front" : "Rear"));
+                    }
+                }
+                catch (Exception ex)
+                {
+                    if (Main.ModEntry != null && Main.ModEntry.Logger != null)
+                    {
+                        Main.ModEntry.Logger.Warning(string.Format("[TrainSpawner] Failed to connect MU cable between '{0}' and '{1}': {2}",
+                            carA.ID, carB.ID, ex.Message));
+                    }
                 }
             }
         }
@@ -475,11 +952,24 @@ namespace AITraffic.Fleet
                     controls = loco.SimController.controlsOverrider;
                 }
 
+                if (loco.brakeSystem != null)
+                {
+                    try
+                    {
+                        loco.brakeSystem.SetMainReservoirPressure(9.5f);
+                        loco.brakeSystem.SetBrakePipePressure(5.0f);
+                        loco.brakeSystem.SetAuxReservoirPressure(5.0f);
+                        loco.brakeSystem.SetControlReservoirPressure(5.0f);
+                    }
+                    catch { }
+                    loco.brakeSystem.SetHandbrakePosition(0f, true);
+                }
+
                 if (controls != null)
                 {
                     if (controls.Handbrake != null) controls.Handbrake.Set(0f);
-                    if (controls.Brake != null) controls.Brake.Set(0f);
-                    if (controls.IndependentBrake != null) controls.IndependentBrake.Set(0f);
+                    if (controls.Brake != null) controls.Brake.Set(0.5f); // Hold service brake until AI takes control
+                    if (controls.IndependentBrake != null) controls.IndependentBrake.Set(1.0f); // Solidly clamp locomotive independent brake
                     if (controls.DynamicBrake != null) controls.DynamicBrake.Set(0f);
                     if (controls.Reverser != null) controls.Reverser.Set(1f);
                     if (controls.HeadlightsFront != null) controls.HeadlightsFront.Set(2f);
