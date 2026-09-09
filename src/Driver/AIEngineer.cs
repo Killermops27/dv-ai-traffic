@@ -747,7 +747,8 @@ namespace AITraffic.Driver
                 RailTrack prevSwitchTrack = curTrack;
                 _switchHoldDistance = float.PositiveInfinity;
 
-                bool isStoppedWaiting = (CurrentSpeedKmh < 1.0f && (DistanceToObstacle < 250f || DistanceToSignal < 250f || _corridorHoldDistance < 250f || State == EngineState.StationHold || State == EngineState.TerminusStop));
+                bool isParked = (State == EngineState.StationHold || State == EngineState.TerminusStop);
+                bool isStoppedWaiting = (CurrentSpeedKmh < 1.0f && (isParked || State == EngineState.Idle || (State == EngineState.Braking && TargetSpeedKmh <= 1.0f)));
                 if (isStoppedWaiting && AITraffic.Navigation.JunctionController.Instance != null)
                 {
                     AITraffic.Navigation.JunctionController.Instance.ReleaseAllLocksFor(this);
@@ -795,7 +796,7 @@ namespace AITraffic.Driver
 
                             // Advance Alignment: set switch immediately so station exit/entry route is aligned
                             bool switchAligned = (junction.selectedBranch == requiredBranch);
-                            if (!switchAligned && !isStoppedWaiting)
+                            if (!switchAligned && !isParked)
                             {
                                 switchAligned = AITraffic.Navigation.JunctionController.Instance.RequestJunctionAlignment(junction, requiredBranch, this);
                             }
@@ -1417,7 +1418,10 @@ namespace AITraffic.Driver
                     // Stop safely before the start of the single-track section.
                     // Write to _corridorHoldDistance (not DistanceToObstacle!) so the obstacle
                     // sensor's periodic refresh (every 0.25s) cannot clear this hold each cycle.
-                    float holdStopDist = Mathf.Max(5.0f, distToCorridorStart - 25.0f);
+                    // Increased distance from 25m to 45m to ensure the holding train parks completely
+                    // OUTSIDE the switch's physical 35m clearance margin, preventing it from
+                    // permanently denying switch alignment to the train it is waiting for!
+                    float holdStopDist = Mathf.Max(5.0f, distToCorridorStart - 45.0f);
                     _corridorHoldDistance = Mathf.Min(_corridorHoldDistance, holdStopDist);
                     return;
                 }
@@ -1435,7 +1439,23 @@ namespace AITraffic.Driver
                 _isHoldingForCorridor = false;
                 _corridorHoldReason = null;
                 _corridorHoldDistance = float.PositiveInfinity;
+            }
 
+            bool isParked = (State == EngineState.StationHold || State == EngineState.TerminusStop);
+            bool isStoppedWaiting = (CurrentSpeedKmh < 1.0f && (isParked || State == EngineState.Idle || (State == EngineState.Braking && TargetSpeedKmh <= 1.0f)));
+
+            // 4. Update Reservations
+            if (_isHoldingForCorridor || isStoppedWaiting)
+            {
+                // Yield all track reservations so other trains can pass us while we wait
+                foreach (var rTrk in _reservedTracks)
+                {
+                    AITraffic.Navigation.RailGraph.Instance.ReleaseTrackReservation(rTrk, this);
+                }
+                _reservedTracks.Clear();
+            }
+            else
+            {
                 // Acquire track reservations for the corridor to protect it from opposing traffic
                 for (int c = 0; c < corridorTracks.Count; c++)
                 {

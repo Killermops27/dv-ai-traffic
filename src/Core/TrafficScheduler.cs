@@ -127,6 +127,12 @@ namespace AITraffic.Core
         private readonly System.Random _rng = new System.Random();
         private readonly List<string> _recentDestinations = new List<string>();
 
+        private struct ScoredCorridor
+        {
+            public TrafficCorridor Corridor;
+            public float Score;
+        }
+
         public TrafficScheduler()
         {
             _lastDispatchTime = -9999f;
@@ -329,14 +335,22 @@ namespace AITraffic.Core
                 }
 
                 // 2. Sort corridors by player proximity score and destination anti-repetition
-                if (playerPos != Vector3.zero)
+                if (playerPos != Vector3.zero && corridorList.Count > 1)
                 {
-                    corridorList.Sort((a, b) =>
+                    var scoredCorridors = new List<ScoredCorridor>(corridorList.Count);
+                    for (int i = 0; i < corridorList.Count; i++)
                     {
-                        float scoreA = CalculateCorridorScore(a, playerPos);
-                        float scoreB = CalculateCorridorScore(b, playerPos);
-                        return scoreA.CompareTo(scoreB);
-                    });
+                        scoredCorridors.Add(new ScoredCorridor
+                        {
+                            Corridor = corridorList[i],
+                            Score = CalculateCorridorScore(corridorList[i], playerPos)
+                        });
+                    }
+                    scoredCorridors.Sort((a, b) => a.Score.CompareTo(b.Score));
+                    for (int i = 0; i < scoredCorridors.Count; i++)
+                    {
+                        corridorList[i] = scoredCorridors[i].Corridor;
+                    }
                 }
 
                 for (int c = 0; c < corridorList.Count; c++)
@@ -763,42 +777,58 @@ namespace AITraffic.Core
             return true;
         }
 
-        private static StationController FindStation(string yardId)
+        private static readonly Dictionary<string, StationController> s_stationIndex = new Dictionary<string, StationController>(StringComparer.OrdinalIgnoreCase);
+
+        private static void EnsureStationIndexBuilt()
         {
-            if (string.IsNullOrEmpty(yardId) || StationController.allStations == null)
-                return null;
+            if (s_stationIndex.Count > 0) return;
+            if (StationController.allStations == null || StationController.allStations.Count == 0) return;
 
             for (int i = 0; i < StationController.allStations.Count; i++)
             {
                 var sc = StationController.allStations[i];
-                if (sc != null && sc.stationInfo != null)
+                if (sc == null || sc.stationInfo == null) continue;
+
+                string sYard = sc.stationInfo.YardID;
+                string sName = sc.stationInfo.Name;
+
+                if (!string.IsNullOrEmpty(sYard) && !s_stationIndex.ContainsKey(sYard))
                 {
-                    string sYard = sc.stationInfo.YardID ?? "";
-                    string sName = sc.stationInfo.Name ?? "";
+                    s_stationIndex[sYard] = sc;
+                }
+                if (!string.IsNullOrEmpty(sName) && !s_stationIndex.ContainsKey(sName))
+                {
+                    s_stationIndex[sName] = sc;
+                }
 
-                    if (string.Equals(sYard, yardId, StringComparison.OrdinalIgnoreCase) ||
-                        string.Equals(sName, yardId, StringComparison.OrdinalIgnoreCase))
-                    {
-                        return sc;
-                    }
+                // Handle common aliases: CW / CSW (City South West / City West)
+                if (string.Equals(sYard, "CSW", StringComparison.OrdinalIgnoreCase) || string.Equals(sYard, "CW", StringComparison.OrdinalIgnoreCase) ||
+                    (!string.IsNullOrEmpty(sName) && (sName.IndexOf("City South", StringComparison.OrdinalIgnoreCase) >= 0 || sName.IndexOf("City West", StringComparison.OrdinalIgnoreCase) >= 0)))
+                {
+                    if (!s_stationIndex.ContainsKey("CW")) s_stationIndex["CW"] = sc;
+                    if (!s_stationIndex.ContainsKey("CSW")) s_stationIndex["CSW"] = sc;
+                }
 
-                    // Handle common aliases: CW / CSW (City South West / City West)
-                    if ((yardId.Equals("CW", StringComparison.OrdinalIgnoreCase) || yardId.Equals("CSW", StringComparison.OrdinalIgnoreCase)) &&
-                        (sYard.Equals("CW", StringComparison.OrdinalIgnoreCase) || sYard.Equals("CSW", StringComparison.OrdinalIgnoreCase) ||
-                         sName.IndexOf("City South", StringComparison.OrdinalIgnoreCase) >= 0 || sName.IndexOf("City West", StringComparison.OrdinalIgnoreCase) >= 0))
-                    {
-                        return sc;
-                    }
-
-                    // Handle Farm / Forest Meadow aliases
-                    if ((yardId.Equals("FM", StringComparison.OrdinalIgnoreCase) || yardId.Equals("FR", StringComparison.OrdinalIgnoreCase)) &&
-                        (sYard.Equals("FM", StringComparison.OrdinalIgnoreCase) || sYard.Equals("FR", StringComparison.OrdinalIgnoreCase) ||
-                         sName.IndexOf("Farm", StringComparison.OrdinalIgnoreCase) >= 0 || sName.IndexOf("Forest", StringComparison.OrdinalIgnoreCase) >= 0))
-                    {
-                        return sc;
-                    }
+                // Handle Farm / Forest Meadow aliases
+                if (string.Equals(sYard, "FM", StringComparison.OrdinalIgnoreCase) || string.Equals(sYard, "FR", StringComparison.OrdinalIgnoreCase) ||
+                    (!string.IsNullOrEmpty(sName) && (sName.IndexOf("Farm", StringComparison.OrdinalIgnoreCase) >= 0 || sName.IndexOf("Forest", StringComparison.OrdinalIgnoreCase) >= 0)))
+                {
+                    if (!s_stationIndex.ContainsKey("FM")) s_stationIndex["FM"] = sc;
+                    if (!s_stationIndex.ContainsKey("FR")) s_stationIndex["FR"] = sc;
                 }
             }
+        }
+
+        private static StationController FindStation(string yardId)
+        {
+            if (string.IsNullOrEmpty(yardId))
+                return null;
+
+            EnsureStationIndexBuilt();
+
+            StationController sc;
+            if (s_stationIndex.TryGetValue(yardId, out sc))
+                return sc;
 
             return null;
         }

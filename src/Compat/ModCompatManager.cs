@@ -36,6 +36,7 @@ namespace AITraffic.Compat
         private static readonly HashSet<TrainCar> s_aiCars = new HashSet<TrainCar>();
         private static readonly HashSet<string> s_aiCarIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         private static readonly HashSet<string> s_historicalAmbientCarIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        private static readonly HashSet<string> s_knownNonAiCarIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
         // Mod ID Constants
         private const string ModIdDVSignals = "DVSignals";
@@ -459,6 +460,7 @@ namespace AITraffic.Compat
                         {
                             s_aiCarIds.Add(car.ID);
                             s_historicalAmbientCarIds.Add(car.ID);
+                            s_knownNonAiCarIds.Remove(car.ID);
                         }
                         s_aiCars.Add(car);
                     }
@@ -522,6 +524,13 @@ namespace AITraffic.Compat
         public static bool IsAITrain(TrainCar car)
         {
             if (car == null) return false;
+
+            lock (s_aiCarsLock)
+            {
+                if (s_aiCars.Contains(car) || (!string.IsNullOrEmpty(car.CarGUID) && s_aiCarGuids.Contains(car.CarGUID)))
+                    return true;
+            }
+
             if (car.GetComponent<AITraffic.Driver.AIEngineer>() != null) return true;
             if (car.gameObject != null && car.gameObject.GetComponent<AITrafficCarMarker>() != null) return true;
 
@@ -538,10 +547,7 @@ namespace AITraffic.Compat
                 }
             }
 
-            lock (s_aiCarsLock)
-            {
-                return s_aiCars.Contains(car) || (!string.IsNullOrEmpty(car.CarGUID) && s_aiCarGuids.Contains(car.CarGUID));
-            }
+            return false;
         }
 
         /// <summary>
@@ -612,6 +618,8 @@ namespace AITraffic.Compat
             {
                 if (s_historicalAmbientCarIds.Contains(carId) || s_aiCarIds.Contains(carId))
                     return true;
+                if (s_knownNonAiCarIds.Contains(carId))
+                    return false;
             }
 
             if (CarSpawner.Instance != null && CarSpawner.Instance.AllCars != null)
@@ -619,7 +627,20 @@ namespace AITraffic.Compat
                 var car = CarSpawner.Instance.AllCars.Find(c => c != null && c.ID == carId);
                 if (car != null)
                 {
-                    return IsAmbientAITrain(car);
+                    bool isAi = IsAmbientAITrain(car);
+                    lock (s_aiCarsLock)
+                    {
+                        if (isAi)
+                        {
+                            s_aiCarIds.Add(carId);
+                            s_historicalAmbientCarIds.Add(carId);
+                        }
+                        else
+                        {
+                            s_knownNonAiCarIds.Add(carId);
+                        }
+                    }
+                    return isAi;
                 }
             }
 

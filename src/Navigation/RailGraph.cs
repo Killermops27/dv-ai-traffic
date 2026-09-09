@@ -790,40 +790,42 @@ namespace AITraffic.Navigation
 
         public RailEdge GetClosestEdge(Vector3 position, out float minDistance)
         {
-            minDistance = float.MaxValue;
+            float minSqrDistance = float.MaxValue;
             RailEdge bestEdge = null;
 
             for (int i = 0; i < Edges.Count; i++)
             {
                 var edge = Edges[i];
                 Vector3 mid = edge.GetMidPoint();
-                float d = Vector3.Distance(position, mid);
-                if (d < minDistance)
+                float sqrD = (position - mid).sqrMagnitude;
+                if (sqrD < minSqrDistance)
                 {
-                    minDistance = d;
+                    minSqrDistance = sqrD;
                     bestEdge = edge;
                 }
             }
 
+            minDistance = minSqrDistance < float.MaxValue ? Mathf.Sqrt(minSqrDistance) : float.MaxValue;
             return bestEdge;
         }
 
         public RailNode GetClosestNode(Vector3 position, out float minDistance)
         {
-            minDistance = float.MaxValue;
+            float minSqrDist = float.MaxValue;
             RailNode bestNode = null;
 
             for (int i = 0; i < Nodes.Count; i++)
             {
                 var node = Nodes[i];
-                float d = Vector3.Distance(position, node.Position);
-                if (d < minDistance)
+                float dSqr = (position - node.Position).sqrMagnitude;
+                if (dSqr < minSqrDist)
                 {
-                    minDistance = d;
+                    minSqrDist = dSqr;
                     bestNode = node;
                 }
             }
 
+            minDistance = minSqrDist < float.MaxValue ? Mathf.Sqrt(minSqrDist) : float.MaxValue;
             return bestNode;
         }
 

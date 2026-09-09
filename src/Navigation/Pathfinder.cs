@@ -299,6 +299,10 @@ namespace AITraffic.Navigation
     public class Pathfinder
     {
         private readonly RailGraph _graph;
+        private readonly MinHeap<SearchNode> _openSet = new MinHeap<SearchNode>();
+        private readonly Dictionary<long, float> _nodeBestCost = new Dictionary<long, float>();
+        private readonly HashSet<RailTrack> _requesterTracks = new HashSet<RailTrack>();
+        private readonly HashSet<RailNode> _targetNodes = new HashSet<RailNode>();
 
         public Pathfinder(RailGraph graph = null)
         {
@@ -521,19 +525,20 @@ namespace AITraffic.Navigation
 
         private RailPath RunAStar(RailEdge initialEdge, RailNode startNode, RailEdge destEdge, PathfinderOptions options)
         {
-            var targetNodes = new HashSet<RailNode>();
-            if (destEdge.FromNode != null) targetNodes.Add(destEdge.FromNode);
-            if (destEdge.ToNode != null) targetNodes.Add(destEdge.ToNode);
+            _targetNodes.Clear();
+            if (destEdge.FromNode != null) _targetNodes.Add(destEdge.FromNode);
+            if (destEdge.ToNode != null) _targetNodes.Add(destEdge.ToNode);
 
             Vector3 targetPosition = destEdge.GetMidPoint();
-            return ExecuteAStarCore(initialEdge, startNode, targetPosition, destEdge, targetNodes, options);
+            return ExecuteAStarCore(initialEdge, startNode, targetPosition, destEdge, _targetNodes, options);
         }
 
         private RailPath RunAStar(RailEdge initialEdge, RailNode startNode, RailNode destNode, PathfinderOptions options)
         {
-            var targetNodes = new HashSet<RailNode> { destNode };
+            _targetNodes.Clear();
+            _targetNodes.Add(destNode);
             Vector3 targetPosition = destNode.Position;
-            return ExecuteAStarCore(initialEdge, startNode, targetPosition, null, targetNodes, options);
+            return ExecuteAStarCore(initialEdge, startNode, targetPosition, null, _targetNodes, options);
         }
 
         private static long GetStateKey(int nodeId, int incomingEdgeId)
@@ -549,14 +554,17 @@ namespace AITraffic.Navigation
             HashSet<RailNode> targetNodes,
             PathfinderOptions options)
         {
-            var openSet = new MinHeap<SearchNode>();
-            var nodeBestCost = new Dictionary<long, float>();
+            _openSet.Clear();
+            var openSet = _openSet;
+            _nodeBestCost.Clear();
+            var nodeBestCost = _nodeBestCost;
 
             // Pre-index requester's own cars into a HashSet<RailTrack> for O(1) checks during A*
             HashSet<RailTrack> requesterTracks = null;
             if (options.RequesterTrainset != null && options.RequesterTrainset.cars != null)
             {
-                requesterTracks = new HashSet<RailTrack>();
+                _requesterTracks.Clear();
+                requesterTracks = _requesterTracks;
                 for (int c = 0; c < options.RequesterTrainset.cars.Count; c++)
                 {
                     var car = options.RequesterTrainset.cars[c];
@@ -569,12 +577,15 @@ namespace AITraffic.Navigation
             // Ensure occupied tracks snapshot is available for O(1) checks during A*
             HashSet<RailTrack> occupiedSnapshot = options.OccupiedTracksSnapshot ?? RailGraph.BuildOccupiedTracksSnapshot(options.RequesterTrainset);
 
+            float startG = initialEdge != null ? initialEdge.Length : 0f;
+            float startH = Vector3.Distance(startNode.Position, targetPosition);
             var startSearchNode = new SearchNode
             {
                 Node = startNode,
                 IncomingEdge = initialEdge,
-                GScore = initialEdge != null ? initialEdge.Length : 0f,
-                HScore = Vector3.Distance(startNode.Position, targetPosition),
+                GScore = startG,
+                HScore = startH,
+                FScore = startG + startH,
                 Parent = null,
                 EdgeFromParent = initialEdge,
                 SwitchBranch = 0
@@ -660,6 +671,7 @@ namespace AITraffic.Navigation
                         IncomingEdge = edge,
                         GScore = tentativeGScore,
                         HScore = hScore,
+                        FScore = tentativeGScore + hScore,
                         Parent = current,
                         EdgeFromParent = edge,
                         SwitchBranch = requiredBranch
@@ -1172,10 +1184,7 @@ namespace AITraffic.Navigation
             public RailEdge IncomingEdge;
             public float GScore;
             public float HScore;
-            public float FScore
-            {
-                get { return GScore + HScore; }
-            }
+            public float FScore;
             public SearchNode Parent;
             public RailEdge EdgeFromParent;
             public byte SwitchBranch;
@@ -1197,6 +1206,11 @@ namespace AITraffic.Navigation
             public int Count
             {
                 get { return _elements.Count; }
+            }
+
+            public void Clear()
+            {
+                _elements.Clear();
             }
 
             public void Push(T item)

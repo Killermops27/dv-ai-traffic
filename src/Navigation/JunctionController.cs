@@ -135,9 +135,40 @@ namespace AITraffic.Navigation
                 TrainCar occupyingCar;
                 if (IsJunctionPhysicallyOccupied(junction, out occupyingCar))
                 {
-                    Log(string.Format("[JunctionController] Junction '{0}' is physically occupied by car '{1}'; alignment to branch {2} DENIED for requester '{3}'.",
-                        junction.name, occupyingCar != null ? occupyingCar.ID : "unknown", desiredBranch, requester));
-                    return false;
+                    Trainset requesterTrainset = GetTrainsetFromRequester(requester);
+                    if (requesterTrainset != null && occupyingCar != null && occupyingCar.trainset == requesterTrainset)
+                    {
+                        // The occupying car is our own train.
+                        // We must ensure we are not STRADDLING the junction.
+                        bool isStraddling = false;
+                        foreach (var car in requesterTrainset.cars)
+                        {
+                            if (car.FrontBogie != null && car.RearBogie != null && car.FrontBogie.track != null && car.RearBogie.track != null)
+                            {
+                                if (car.FrontBogie.track != car.RearBogie.track)
+                                {
+                                    var connectedTracks = GetConnectedTracks(junction);
+                                    if (connectedTracks.Contains(car.FrontBogie.track) && connectedTracks.Contains(car.RearBogie.track))
+                                    {
+                                        isStraddling = true;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+
+                        if (isStraddling)
+                        {
+                            Log(string.Format("[JunctionController] Junction '{0}' is physically STRADDLED by our own train '{1}'; alignment DENIED.", junction.name, occupyingCar.ID));
+                            return false;
+                        }
+                    }
+                    else
+                    {
+                        Log(string.Format("[JunctionController] Junction '{0}' is physically occupied by car '{1}'; alignment to branch {2} DENIED for requester '{3}'.",
+                            junction.name, occupyingCar != null ? occupyingCar.ID : "unknown", desiredBranch, requester));
+                        return false;
+                    }
                 }
 
                 // 2. Player occupancy / presence check
@@ -166,7 +197,7 @@ namespace AITraffic.Navigation
 
                 try
                 {
-                    junction.Switch(Junction.SwitchMode.REGULAR, desiredBranch);
+                    junction.Switch(Junction.SwitchMode.FORCED, desiredBranch);
                     Log(string.Format("[JunctionController] Junction '{0}' switched to branch {1} for requester '{2}'.", junction.name, desiredBranch, requester));
 
                     if (OnJunctionSwitched != null)
@@ -196,9 +227,30 @@ namespace AITraffic.Navigation
                 if (IsJunctionPhysicallyOccupied(junction, out occupyingCar))
                 {
                     Trainset requesterTrainset = GetTrainsetFromRequester(requester);
-                    if (occupyingCar != null && (requesterTrainset == null || occupyingCar.trainset != requesterTrainset))
+                    bool isStraddling = false;
+
+                    if (requesterTrainset != null && occupyingCar != null && occupyingCar.trainset == requesterTrainset)
                     {
-                        return false; // Junction is physically occupied by a different train
+                        foreach (var car in requesterTrainset.cars)
+                        {
+                            if (car.FrontBogie != null && car.RearBogie != null && car.FrontBogie.track != null && car.RearBogie.track != null)
+                            {
+                                if (car.FrontBogie.track != car.RearBogie.track)
+                                {
+                                    var connectedTracks = GetConnectedTracks(junction);
+                                    if (connectedTracks.Contains(car.FrontBogie.track) && connectedTracks.Contains(car.RearBogie.track))
+                                    {
+                                        isStraddling = true;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if (requesterTrainset == null || occupyingCar == null || occupyingCar.trainset != requesterTrainset || isStraddling)
+                    {
+                        return false;
                     }
                 }
 
@@ -209,6 +261,7 @@ namespace AITraffic.Navigation
                         return false;
                     }
                 }
+
                 JunctionLockInfo lockInfo;
                 if (_activeLocks.TryGetValue(junction, out lockInfo))
                 {

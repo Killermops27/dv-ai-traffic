@@ -213,34 +213,35 @@ namespace AITraffic.Core
             }
         }
 
+        private struct StationLocationEntry
+        {
+            public float LastUpdateTime;
+            public string Description;
+        }
+
+        private static readonly Dictionary<TrainCar, StationLocationEntry> s_stationLocationCache = new Dictionary<TrainCar, StationLocationEntry>();
+
         /// <summary>
         /// Checks whether a given TrainCar is operated by the AI Traffic mod.
         /// </summary>
         public static bool IsAITrain(TrainCar car)
         {
-            if (car == null) return false;
-
-            if (car.GetComponent<AIEngineer>() != null) return true;
-
-            if (car.trainset != null && car.trainset.cars != null)
-            {
-                for (int i = 0; i < car.trainset.cars.Count; i++)
-                {
-                    var c = car.trainset.cars[i];
-                    if (c != null && c.GetComponent<AIEngineer>() != null)
-                        return true;
-                }
-            }
-
-            return false;
+            return AITraffic.Compat.ModCompatManager.IsAITrain(car);
         }
 
         /// <summary>
         /// Gets a descriptive string of the train's current world location and nearest station.
+        /// Cached per locomotive on a 2-second timer to eliminate per-frame station iteration in OnGUI.
         /// </summary>
         public static string GetTrainLocationDescription(TrainCar trainCar)
         {
             if (trainCar == null) return "Unknown";
+
+            StationLocationEntry cached;
+            if (s_stationLocationCache.TryGetValue(trainCar, out cached) && (Time.time - cached.LastUpdateTime < 2.0f))
+            {
+                return cached.Description;
+            }
 
             string trackName = "Mainline";
             if (trainCar.FrontBogie != null && trainCar.FrontBogie.track != null)
@@ -275,7 +276,9 @@ namespace AITraffic.Core
                 }
             }
 
-            return string.Format("{0} | Track: {1}", nearestStationStr, trackName);
+            string result = string.Format("{0} | Track: {1}", nearestStationStr, trackName);
+            s_stationLocationCache[trainCar] = new StationLocationEntry { LastUpdateTime = Time.time, Description = result };
+            return result;
         }
 
         /// <summary>
@@ -510,6 +513,42 @@ namespace AITraffic.Core
                         }
                     }
                 }
+
+                // Shift existing visualizer points and mark caches dirty to resample from shifted track curves
+                for (int i = 0; i < _visualizerCaches.Count; i++)
+                {
+                    var cache = _visualizerCaches[i];
+                    if (cache == null) continue;
+
+                    if (cache.Points != null && cache.Points.Count > 0)
+                    {
+                        for (int p = 0; p < cache.Points.Count; p++)
+                        {
+                            cache.Points[p] += offset;
+                        }
+                    }
+
+                    if (cache.PointsArray != null && cache.PointsArray.Length > 0)
+                    {
+                        for (int p = 0; p < cache.PointsArray.Length; p++)
+                        {
+                            cache.PointsArray[p] += offset;
+                        }
+
+                        if (i < _routeLineRenderers.Count)
+                        {
+                            var lr = _routeLineRenderers[i];
+                            if (lr != null)
+                            {
+                                lr.positionCount = cache.PointsArray.Length;
+                                lr.SetPositions(cache.PointsArray);
+                            }
+                        }
+                    }
+
+                    cache.TrackIndex = -1;
+                    cache.Path = null;
+                }
             }
             catch (Exception ex)
             {
@@ -522,11 +561,90 @@ namespace AITraffic.Core
 
         #region 3D In-World Route Visualizer
 
+        public static readonly Color[] TrainPathColors = new Color[]
+        {
+            new Color(0.0f, 1.0f, 0.55f),  // Spring / Emerald Green
+            new Color(0.15f, 0.85f, 1.0f), // Cyan / Sky Blue
+            new Color(1.0f, 0.85f, 0.1f),  // Gold / Yellow
+            new Color(1.0f, 0.35f, 0.95f), // Magenta / Neon Pink
+            new Color(1.0f, 0.45f, 0.1f),  // Bright Orange
+            new Color(0.35f, 0.55f, 1.0f), // Royal / Azure Blue
+            new Color(0.65f, 1.0f, 0.2f),  // Lime Green
+            new Color(0.85f, 0.4f, 1.0f),  // Purple / Violet
+            new Color(1.0f, 0.25f, 0.25f), // Bright Crimson / Red
+            new Color(0.1f, 1.0f, 0.85f),  // Turquoise / Aquamarine
+            new Color(1.0f, 0.6f, 0.8f),   // Rose Pink
+            new Color(0.5f, 0.9f, 1.0f),   // Ice Blue
+            new Color(1.0f, 0.7f, 0.3f),   // Coral / Amber
+            new Color(0.3f, 1.0f, 0.4f),   // Mint Green
+            new Color(0.8f, 0.9f, 0.2f),   // Chartreuse
+            new Color(0.9f, 0.6f, 1.0f)    // Lavender / Orchid
+        };
+
+        private static readonly Material[] s_pathMaterials = new Material[TrainPathColors.Length];
+        private static Shader s_routeShader;
+
+        private static Material GetPathMaterial(int colorIndex)
+        {
+            int idx = Mathf.Abs(colorIndex) % TrainPathColors.Length;
+            if (s_pathMaterials[idx] != null)
+                return s_pathMaterials[idx];
+
+            if (s_routeShader == null)
+            {
+                try
+                {
+                    var existingLr = UnityEngine.Object.FindObjectOfType<LineRenderer>();
+                    if (existingLr != null && existingLr.sharedMaterial != null && existingLr.sharedMaterial.shader != null)
+                    {
+                        s_routeShader = existingLr.sharedMaterial.shader;
+                    }
+                }
+                catch { }
+
+                if (s_routeShader == null)
+                {
+                    s_routeShader = Shader.Find("Sprites/Default") ??
+                                    Shader.Find("Legacy Shaders/Particles/Alpha Blended Premultiply") ??
+                                    Shader.Find("Unlit/Color") ??
+                                    Shader.Find("UI/Default") ??
+                                    Shader.Find("Standard") ??
+                                    Shader.Find("Hidden/Internal-Colored");
+                }
+            }
+
+            if (s_routeShader != null)
+            {
+                var mat = new Material(s_routeShader);
+                Color c = TrainPathColors[idx];
+                if (mat.HasProperty("_Color"))
+                {
+                    mat.color = c;
+                }
+                s_pathMaterials[idx] = mat;
+                return mat;
+            }
+
+            return null;
+        }
+
+        private class VisualizerTrackCache
+        {
+            public AIEngineer Engineer;
+            public int TrackIndex = -1;
+            public Navigation.RailPath Path = null;
+            public float Direction;
+            public double LastSpan;
+            public readonly List<Vector3> Points = new List<Vector3>();
+            public Vector3[] PointsArray = new Vector3[0];
+        }
+
+        private readonly List<VisualizerTrackCache> _visualizerCaches = new List<VisualizerTrackCache>();
         private readonly List<LineRenderer> _routeLineRenderers = new List<LineRenderer>();
-        private Material _lineMaterial;
 
         private void LateUpdate()
         {
+            CheckFloatingOriginShift();
             Update3DRouteVisualizer();
         }
 
@@ -543,42 +661,16 @@ namespace AITraffic.Core
                 return;
             }
 
-            if (_lineMaterial == null)
-            {
-                try
-                {
-                    var existingLr = UnityEngine.Object.FindObjectOfType<LineRenderer>();
-                    if (existingLr != null && existingLr.sharedMaterial != null)
-                    {
-                        _lineMaterial = new Material(existingLr.sharedMaterial);
-                    }
-                }
-                catch {}
-
-                if (_lineMaterial == null)
-                {
-                    Shader shader = Shader.Find("Sprites/Default") ??
-                                    Shader.Find("Legacy Shaders/Particles/Alpha Blended Premultiply") ??
-                                    Shader.Find("Unlit/Color") ??
-                                    Shader.Find("UI/Default") ??
-                                    Shader.Find("Standard") ??
-                                    Shader.Find("Hidden/Internal-Colored");
-
-                    if (shader != null)
-                    {
-                        _lineMaterial = new Material(shader);
-                    }
-                }
-            }
-
-            // Maintain LineRenderer pool for active engineers
+            // Maintain LineRenderer and cache pool for active engineers
             while (_routeLineRenderers.Count < _activeEngineers.Count)
             {
-                var lineObj = new GameObject(string.Format("[AI_RouteVisualizer_{0}]", _routeLineRenderers.Count));
+                int newIdx = _routeLineRenderers.Count;
+                var lineObj = new GameObject(string.Format("[AI_RouteVisualizer_{0}]", newIdx));
                 lineObj.transform.SetParent(transform);
                 lineObj.layer = 0; // Default layer (always rendered)
                 var lr = lineObj.AddComponent<LineRenderer>();
-                if (_lineMaterial != null) lr.material = _lineMaterial;
+                var mat = GetPathMaterial(newIdx);
+                if (mat != null) lr.sharedMaterial = mat;
                 lr.startWidth = 0.50f;
                 lr.endWidth = 0.35f;
                 lr.useWorldSpace = true;
@@ -588,21 +680,19 @@ namespace AITraffic.Core
                 lr.shadowCastingMode = UnityEngine.Rendering.ShadowCastingMode.Off;
                 lr.receiveShadows = false;
                 _routeLineRenderers.Add(lr);
+                _visualizerCaches.Add(new VisualizerTrackCache());
             }
-
-            Color[] colors = new Color[] {
-                new Color(0.0f, 1.0f, 0.55f, 0.90f), // Emerald Green
-                new Color(0.2f, 0.85f, 1.0f, 0.90f), // Cyan
-                new Color(1.0f, 0.82f, 0.1f, 0.90f), // Gold
-                new Color(0.95f, 0.4f, 1.0f, 0.90f)  // Magenta
-            };
 
             for (int i = 0; i < _routeLineRenderers.Count; i++)
             {
                 var lr = _routeLineRenderers[i];
+                var cache = _visualizerCaches[i];
                 if (i >= _activeEngineers.Count)
                 {
                     if (lr != null) lr.enabled = false;
+                    cache.Engineer = null;
+                    cache.TrackIndex = -1;
+                    cache.Path = null;
                     continue;
                 }
 
@@ -610,19 +700,31 @@ namespace AITraffic.Core
                 if (eng == null || eng.TrainCar == null || eng.CurrentPath == null || eng.CurrentPath.Tracks == null || eng.CurrentPath.Tracks.Count == 0)
                 {
                     if (lr != null) lr.enabled = false;
+                    cache.Engineer = null;
+                    cache.TrackIndex = -1;
+                    cache.Path = null;
                     continue;
                 }
 
-                if (_lineMaterial != null && lr.material != _lineMaterial)
+                if (cache.Engineer != eng)
                 {
-                    lr.material = _lineMaterial;
+                    cache.Engineer = eng;
+                    cache.TrackIndex = -1;
+                    cache.Path = null;
+                    cache.Points.Clear();
                 }
 
-                Color lineColor = colors[i % colors.Length];
-                lr.startColor = lineColor;
-                lr.endColor = new Color(lineColor.r, lineColor.g, lineColor.b, 0.20f);
+                Material pathMat = GetPathMaterial(i % TrainPathColors.Length);
+                if (pathMat != null && lr.sharedMaterial != pathMat)
+                {
+                    lr.sharedMaterial = pathMat;
+                }
 
-                List<Vector3> pts = new List<Vector3>();
+                Color pathColor = TrainPathColors[i % TrainPathColors.Length];
+                lr.startColor = new Color(pathColor.r, pathColor.g, pathColor.b, 0.90f);
+                lr.endColor = new Color(pathColor.r, pathColor.g, pathColor.b, 0.25f);
+
+                int startIdx = Mathf.Clamp(eng.CurrentPathTrackIndex, 0, Mathf.Max(0, eng.CurrentPath.Tracks.Count - 1));
 
                 // Determine current span of locomotive on start track
                 double curSpan = 0.0;
@@ -631,86 +733,88 @@ namespace AITraffic.Core
                     curSpan = eng.TrainCar.FrontBogie.traveller.Span;
                 }
 
-                int startIdx = Mathf.Clamp(eng.CurrentPathTrackIndex, 0, Mathf.Max(0, eng.CurrentPath.Tracks.Count - 1));
-                float accumulatedMeters = 0f;
-                const float maxRenderDistance = 3000f;
-
-                Vector3 lastPoint = Vector3.zero;
-
-                for (int t = startIdx; t < eng.CurrentPath.Tracks.Count && accumulatedMeters < maxRenderDistance; t++)
+                bool dirChanged = (cache.Direction != eng.TargetDirection);
+                bool spanMovedFar = (Math.Abs(curSpan - cache.LastSpan) > 120.0);
+                if (cache.TrackIndex != startIdx || cache.Path != eng.CurrentPath || dirChanged || spanMovedFar)
                 {
-                    var track = eng.CurrentPath.Tracks[t];
-                    if (track == null || track.curve == null) continue;
+                    cache.TrackIndex = startIdx;
+                    cache.Path = eng.CurrentPath;
+                    cache.Direction = eng.TargetDirection;
+                    cache.LastSpan = curSpan;
+                    cache.Points.Clear();
 
-                    float len = track.curve.length;
-                    if (len <= 0.1f) continue;
+                    float accumulatedMeters = 0f;
+                    const float maxRenderDistance = 3000f;
 
-                    Vector3 p0 = track.curve.GetPointAt(0.0f) + Vector3.up * 0.45f;
-                    Vector3 p1 = track.curve.GetPointAt(1.0f) + Vector3.up * 0.45f;
+                    Vector3 lastPoint = Vector3.zero;
 
-                    bool isForward;
-                    if (t == startIdx)
+                    for (int t = startIdx; t < eng.CurrentPath.Tracks.Count && accumulatedMeters < maxRenderDistance; t++)
                     {
-                        // On current track, determine direction by looking at the next track in the path
-                        if (t + 1 < eng.CurrentPath.Tracks.Count && eng.CurrentPath.Tracks[t + 1] != null && eng.CurrentPath.Tracks[t + 1].curve != null)
+                        var track = eng.CurrentPath.Tracks[t];
+                        if (track == null || track.curve == null) continue;
+
+                        float len = track.curve.length;
+                        if (len <= 0.1f) continue;
+
+                        Vector3 p0 = track.curve.GetPointAt(0.0f) + Vector3.up * 0.65f;
+                        Vector3 p1 = track.curve.GetPointAt(1.0f) + Vector3.up * 0.65f;
+
+                        bool isForward;
+                        if (t == startIdx)
                         {
-                            Vector3 nextMid = eng.CurrentPath.Tracks[t + 1].curve.GetPointAt(0.5f);
-                            isForward = (Vector3.Distance(p1, nextMid) <= Vector3.Distance(p0, nextMid));
+                            isForward = (eng.TargetDirection >= 0.0f);
                         }
                         else
                         {
-                            Vector3 trackTan = track.curve.GetTangentAt(0.5f);
-                            isForward = (Vector3.Dot(eng.TrainCar.transform.forward, trackTan) >= 0f);
+                            isForward = (Vector3.SqrMagnitude(lastPoint - p0) <= Vector3.SqrMagnitude(lastPoint - p1));
                         }
-                    }
-                    else
-                    {
-                        // Continuity from previous track's exit point
-                        isForward = (Vector3.Distance(lastPoint, p0) <= Vector3.Distance(lastPoint, p1));
-                    }
 
-                    float startFrac;
-                    float endFrac;
+                        float startFrac;
+                        float endFrac;
 
-                    if (t == startIdx)
-                    {
-                        float spanFrac = Mathf.Clamp01((float)(curSpan / len));
-                        startFrac = spanFrac;
-                        endFrac = isForward ? 1.0f : 0.0f;
-                    }
-                    else
-                    {
-                        startFrac = isForward ? 0.0f : 1.0f;
-                        endFrac = isForward ? 1.0f : 0.0f;
-                    }
-
-                    int samples = Mathf.Max(2, Mathf.RoundToInt(Mathf.Abs(endFrac - startFrac) * len / 4f));
-
-                    for (int s = 0; s <= samples; s++)
-                    {
-                        float frac = Mathf.Lerp(startFrac, endFrac, (float)s / samples);
-                        Vector3 pt = track.curve.GetPointAt(frac) + Vector3.up * 0.45f;
-
-                        if (pts.Count == 0 || Vector3.Distance(pts[pts.Count - 1], pt) > 0.1f)
+                        if (t == startIdx)
                         {
-                            pts.Add(pt);
-                            lastPoint = pt;
+                            float spanFrac = Mathf.Clamp01((float)(curSpan / len));
+                            startFrac = spanFrac;
+                            endFrac = isForward ? 1.0f : 0.0f;
                         }
+                        else
+                        {
+                            startFrac = isForward ? 0.0f : 1.0f;
+                            endFrac = isForward ? 1.0f : 0.0f;
+                        }
+
+                        int samples = Mathf.Max(2, Mathf.RoundToInt(Mathf.Abs(endFrac - startFrac) * len / 4f));
+
+                        for (int s = 0; s <= samples; s++)
+                        {
+                            float frac = Mathf.Lerp(startFrac, endFrac, (float)s / samples);
+                            Vector3 pt = track.curve.GetPointAt(frac) + Vector3.up * 0.65f;
+
+                            if (cache.Points.Count == 0 || Vector3.Distance(cache.Points[cache.Points.Count - 1], pt) > 0.1f)
+                            {
+                                cache.Points.Add(pt);
+                                lastPoint = pt;
+                            }
+                        }
+
+                        accumulatedMeters += len;
                     }
 
-                    accumulatedMeters += len;
+                    cache.PointsArray = cache.Points.ToArray();
+                    lr.positionCount = cache.PointsArray.Length;
+                    lr.SetPositions(cache.PointsArray);
                 }
 
-                if (pts.Count > 1)
+                // Crucial visibility fix: Ensure this runs ALWAYS, so toggling visuals or caching never leaves lr.enabled == false
+                if (cache.PointsArray != null && cache.PointsArray.Length > 1)
                 {
-                    lr.gameObject.SetActive(true);
-                    lr.positionCount = pts.Count;
-                    lr.SetPositions(pts.ToArray());
-                    lr.enabled = true;
+                    if (!lr.gameObject.activeSelf) lr.gameObject.SetActive(true);
+                    if (!lr.enabled) lr.enabled = true;
                 }
                 else
                 {
-                    if (lr != null) lr.enabled = false;
+                    if (lr.enabled) lr.enabled = false;
                 }
             }
         }
@@ -896,8 +1000,10 @@ namespace AITraffic.Core
                             eng.CurrentSpeedProfile.LimitingReason,
                             eng.CurrentSpeedProfile.TrackLimitKmh);
 
+                        string locoColorHex = ColorUtility.ToHtmlStringRGB(TrainPathColors[i % TrainPathColors.Length]);
+
                         GUILayout.BeginHorizontal();
-                        GUILayout.Label(string.Format("• <b>{0}</b> [{1}]  Speed: <b>{2:F1}</b> / {3:F1} km/h{4}", locoId, state, speed, targetSpeed, reasonStr));
+                        GUILayout.Label(string.Format("<color=#{0}>■</color> <b>{1}</b> [{2}]  Speed: <b>{3:F1}</b> / {4:F1} km/h{5}", locoColorHex, locoId, state, speed, targetSpeed, reasonStr));
                         
                         bool isRouteExpanded = _expandedRoutes.Contains(locoId);
                         if (GUILayout.Button(isRouteExpanded ? "▲ Route" : "▼ Route", GUILayout.Width(62), GUILayout.Height(19)))
@@ -1073,8 +1179,9 @@ namespace AITraffic.Core
                         {
                             float guiY = Screen.height - screenPos.y;
                             string destShort = !string.IsNullOrEmpty(eng.DestinationStationName) ? eng.DestinationStationName : "Open Line";
-                            string tag = string.Format("<color=#FFD700><b>[AI: {0}]</b></color>\n<color=white>{1:F0} km/h ({2})</color>\n<color=#98FB98>➜ {3}</color>",
-                                eng.TrainCar.ID, eng.CurrentSpeedKmh, eng.State, destShort);
+                            string locoColorHex = ColorUtility.ToHtmlStringRGB(TrainPathColors[i % TrainPathColors.Length]);
+                            string tag = string.Format("<color=#{0}><b>[AI: {1}]</b></color>\n<color=white>{2:F0} km/h ({3})</color>\n<color=#98FB98>➜ {4}</color>",
+                                locoColorHex, eng.TrainCar.ID, eng.CurrentSpeedKmh, eng.State, destShort);
                             GUI.Label(new Rect(screenPos.x - 120f, guiY - 30f, 240f, 60f), tag, _nameTagStyle);
                         }
                     }
