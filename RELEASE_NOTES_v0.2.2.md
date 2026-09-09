@@ -82,9 +82,19 @@
 
 ---
 
-### ⚙️ 11. Settings & UI Polish
+### ⚙️ 11. Settings, Visuals & HUD Polish
 * **Diegetic Worker Dispatch Description:** Updated UMM settings descriptions to clarify that AI workers are employed in-game via the Comms Radio tool in AI WORKER mode.
 * **Mod Compatibility Checklist:** Added ZCouplers and updated CommsRadioAPI status indicators in the Mod Compatibility panel.
+* **Synchronized HUD & 3D Nametag Colors:** In-world 3D nametags and HUD train entries are now color-coded to match their active route path lines on the tracks.
+* **Cached Route Visualizer:** Track path line rendering is cached by track span, elevating line geometry 0.65m above rails to eliminate z-fighting with ballast while avoiding per-frame vertex recomputations.
+
+---
+
+### 🚀 12. Engine Stability, Memory & Clearance Polish
+* **Corridor Fouling Buffer Expansion:** Increased single-track corridor hold distance from 25m to 45m (`Mathf.Max(5.0f, distToCorridorStart - 45.0f)`). This ensures holding trains park safely outside the switch's 35m physical clearance envelope, preventing false switch alignment locks against the oncoming train.
+* **Reservation Yield on Hold:** AI trains holding for single-track corridors or stopped at signals temporarily yield downstream reservations, allowing passing trains to clear junctions without conflict.
+* **A* Memory Pooling & Zero-GC Pathfinding:** Reusable collections for the Pathfinder's open set, best-cost table, and target nodes eliminate repeated heap allocations and GC spikes during route queries.
+* **O(1) Station Indexing:** Fast dictionary lookups for station controllers and yard aliases (`CW`/`CSW`, `FM`/`FR`) replace linear searches across the station registry.
 
 ---
 

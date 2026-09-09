@@ -1,13 +1,12 @@
-# Derail Valley AI Traffic Mod (`AITraffic`)
+# Derail Valley AI Traffic (`AITraffic`)
 
 [![Game: Derail Valley](https://img.shields.io/badge/Game-Derail%20Valley-blue.svg)](http://www.derailvalley.com/)
 [![Mod Loader: UMM](https://img.shields.io/badge/ModLoader-Unity%20Mod%20Manager-orange.svg)](https://www.nexusmods.com/site/mods/21)
 [![Requires: DVSignals](https://img.shields.io/badge/Requires-DVSignals-green.svg)](https://github.com/WhistleWiz/dv-signals)
 [![Requires: CommsRadioAPI](https://img.shields.io/badge/Requires-CommsRadioAPI-purple.svg)](https://github.com/Killermops27/dv-ai-traffic)
 [![Compatible: ZCouplers](https://img.shields.io/badge/Compatible-ZCouplers-blueviolet.svg)](https://www.nexusmods.com/derailvalley/mods/813)
-[![Latest Release](https://img.shields.io/github/v/release/Killermops27/dv-ai-traffic?include_prereleases&color=brightgreen)](https://github.com/Killermops27/dv-ai-traffic/releases)
+[![Latest Release: v0.2.2](https://img.shields.io/badge/Release-v0.2.2-brightgreen.svg)](https://github.com/Killermops27/dv-ai-traffic/releases/tag/v0.2.2)
 [![Nexus Mods](https://img.shields.io/badge/Nexus%20Mods-1685-orange.svg)](https://www.nexusmods.com/derailvalley/mods/1685)
-[![Status: Early Alpha](https://img.shields.io/badge/Status-Early%20Alpha%20(Bugs%20Expected)-red.svg)](#disclaimer)
 
 An autonomous AI train traffic, timetable dispatching, and player-employed AI worker system for **Derail Valley**, bringing the railway network to life with schedule-driven freight, passenger, shunting, and haulage movements.
 
@@ -23,7 +22,25 @@ An autonomous AI train traffic, timetable dispatching, and player-employed AI wo
 
 ---
 
-## 🚂 Key Features & Architecture
+## 🌟 What's New in v0.2.2
+
+- 🚦 **Thru-Station Pathfinding & Occupancy Elimination:** Intermediate tracks occupied by parked cars or rolling stock are strictly rejected (`StrictlyAvoidOccupied = true`). AI trains will no longer route into occupied sidings!
+- 🔄 **Passing Loops vs. Industrial Storage Yards:** AI traffic differentiates passing loops (`[S]`, `Siding`, `Loop`) from industrial storage yards (`[Y]`, `[L]`). Passing loops have minimal preference cost (+350m) so clear lines are preferred, but empty loops are taken over blocked lines. Industrial yards carry heavy transit penalties (+500,000m) to keep ambient freight from cutting through shunting tracks.
+- 🛡️ **Single-Track Corridor Lookahead & Deadlock Prevention (GitHub Issue #5):** AI trains evaluate single-track corridors ahead of passing loops. If an opposing train is detected, the train holds safely inside the passing siding outside the switch clearance foul envelope (45m buffer) until the single track clears. Direction-aware tracking allows same-direction trains to follow freely!
+- 🔀 **Switch Interlocking & Anti-Split Switch Safety (GitHub Issue #4):** Switches are strictly locked against throwing while any railcar body or bogie is physically straddling the switch points or clearance envelope. Continuous lock renewal protects switches until the entire consist has cleared.
+- 🌡️ **Powertrain Thermal Protection & Overheating Roll-Off (GitHub Issue #6):** Actively monitors engine coolant and oil temperatures, linearly derating throttle between 95°C and 105°C to eliminate blown prime movers on mountain grades.
+- ⛰️ **Hill-Start Pre-Charge Sequence & Anti-Rollback:** On upgrades ($\ge 0.15\%$), independent and train brakes stay firmly clamped while the engine spools up to build launching torque before brakes release. Guarantees 0 rollback on steep mountain starts.
+- ⚙️ **DM3 High-Power Fluid Launch & Gear Shift Brake Hold:** Mechanical DM3 locomotives spool throttle up to 0.90–1.00 before releasing independent brakes on slopes, and apply holding brakes during neutral gear shifts.
+- ⚡ **Traction Motor Over-Current Protection:** Monitored traction motor amperage rolls throttle back above 380A and cuts power at 420–480A to prevent blown fuses. Tripped fuses automatically reset once stopped.
+- 🔗 **Automatic Multiple Unit (MU) Cabling:** Consists with adjacent locomotives and slugs (e.g. DE6+DE6, DE2+Slug) automatically couple physical 3D MU jumper cables and propagate controls without requiring career license unlocks.
+- 🧲 **Zeibach's Couplers (`ZCouplers`) Compatibility (GitHub Issue #2):** AI trains are exempted from stress-induced coupler snapping while retaining full 3D knuckle visuals, animations, and buffer spring physics.
+- 🎥 **Freecam / Photo Mode 3D Nametag Projection (GitHub Issue #1):** Overhead nameplates and route visualizer lines properly track active camera in Freecam, Orbit, and Photo Mode.
+- ⚡ **O(1) Snapshot Occupancy & Frame-Staggered Spawning:** Evaluates track occupancy in <3ms using frame-cached snapshots, and instantiates ambient trains 1 car per frame to completely eliminate spawn stutter and frame drops.
+- 🎨 **Visual Route Line & HUD Sync:** In-world route lines are elevated 0.65m above rails to eliminate ballast z-fighting, and HUD train entries match their route visualizer colors.
+
+---
+
+## 🚂 Key Systems & Features
 
 ### 1. 👷 Player-Employed AI Worker System (Phase 2)
 - **Point-to-Point AI Hauls:** Hire AI engineers to haul your assembled consists from station to station across the valley map.
@@ -36,8 +53,8 @@ An autonomous AI train traffic, timetable dispatching, and player-employed AI wo
 ### 2. 🧠 Autonomous Virtual Engineer (`AIEngineer`)
 - **Closed-Loop Speed Regulation:** Custom PID controllers modulate throttle, dynamic braking, and independent/train air brakes to track dynamic target velocities smoothly across varying terrain and gradients.
 - **Speed Profile Calculation:** Generates realistic deceleration and braking curves based on upcoming track speed limits, curves (evaluated in the 2D horizontal plane using native Bezier arc approximations), red/yellow signal aspects, and station stopping points.
-- **Powertrain Thermal Protection & Overheating Roll-Off:** Actively tracks engine coolant and oil temperatures across all locomotives, linearly rolling off throttle between 95°C and 105°C to prevent blown prime movers on long grades.
-- **Hill-Start Pre-Charge & Grade Anti-Rollback:** On upgrades ($\ge 0.15\%$), independent and train brakes remain firmly clamped while the prime mover ramps throttle up to build launching torque before brakes graduate off. Guarantees zero backward rollback on steep mountain starts.
+- **Powertrain Thermal Protection:** Proactive throttle derating between 95°C and 105°C prevents engine explosions on steep grades; pneumatic grade anti-rollback clamp holds trains if power is lost.
+- **Hill-Start Pre-Charge Sequence:** Prime mover throttles up and builds tractive effort before brakes release on grades ($\ge 0.15\%$), eliminating rollback stalls.
 - **DM3 Mechanical Shunter Automation:** Specialized automatic gear-shifting controller (`DM3TransmissionController`), neutral gear-shift brake hold, and high-power fluid coupling launches.
 - **Traction Motor Over-Current Protection:** Fast amperage derating (>380A) and automatic stationary fuse reset for diesel-electrics.
 
@@ -74,7 +91,7 @@ Built with cross-mod interoperability in mind:
 
 ---
 
-## 🎮 Controls & Operation Guide
+## 🎮 Controls & How to Use
 
 ### Diegetic Comms Radio (AI Worker Mode)
 1. Equip the **Comms Radio** from your inventory.
@@ -96,47 +113,26 @@ Built with cross-mod interoperability in mind:
 
 ### Required:
 1. **[Derail Valley](https://store.steampowered.com/app/588030/Derail_Valley/)** (PC / Steam release)
-2. **[Unity Mod Manager (UMM)](https://www.nexusmods.com/site/mods/21)** (v0.27.0 or newer, configured for Doorstop / Assembly Injection)
-3. **[DVSignals](https://github.com/WhistleWiz/dv-signals)** installed in your `Derail Valley/Mods/` directory
-4. **[CommsRadioAPI](https://github.com/Killermops27/dv-ai-traffic)** installed in your `Derail Valley/Mods/` directory
+2. **[Unity Mod Manager (UMM)](https://www.nexusmods.com/site/mods/21)** (v0.27.0 or newer)
+3. **[DVSignals](https://github.com/WhistleWiz/dv-signals)** installed in `Derail Valley/Mods/`
+4. **[CommsRadioAPI](https://github.com/Killermops27/dv-ai-traffic)** installed in `Derail Valley/Mods/`
 
 ### Strongly Recommended:
-* **[Double Track (`DoubleTrack`)](https://www.nexusmods.com/derailvalley/mods/808)**: Highly recommended for smooth traffic flow. Double track sections provide bi-directional passing capacity, significantly mitigating single-track traffic bottlenecks and deadlocks between ambient AI trains and player operations.
+* **[Double Track (`DoubleTrack`)](https://www.nexusmods.com/derailvalley/mods/808)**: Strongly recommended for smooth traffic flow and bi-directional mainline capacity.
 * **[Zeibach's Couplers (`ZCouplers`)](https://www.nexusmods.com/derailvalley/mods/813)**: Supported with AI stress protection.
 
 ---
 
 ## 🛠️ Installation
 
-1. Download the latest **`AITraffic-v0.2.2.zip`** from the **[Releases](https://github.com/Killermops27/dv-ai-traffic/releases)** section or **[Nexus Mods](https://www.nexusmods.com/derailvalley/mods/1685)**.
+1. Download the latest **`AITraffic-v0.2.2.zip`** from [GitHub Releases](https://github.com/Killermops27/dv-ai-traffic/releases) or [Nexus Mods](https://www.nexusmods.com/derailvalley/mods/1685).
 2. Install via **Unity Mod Manager (UMM)**:
    - Drag and drop the downloaded `.zip` file directly into the UMM **Mods** tab, **OR**
    - Extract the `.zip` archive into your `Derail Valley/Mods/` folder so that `Info.json` is located at:
      ```text
      Derail Valley/Mods/AITraffic/Info.json
      ```
-3. Start the game. Open the Unity Mod Manager interface (<kbd>Ctrl</kbd> + <kbd>F10</kbd>) to verify that `AI Traffic` is loaded with a green status indicator and configure mod settings.
-
----
-
-## ⚙️ Building from Source
-
-### Prerequisites
-- **Visual Studio 2022** or **JetBrains Rider** / **MSBuild** with .NET Framework 4.8 targeting pack.
-- A valid installation of **Derail Valley**.
-
-### Build Steps
-1. Clone the repository including submodules:
-   ```bash
-   git clone --recurse-submodules git@github.com:Killermops27/dv-ai-traffic.git
-   ```
-2. Open `AITraffic.csproj` or the solution in Visual Studio.
-3. Configure the `DVInstallPath` property in `AITraffic.csproj` if your Steam library is located outside the default path:
-   ```xml
-   <DVInstallPath>C:\Path\To\SteamLibrary\steamapps\common\Derail Valley</DVInstallPath>
-   ```
-4. Build in **Release** configuration. The build output will package `AITraffic.dll` and `Info.json` into `bin/Release/`.
-5. Run `.\package_release.ps1` in PowerShell to generate a UMM-compliant release archive at `dist/AITraffic-v<version>.zip`.
+3. Start the game. Open UMM (<kbd>Ctrl</kbd> + <kbd>F10</kbd>) to verify that `AI Traffic` is loaded with a green status indicator.
 
 ---
 
@@ -144,9 +140,9 @@ Built with cross-mod interoperability in mind:
 
 - [ ] Interactive dispatcher map / tablet overview for live train monitoring.
 - [ ] Timetable schedule manager with customizable station dwell times.
-- [ ] Expanded AI communication (horns at grade crossings, cab lighting, radio alerts).
+- [ ] Expanded AI audio/visual communication (horns at grade crossings, cab lighting, radio callouts).
 - [ ] Full shunting yard automation and car classification movements.
-- [ ] Performance profiling and chunk-based train LOD physics suspension.
+- [ ] Chunk-based train LOD physics suspension for distant consists.
 
 ---
 
