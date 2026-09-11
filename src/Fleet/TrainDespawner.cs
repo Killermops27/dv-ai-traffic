@@ -218,13 +218,26 @@ namespace AITraffic.Fleet
             Vector3 trainPos = engineer.TrainCar.transform.position;
             float currentDistToPlayer = Vector3.Distance(trainPos, playerPos);
 
-            // 1. If the train is already within 2500m of player, it is in active encounter range
-            if (currentDistToPlayer <= 2500f)
+            // 1. If the train is within 1000m of the player, it is in immediate player proximity
+            if (currentDistToPlayer <= 1000f)
             {
                 return true;
             }
 
-            // 2. Check if destination station / track is closer to the player than the train's current position
+            // 2. Check instantaneous movement direction
+            Vector3 toPlayer = (playerPos - trainPos).normalized;
+            Vector3 locoForward = engineer.TrainCar.transform.forward;
+            float speedKmh = engineer.CurrentSpeedKmh;
+            Vector3 moveDir = (Mathf.Abs(speedKmh) > 1.0f)
+                ? (speedKmh > 0 ? locoForward : -locoForward)
+                : Vector3.zero;
+
+            if (moveDir != Vector3.zero && Vector3.Dot(moveDir, toPlayer) > 0.2f)
+            {
+                return true;
+            }
+
+            // 3. Check if destination station / track is closer to the player than the train's current position
             if (engineer.CurrentPath != null && engineer.CurrentPath.Tracks != null && engineer.CurrentPath.Tracks.Count > 0)
             {
                 var tracks = engineer.CurrentPath.Tracks;
@@ -232,13 +245,13 @@ namespace AITraffic.Fleet
                 if (destTrack != null)
                 {
                     float destDistToPlayer = Vector3.Distance(destTrack.transform.position, playerPos);
-                    if (destDistToPlayer < currentDistToPlayer)
+                    if (destDistToPlayer < currentDistToPlayer - 100f)
                     {
                         return true; // Journey is heading towards player
                     }
                 }
 
-                // 3. Check remaining route track waypoints
+                // 4. Check remaining route track waypoints from current track index forward
                 int startIdx = Mathf.Clamp(engineer.CurrentPathTrackIndex, 0, tracks.Count - 1);
                 for (int i = startIdx; i < tracks.Count; i++)
                 {
@@ -246,8 +259,8 @@ namespace AITraffic.Fleet
                     if (t == null) continue;
 
                     float trackDist = Vector3.Distance(t.transform.position, playerPos);
-                    // If route waypoint passes within 2200m of player or comes substantially closer than current position
-                    if (trackDist <= 2200f || trackDist < currentDistToPlayer * 0.75f)
+                    // If route waypoint passes closer than current distance
+                    if (trackDist < currentDistToPlayer - 150f)
                     {
                         return true;
                     }

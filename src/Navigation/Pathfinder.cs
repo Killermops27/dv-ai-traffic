@@ -71,6 +71,11 @@ namespace AITraffic.Navigation
         public float TurnoutDivergingPenalty { get; set; }
 
         /// <summary>
+        /// Cost penalty added for traversing crossover tracks connecting parallel double-track mainlines.
+        /// </summary>
+        public float CrossoverPenalty { get; set; }
+
+        /// <summary>
         /// Penalty added per meter on yard tracks to prefer mainline routing when travelling between stations.
         /// </summary>
         public float YardTrackPenaltyPerMeter { get; set; }
@@ -108,8 +113,8 @@ namespace AITraffic.Navigation
         public PathfinderOptions()
         {
             AllowWrongDirection = true;
-            WrongDirectionFlatPenalty = 350f;
-            WrongDirectionMultiplier = 1.5f;
+            WrongDirectionFlatPenalty = 1500f;
+            WrongDirectionMultiplier = 3.0f;
             AvoidOccupiedTracks = true;
             OccupiedTrackPenalty = 10000000f;
             StrictlyAvoidOccupied = true;
@@ -122,6 +127,7 @@ namespace AITraffic.Navigation
             ExcludedTracks = null;
             OccupiedTracksSnapshot = null;
             TurnoutDivergingPenalty = 40f;
+            CrossoverPenalty = 0f;
             YardTrackPenaltyPerMeter = 1.5f;
             PreferSpeedOverDistance = true;
             MaxSearchDistance = 5000000f;
@@ -883,6 +889,44 @@ namespace AITraffic.Navigation
                 }
             }
 
+            // Forward Angular Continuity Check
+            // A train arriving at fromNode cannot make an acute-angle hairpin U-turn (> 90 degrees) onto outgoing edge
+            if (incomingEdge != null)
+            {
+                Vector3 inDir = -incomingEdge.GetDirection(fromNode); // Arriving direction of travel
+                Vector3 candidateDir = edge.GetDirection(fromNode);   // Departing direction of travel
+                inDir.y = 0f;
+                inDir.Normalize();
+                candidateDir.y = 0f;
+                candidateDir.Normalize();
+                float alignment = Vector3.Dot(inDir, candidateDir);
+
+                if (alignment <= 0.0f)
+                {
+                    // Acute angle turnback / hairpin U-turn (> 90 degrees): physically impossible for railway equipment!
+                    return false;
+                }
+            }
+
+            // Crossover Track Penalty:
+            // Severely disfavor unnecessary jumping across crossovers between parallel double-track mainlines
+            bool isCrossover = (trackName.IndexOf("CX", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                trackName.IndexOf("Cross", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                trackName.IndexOf("Xing", StringComparison.OrdinalIgnoreCase) >= 0);
+
+            if (!isCrossover && incomingEdge != null && incomingEdge.IsDoubleTrackMainline && edge.IsDoubleTrackMainline)
+            {
+                if (edge != incomingEdge && (edge.ParallelEdge == incomingEdge || incomingEdge.ParallelEdge == edge))
+                {
+                    isCrossover = true;
+                }
+            }
+
+            if (isCrossover && !isStartOrDest && options.CrossoverPenalty > 0f)
+            {
+                cost += options.CrossoverPenalty;
+            }
+
             // Diverging turnout penalty
             if (fromNode.Junction != null && requiredBranch > 0)
             {
@@ -923,7 +967,7 @@ namespace AITraffic.Navigation
             }
 
             // Double track wrong-way running penalty (non-negative)
-            if (edge.IsDoubleTrackMainline)
+            if (edge.IsDoubleTrackMainline && edge.ParallelEdge != null)
             {
                 bool traversingForward = edge.IsForward(fromNode, toNode);
                 bool isCorrectDirection = (traversingForward == edge.PreferredForward);
@@ -977,9 +1021,10 @@ namespace AITraffic.Navigation
                     speedLimits.Add(edge.SpeedLimit);
                     totalDist += edge.Length;
 
-                    if (nodes.Count == 0 && edge.FromNode != null)
+                    if (nodes.Count == 0)
                     {
-                        nodes.Add(edge.FromNode);
+                        var originNode = edge.GetOtherNode(step.Node);
+                        nodes.Add(originNode ?? edge.FromNode);
                     }
                     nodes.Add(step.Node);
 

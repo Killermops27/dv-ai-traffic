@@ -189,8 +189,30 @@ namespace AITraffic.Navigation
                     return (FromNode.Position - ToNode.Position).normalized;
                 }
             }
+            else if (fromNode != null)
+            {
+                // Position-based fallback if reference doesn't match
+                float dFrom = FromNode != null ? Vector3.SqrMagnitude(fromNode.Position - FromNode.Position) : float.MaxValue;
+                float dTo = ToNode != null ? Vector3.SqrMagnitude(fromNode.Position - ToNode.Position) : float.MaxValue;
+                if (dFrom <= dTo)
+                {
+                    if (Track != null && Track.curve != null && Track.curve.pointCount > 0)
+                        return Track.curve.GetTangentAt(0f).normalized;
+                    if (ToNode != null && FromNode != null)
+                        return (ToNode.Position - FromNode.Position).normalized;
+                }
+                else
+                {
+                    if (Track != null && Track.curve != null && Track.curve.pointCount > 0)
+                        return -Track.curve.GetTangentAt(1f).normalized;
+                    if (FromNode != null && ToNode != null)
+                        return (FromNode.Position - ToNode.Position).normalized;
+                }
+            }
 
-            return Vector3.forward;
+            return (Track != null && Track.curve != null && Track.curve.pointCount > 0)
+                ? Track.curve.GetTangentAt(0f).normalized
+                : Vector3.forward;
         }
 
         public Vector3 GetMidPoint()
@@ -567,11 +589,16 @@ namespace AITraffic.Navigation
 
                                 string tName = edge.Track.name ?? string.Empty;
                                 bool isDoubleTrackMod = tName.IndexOf("doubletrack", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                                                        tName.IndexOf("[#]", StringComparison.OrdinalIgnoreCase) >= 0;
+                                                        tName.IndexOf("DT-", StringComparison.OrdinalIgnoreCase) >= 0;
+                                bool isMainlineMod = tName.IndexOf("[#]", StringComparison.OrdinalIgnoreCase) >= 0;
 
                                 if (isDoubleTrackMod)
                                 {
                                     edge.IsDoubleTrackMainline = true;
+                                    edge.IsYardTrack = false;
+                                }
+                                else if (isMainlineMod)
+                                {
                                     edge.IsYardTrack = false;
                                 }
                                 else
@@ -599,11 +626,16 @@ namespace AITraffic.Navigation
                         {
                             string tName = edge.Track.name ?? string.Empty;
                             bool isDoubleTrackMod = tName.IndexOf("doubletrack", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                                                    tName.IndexOf("[#]", StringComparison.OrdinalIgnoreCase) >= 0;
+                                                    tName.IndexOf("DT-", StringComparison.OrdinalIgnoreCase) >= 0;
+                            bool isMainlineMod = tName.IndexOf("[#]", StringComparison.OrdinalIgnoreCase) >= 0;
 
                             if (isDoubleTrackMod)
                             {
                                 edge.IsDoubleTrackMainline = true;
+                                edge.IsYardTrack = false;
+                            }
+                            else if (isMainlineMod)
+                            {
                                 edge.IsYardTrack = false;
                             }
                             else
@@ -702,46 +734,80 @@ namespace AITraffic.Navigation
                 if (edge != null && edge.Track != null && edge.Track.name != null)
                 {
                     if (edge.Track.name.IndexOf("doubletrack", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                        edge.Track.name.IndexOf("[#]", StringComparison.OrdinalIgnoreCase) >= 0)
+                        edge.Track.name.IndexOf("DT-", StringComparison.OrdinalIgnoreCase) >= 0)
                     {
                         edge.IsDoubleTrackMainline = true;
+                        edge.IsYardTrack = false;
+                    }
+                    else if (edge.Track.name.IndexOf("[#]", StringComparison.OrdinalIgnoreCase) >= 0)
+                    {
                         edge.IsYardTrack = false;
                     }
                 }
             }
 
-            var mainlineEdges = Edges.Where(e => !e.IsYardTrack && e.Length >= 20f).ToList();
+            var mainlineEdges = Edges.Where(e => (!e.IsYardTrack || (e.Track != null && e.Track.name != null && e.Track.name.IndexOf("DT-", StringComparison.OrdinalIgnoreCase) >= 0)) && e.Length >= 10f).ToList();
 
             for (int i = 0; i < mainlineEdges.Count; i++)
             {
                 var edge1 = mainlineEdges[i];
+                if (edge1.Track == null || edge1.Track.curve == null) continue;
+                Vector3 start1 = edge1.Track.curve.GetPointAt(0f);
                 Vector3 mid1 = edge1.GetMidPoint();
                 Vector3 tan1 = edge1.GetTangentAtSpan(edge1.Length * 0.5f);
 
                 for (int j = i + 1; j < mainlineEdges.Count; j++)
                 {
                     var edge2 = mainlineEdges[j];
-                    Vector3 mid2 = edge2.GetMidPoint();
-
-                    float dist = Vector3.Distance(mid1, mid2);
-                    if (dist < minParallelDistance || dist > maxParallelDistance)
-                        continue;
-
+                    if (edge2.Track == null || edge2.Track.curve == null) continue;
                     Vector3 tan2 = edge2.GetTangentAtSpan(edge2.Length * 0.5f);
                     float dot = Vector3.Dot(tan1, tan2);
 
-                    if (Mathf.Abs(dot) >= minTangentAlignment)
+                    if (Mathf.Abs(dot) < minTangentAlignment)
+                        continue;
+
+                    Vector3 start2 = edge2.Track.curve.GetPointAt(0f);
+                    Vector3 mid2 = edge2.GetMidPoint();
+
+                    // Calculate perpendicular track separation for staggered track segments
+                    Vector3 v12 = mid1 - start2;
+                    float proj2 = Vector3.Dot(v12, tan2);
+                    Vector3 perpVec2 = v12 - proj2 * tan2;
+                    float perpDist2 = perpVec2.magnitude;
+
+                    Vector3 v21 = mid2 - start1;
+                    float proj1 = Vector3.Dot(v21, tan1);
+                    Vector3 perpVec1 = v21 - proj1 * tan1;
+                    float perpDist1 = perpVec1.magnitude;
+
+                    bool isParallel = false;
+                    Vector3 rightNormal1 = Vector3.Cross(Vector3.up, tan1).normalized;
+
+                    if (proj2 >= -15f && proj2 <= edge2.Length + 15f && perpDist2 >= minParallelDistance && perpDist2 <= maxParallelDistance)
+                    {
+                        isParallel = true;
+                    }
+                    else if (proj1 >= -15f && proj1 <= edge1.Length + 15f && perpDist1 >= minParallelDistance && perpDist1 <= maxParallelDistance)
+                    {
+                        isParallel = true;
+                    }
+                    else
+                    {
+                        float dist = Vector3.Distance(mid1, mid2);
+                        if (dist >= minParallelDistance && dist <= maxParallelDistance)
+                        {
+                            isParallel = true;
+                        }
+                    }
+
+                    if (isParallel)
                     {
                         edge1.IsDoubleTrackMainline = true;
                         edge2.IsDoubleTrackMainline = true;
-                        edge1.ParallelEdge = edge2;
-                        edge2.ParallelEdge = edge1;
+                        if (edge1.ParallelEdge == null) edge1.ParallelEdge = edge2;
+                        if (edge2.ParallelEdge == null) edge2.ParallelEdge = edge1;
 
-                        Vector3 forwardDir1 = tan1;
-                        Vector3 rightNormal1 = Vector3.Cross(Vector3.up, forwardDir1).normalized;
-                        Vector3 offset12 = mid2 - mid1;
-
-                        float lateralOffset = Vector3.Dot(offset12, rightNormal1);
+                        float lateralOffset = Vector3.Dot(mid2 - mid1, rightNormal1);
 
                         // If lateralOffset > 0, edge2 is to the RIGHT of edge1 when traveling forward (+tan1).
                         // In right-hand running, forward (+tan1) traffic should use edge2, reverse (-tan1) should use edge1.

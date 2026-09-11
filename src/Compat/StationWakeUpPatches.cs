@@ -1,6 +1,8 @@
 using System;
 using HarmonyLib;
 using AITraffic.Workers;
+using AITraffic.Navigation;
+using Signals.Game.Controllers;
 
 namespace AITraffic.Compat
 {
@@ -51,6 +53,34 @@ namespace AITraffic.Compat
                 {
                     if (Main.ModEntry != null && Main.ModEntry.Logger != null)
                         Main.ModEntry.Logger.Error(string.Format("Error in IsPlayerOutOfJobDestroyZone_Patch: {0}", ex));
+                }
+            }
+        }
+
+        /// <summary>
+        /// Harmony patch ensuring DVSignals controllers stay awake and actively evaluate
+        /// block occupancy and aspects when AI trains are within approach distance (1500m),
+        /// even when the player is far away across the map.
+        /// Eliminates dormant signals displaying false green aspects to opposing traffic.
+        /// </summary>
+        [HarmonyPatch(typeof(BasicSignalController), "ShouldUpdate")]
+        public static class BasicSignalController_ShouldUpdate_Patch
+        {
+            [HarmonyPostfix]
+            public static void Postfix(BasicSignalController __instance, ref bool __result)
+            {
+                if (__result) return; // Player camera is already within 1500m
+
+                try
+                {
+                    if (SignalRegistry.IsSignalNearAnyAITrain(__instance, 1500f))
+                    {
+                        __result = true;
+                    }
+                }
+                catch (Exception)
+                {
+                    // Guard against potential null refs during scene transitions
                 }
             }
         }

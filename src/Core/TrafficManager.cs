@@ -368,8 +368,8 @@ namespace AITraffic.Core
 
                 // 2. Active En-Route Train Rules:
 
-                // Rule A: Spawn Grace Period - Never despawn an active train within 180s (3 min) of creation
-                if (Time.time - engineer.SpawnTime < 180f)
+                // Rule A: Spawn Grace Period - Never despawn an active train within 90s of creation
+                if (Time.time - engineer.SpawnTime < 90f)
                 {
                     continue;
                 }
@@ -380,17 +380,17 @@ namespace AITraffic.Core
                     continue;
                 }
 
-                // Rule C: Out-of-Range Moving Away Despawning
-                // Only despawn if the train has traveled far away (> 3500m) AND is moving further away
+                // Rule C: Out-of-Range or Passed-the-Player Moving Away Despawning
+                // Despawn promptly once the train has passed the player or moved out of encounter range (> 1000m) AND is outside camera view
                 float distToPlayer = playerPos != Vector3.zero ? Vector3.Distance(engineer.TrainCar.transform.position, playerPos) : 0f;
-                float minOutDist = Mathf.Max(3500f, configuredDespawnDist);
+                float despawnThreshold = 1000f;
 
-                if (distToPlayer > minOutDist)
+                if (distToPlayer > despawnThreshold)
                 {
-                    if (TrainDespawner.CanDespawnSafely(engineer.TrainCar.trainset, minDistance: minOutDist, frustumDistance: minOutDist * 1.2f))
+                    if (TrainDespawner.CanDespawnSafely(engineer.TrainCar.trainset, minDistance: despawnThreshold, frustumDistance: despawnThreshold))
                     {
                         if (Main.ModEntry != null && Main.ModEntry.Logger != null)
-                            Main.ModEntry.Logger.Log(string.Format("[TrafficManager] Despawning out-of-range AI train '{0}' (> {1:F0}m from player and moving away).",
+                            Main.ModEntry.Logger.Log(string.Format("[TrafficManager] Despawning AI train '{0}' that passed player or moved out of encounter range ({1:F0}m from player, moving away).",
                                 engineer.TrainCar.ID, distToPlayer));
 
                         _activeEngineers.RemoveAt(i);

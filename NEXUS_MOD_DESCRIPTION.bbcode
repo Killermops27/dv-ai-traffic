@@ -1,8 +1,8 @@
 [center][size=5][b][color=#FFB833]Derail Valley AI Traffic (AITraffic)[/color][/b][/size]
 [size=3][i]Autonomous AI Train Traffic, Timetable Dispatching & Player-Employed AI Workers[/i][/size]
-[size=2]Author: [b]Killermops27[/b] | Version: [b][color=#55DD55]0.2.2 (Alpha)[/color][/b][/size]
+[size=2]Author: [b]Killermops27[/b] | Version: [b][color=#55DD55]0.2.3 (Alpha)[/color][/b][/size]
 
-[url=https://github.com/Killermops27/dv-ai-traffic][b]GitHub Repository[/b][/url] • [url=https://github.com/Killermops27/dv-ai-traffic/releases/tag/v0.2.2][b]Latest Release[/b][/url] • [url=https://github.com/Killermops27/dv-ai-traffic/issues][b]Report a Bug[/b][/url] • [url=https://www.nexusmods.com/derailvalley/mods/1685][b]Nexus Mods #1685[/b][/url]
+[url=https://github.com/Killermops27/dv-ai-traffic][b]GitHub Repository[/b][/url] • [url=https://github.com/Killermops27/dv-ai-traffic/releases/tag/v0.2.3][b]Latest Release[/b][/url] • [url=https://github.com/Killermops27/dv-ai-traffic/issues][b]Report a Bug[/b][/url] • [url=https://www.nexusmods.com/derailvalley/mods/1685][b]Nexus Mods #1685[/b][/url]
 [/center]
 
 [hr]
@@ -16,22 +16,19 @@ If you find reproducible bugs, please report them on our [url=https://github.com
 
 [hr]
 
-[size=4][b][color=#FFB833]✦ What's New in Version 0.2.2[/color][/b][/size]
+[size=4][b][color=#FFB833]✦ What's New in Version 0.2.3[/color][/b][/size]
 
 [list]
-[*][b]Thru-Station Pathfinding & Occupied Track Elimination:[/b] Intermediate tracks occupied by parked cars or rolling stock are strictly rejected ([i]StrictlyAvoidOccupied = true[/i]). AI trains will never route into occupied sidings or blocked tracks.
-[*][b]Passing Loops vs. Industrial Storage Yards:[/b] AI pathfinding separates passing loops ([i][S][/i], [i]Siding[/i], [i]Loop[/i]) from industrial storage tracks ([i][Y][/i], [i][L][/i]). Passing loops have minimal preference cost (+350m) so clear mainlines are favored while empty loops are chosen over blocked lines. Industrial yards retain massive transit penalties (+500,000m) to keep freight from cutting through shunting yards.
-[*][b]Single-Track Corridor Protection & Anti-Deadlock (GitHub Issue #5):[/b] Trains look ahead into single-track corridors before passing loops. If opposing traffic is detected, the train holds safely inside the passing siding outside the switch fouling envelope (45m buffer) until the line clears. Direction-aware tracking allows same-direction trains to follow freely!
-[*][b]Switch Interlocking & Anti-Split Switch Safety (GitHub Issue #4):[/b] Switches are physically locked against throwing while any railcar body or bogie is straddling switch points. Continuous lock renewal protects switches until the entire consist has cleared.
-[*][b]Powertrain Thermal Protection & Overheat Roll-Off (GitHub Issue #6):[/b] Actively tracks engine coolant and oil temperatures, rolling off throttle linearly between 95°C and 105°C to eliminate blown prime movers on mountain grades.
-[*][b]Hill-Start Pre-Charge Sequence & Anti-Rollback:[/b] On upgrades (>= 0.15%), independent and train brakes stay firmly clamped while the engine builds launching torque before brakes release. Guarantees 0 rollback on steep mountain starts.
-[*][b]DM3 Fluid-Coupling Launch & Gear Shift Brake Hold:[/b] DM3 locomotives spool throttle up to 0.90–1.00 before releasing independent brakes on slopes, and automatically apply holding brakes during neutral gear shifts.
-[*][b]Traction Motor Over-Current Protection:[/b] Monitored traction motor amperage rolls throttle back above 380A and cuts power at 420–480A to prevent blown fuses. Tripped fuses automatically reset once stopped.
-[*][b]Automatic Multiple Unit (MU) Cable Coupling:[/b] Multi-loco consists (e.g. DE6+DE6, DE2+Slug) automatically couple physical 3D MU jumper cables and propagate controls upon spawn without requiring career license unlocks.
-[*][b]Zeibach's Couplers (ZCouplers) Compatibility (GitHub Issue #2):[/b] AI consists are exempted from stress-induced coupler snapping while retaining full 3D knuckle visuals, animations, and buffer spring physics.
-[*][b]Sub-3ms Snapshot Occupancy & Stutter-Free Spawning:[/b] Evaluates track occupancy in <3ms using frame-cached snapshots, and instantiates ambient trains 1 car per frame across 15–25 frames to eliminate frame drops.
-[*][b]Freecam 3D Nametag Tracking (GitHub Issue #1):[/b] Overhead nameplates and route visualizer lines properly track active camera in Freecam, Orbit, and Photo Mode.
-[*][b]Visual Route Line & HUD Sync:[/b] In-world route lines are elevated 0.65m above rails to eliminate ballast z-fighting, and HUD train entries match their route visualizer colors.
+[*][b]DVSignals Remote Controller Keep-Alive:[/b] Added a Harmony postfix keeping signal controllers awake within 1500m of approaching AI trains even when far from the player camera. Eliminates dormant signals freezing on clear aspects.
+[*][b]Double Track Crossover & Mirrored Mast Support:[/b] Detects inverted mast scale on Double Track crossovers and negates the facing vector, ensuring AI trains read the correct governing signals on mirrored masts.
+[*][b]Signal Route Verification & False Green Rejection:[/b] AI engineers verify upcoming switches in the signal's block are physically aligned before trusting green aspects. Misaligned routes enforce an immediate 0 km/h stop line 15m before the signal until aligned.
+[*][b]Whole-Trainset Switch Straddle Interlocking:[/b] Evaluates entire consists across switches. If ANY car or bogie is spanning switch points, the switch is unconditionally locked against throwing, eliminating switch splits and derailments caused by collider lag.
+[*][b]Forward Angular Continuity (No Hairpin U-Turns):[/b] Pathfinder enforces vector travel continuity, strictly preventing acute-angle hairpin U-turns (> 90 degrees) across junction frogs.
+[*][b]Double-Track Stagger & Crossover Routing:[/b] Pairs staggered parallel double-track segments accurately and penalizes unnecessary zigzagging across crossovers ([i]CX[/i], [i]Cross[/i], [i]Xing[/i]) to maintain smooth right-hand running.
+[*][b]Ambient Reverser Locking & Dynamic Off-Route Recovery:[/b] Ambient trains lock their reverser at spawn, preventing reverser flapping. If diverted off-path, trains dynamically recalculate an A* recovery route forward once the rear car clears the switch.
+[*][b]Brake Pipe Pressure Integrity:[/b] Outer uncoupled angle cocks at front and rear are automatically closed at spawn ([i]IsCockOpen = false[/i]), guaranteeing full air pressure. Coupler connections and locomotive initializations are time-sliced across frames (1 loco per frame) to eliminate spawn stutter.
+[*][b]Encounter-Driven Traffic Scheduling:[/b] Prevents ambient trains from spawning closer than 1000m to the player while biasing origins between 1000m and 3000m so trains travel toward the player for frequent mainline meets. Anti-repetition tracking remembers both recent origins and destinations. Candidate departure and arrival tracks are shuffled across spawns.
+[*][b]Tightened Encounter Despawning:[/b] Trains that have passed the player and moved beyond 1000m (outside camera view and moving away) despawn promptly to free mainline capacity.
 [/list]
 
 [hr]
@@ -42,7 +39,7 @@ If you find reproducible bugs, please report them on our [url=https://github.com
 [list]
 [*][b]Point-to-Point AI Hauls:[/b] Hire AI engineers to haul your assembled consists from station to station across the valley map.
 [*][b]Diegetic Comms Radio Dispatch:[/b] Cycle to [b]AI Worker[/b] mode (cyan laser beam). Aim at any locomotive to inspect train car count, total length (meters), and mass (metric tons), cycle destination stations and arrival tracks via the scroll wheel, and pull the trigger to dispatch!
-[*][b]Dynamic Clear Siding Auto-Selection:[/b] Evaluates receiving ([i]transferIn[/i]) and yard storage tracks at the destination station, verifying length (>= consist + 25m), clearance ([i]!IsTrackOccupied[/i]), and path navigability before selecting.
+[*][b]Dynamic Clear Siding Auto-Selection:[/b] Evaluates candidate receiving ([i]transferIn[/i]) and yard storage tracks at the destination station, verifying length (>= consist + 25m), clearance ([i]!IsTrackOccupied[/i]), and path navigability before selecting.
 [*][b]Dynamic Economy & Driver Wages:[/b] Computes realistic driver compensation based on distance and ton-mileage (Base $300 + $0.06/meter + $0.35/ton), deducting fees directly from the player wallet with a cash register chime.
 [*][b]Consist Automation & Despawn Immunity:[/b] Automatically locks couplers, connects air hoses, sets cock levers, releases handbrakes across the consist, and starts prime movers. Flagged with despawn immunity ([i]IsWorkerDriven = true[/i]).
 [*][b]Arrival Handover:[/b] Halts on the target destination track, applies parking handbrake, removes AI driver, and displays an on-screen toast banner returning 100% manual control to the player.
@@ -59,7 +56,7 @@ If you find reproducible bugs, please report them on our [url=https://github.com
 
 [b][color=#55DD55]3. Signaling, Corridor Holding & Safety Interlocking[/color][/b]
 [list]
-[*][b]DVSignals Integration:[/b] Interacts directly with the DVSignals framework for physical signal aspect resolution, block reservation, and headway control down to the 0m stop line.
+[*][b]DVSignals Integration & Remote Keep-Alive:[/b] Evaluates physical signal aspects, block reservations, and headway control down to 0m stop lines, keeping distant signal controllers active within 1500m of AI trains.
 [*][b]Single-Track Corridor Protection:[/b] Evaluates single-track corridors ahead of passing loops. Holds safely inside passing sidings outside the switch fouling envelope (45m buffer) until the corridor clears.
 [*][b]Direction-Aware Corridor Arbitration:[/b] Distinguishes opposing trains from same-direction followers, allowing consecutive trains to proceed smoothly without deadlock.
 [*][b]Anti-Split Switch & Bogie Interlocking:[/b] Switches are strictly locked against throwing while any railcar body or bogie is physically straddling switch points.
@@ -115,7 +112,7 @@ If you find reproducible bugs, please report them on our [url=https://github.com
 
 [size=4][b][color=#FFB833]✦ Installation[/color][/b][/size]
 
-1. Download [b]AITraffic-v0.2.2.zip[/b] from the Files tab.
+1. Download [b]AITraffic-v0.2.3.zip[/b] from the Files tab.
 2. Drag and drop the archive directly into the Unity Mod Manager [b]Mods[/b] tab, OR extract into your [i]Derail Valley/Mods/[/i] folder so that [i]Info.json[/i] is at [i]Derail Valley/Mods/AITraffic/Info.json[/i].
 3. Start Derail Valley and verify that [b]AI Traffic[/b], [b]DVSignals[/b], and [b]CommsRadioAPI[/b] show green status lights in UMM ([b]Ctrl + F10[/b]).
 

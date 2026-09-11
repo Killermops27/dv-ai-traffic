@@ -104,7 +104,7 @@ namespace AITraffic.Fleet
             if (Core.TrafficManager.Instance != null)
             {
                 yield return Core.TrafficManager.Instance.StartCoroutine(
-                    SpawnAITrainInternalCoroutine(track, liveries, specs, startSpan, flipTrainConsist, onComplete));
+                    SpawnAITrainInternalCoroutine(track, liveries, specs, startSpan, flipTrainConsist, onComplete, consistType));
             }
             else
             {
@@ -221,7 +221,8 @@ namespace AITraffic.Fleet
             List<ConsistCarSpec> specs,
             double startSpan,
             bool flipTrainConsist,
-            Action<AIEngineer> onComplete)
+            Action<AIEngineer> onComplete,
+            ConsistType consistType = ConsistType.RegionalFreight)
         {
             if (track == null || liveries == null || liveries.Count == 0)
             {
@@ -389,22 +390,35 @@ namespace AITraffic.Fleet
                 ModCompatManager.TagTrainAsAITraffic(leadLoco.trainset);
             }
 
-            // Connect couplers, air hoses, open angle cocks, tighten chains
-            ConfigureConsistCouplers(spawnedCars);
-
-            // Yield 1 frame for coupler joint settling
-            yield return null;
-
-            // Connect Multiple Unit (MU) cables between all adjacent locomotives/slugs
+            // Connect couplers, air hoses, open angle cocks, tighten chains, time-sliced across frames (2 cars per frame)
             for (int i = 0; i < spawnedCars.Count - 1; i++)
             {
-                var carA = spawnedCars[i];
-                var carB = spawnedCars[i + 1];
-                if (carA != null && carB != null && carA.IsMultipleUnit && carB.IsMultipleUnit)
+                CoupleAdjacentCars(spawnedCars[i], spawnedCars[i + 1]);
+                if (i % 2 == 1)
                 {
-                    ConnectMUCablesBetween(carA, carB);
+                    yield return null;
                 }
             }
+
+            // Ensure outer end-most couplers have closed angle cocks so brake pipe holds air
+            for (int i = 0; i < spawnedCars.Count; i++)
+            {
+                var car = spawnedCars[i];
+                if (car == null) continue;
+
+                if (car.frontCoupler != null && !car.frontCoupler.IsCoupled())
+                {
+                    car.frontCoupler.IsCockOpen = false;
+                }
+
+                if (car.rearCoupler != null && !car.rearCoupler.IsCoupled())
+                {
+                    car.rearCoupler.IsCockOpen = false;
+                }
+            }
+
+            // Yield 1 frame for coupler joint physics settling
+            yield return null;
 
             // Pre-charge the air brake system across all cars and locomotives in the consist
             for (int i = 0; i < spawnedCars.Count; i++)
@@ -459,13 +473,14 @@ namespace AITraffic.Fleet
             // Yield 1 frame before heavy loco init (SimController port discovery, brake system init, engine startup)
             yield return null;
 
-            // Initialize locomotives (startup prime movers, reverser, lights)
+            // Initialize locomotives (startup prime movers, reverser, lights), staggered 1 loco per frame
             for (int i = 0; i < spawnedCars.Count; i++)
             {
                 var car = spawnedCars[i];
                 if (car != null && car.IsLoco)
                 {
                     InitializeLocomotive(car);
+                    yield return null;
                 }
             }
 
@@ -477,6 +492,11 @@ namespace AITraffic.Fleet
             if (engineer == null)
             {
                 engineer = leadLoco.gameObject.AddComponent<AIEngineer>();
+            }
+
+            if (engineer != null)
+            {
+                engineer.ConsistType = consistType;
             }
 
             // Stagger cargo loading across frames in background
@@ -684,6 +704,10 @@ namespace AITraffic.Fleet
                 if (engineer == null)
                 {
                     engineer = leadLoco.gameObject.AddComponent<AIEngineer>();
+                }
+                if (engineer != null)
+                {
+                    engineer.ConsistType = ConsistType.RegionalFreight;
                 }
 
                 // 8. Time-slice procedural cargo loading across frames to eliminate spawn stutter while maintaining 100% visual/weight fidelity

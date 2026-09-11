@@ -115,7 +115,25 @@ namespace AITraffic.Core
             new TrafficCorridor("CSW", "MF", ConsistType.RegionalFreight),
             new TrafficCorridor("MF", "CSW", ConsistType.RegionalFreight),
             new TrafficCorridor("CSW", "SW", ConsistType.PassengerCommuter),
-            new TrafficCorridor("SW", "CSW", ConsistType.PassengerCommuter)
+            new TrafficCorridor("SW", "CSW", ConsistType.PassengerCommuter),
+            new TrafficCorridor("CSW", "SM", ConsistType.MainlineHeavy),
+            new TrafficCorridor("SM", "CSW", ConsistType.MainlineHeavy),
+            new TrafficCorridor("CSW", "MB", ConsistType.RegionalFreight),
+            new TrafficCorridor("MB", "CSW", ConsistType.RegionalFreight),
+
+            // Coal Power Plant Corridors
+            new TrafficCorridor("CM", "CP", ConsistType.MainlineHeavy),
+            new TrafficCorridor("CP", "CM", ConsistType.MainlineHeavy),
+            new TrafficCorridor("HB", "CP", ConsistType.MainlineHeavy),
+            new TrafficCorridor("CP", "HB", ConsistType.MainlineHeavy),
+            new TrafficCorridor("CP", "SM", ConsistType.MainlineHeavy),
+            new TrafficCorridor("SM", "CP", ConsistType.MainlineHeavy),
+
+            // Additional Forest Meadow & Farm Routes
+            new TrafficCorridor("FR", "SW", ConsistType.ShunterFreight),
+            new TrafficCorridor("SW", "FR", ConsistType.ShunterFreight),
+            new TrafficCorridor("FR", "FF", ConsistType.ShunterFreight),
+            new TrafficCorridor("FF", "FR", ConsistType.ShunterFreight)
         };
 
         private float _lastDispatchTime = -9999f;
@@ -126,6 +144,7 @@ namespace AITraffic.Core
 
         private readonly System.Random _rng = new System.Random();
         private readonly List<string> _recentDestinations = new List<string>();
+        private readonly List<string> _recentOrigins = new List<string>();
 
         private struct ScoredCorridor
         {
@@ -149,6 +168,17 @@ namespace AITraffic.Core
             }
         }
 
+        private void RecordOrigin(string yardId)
+        {
+            if (string.IsNullOrEmpty(yardId)) return;
+            _recentOrigins.Remove(yardId);
+            _recentOrigins.Add(yardId);
+            while (_recentOrigins.Count > 4)
+            {
+                _recentOrigins.RemoveAt(0);
+            }
+        }
+
         private float CalculateCorridorScore(TrafficCorridor corridor, Vector3 playerPos)
         {
             StationController origin = FindStation(corridor.OriginYardId);
@@ -158,30 +188,26 @@ namespace AITraffic.Core
             float distOrigin = Vector3.Distance(origin.transform.position, playerPos);
             float distDest = Vector3.Distance(dest.transform.position, playerPos);
 
-            // Avoid spawning directly on top of the player (< 350m)
-            if (distOrigin < 350f)
+            // Avoid spawning within 1000m of the player
+            if (distOrigin < 1000f)
                 return 80000f;
 
             float score = 0f;
 
-            // Origin distance: Optimal spawn distance is between 500m and 2500m from the player
-            if (distOrigin >= 500f && distOrigin <= 2500f)
+            // Origin distance: Optimal spawn distance is between 1000m and 3000m from the player
+            if (distOrigin >= 1000f && distOrigin <= 3000f)
             {
                 score += distOrigin;
             }
-            else if (distOrigin < 500f)
+            else // distOrigin > 3000f
             {
-                score += 3000f + (500f - distOrigin) * 5f;
-            }
-            else // distOrigin > 2500f
-            {
-                score += 2500f + (distOrigin - 2500f) * 1.5f;
+                score += 3000f + (distOrigin - 3000f) * 1.5f;
             }
 
             // Destination bonus: prioritize trains heading towards or past the player's general sector
-            if (distDest >= 600f && distDest <= 3500f)
+            if (distDest >= 1000f && distDest <= 3500f)
             {
-                score -= 400f;
+                score -= 600f;
             }
 
             // Anti-repetition penalty for recent destinations
@@ -191,8 +217,15 @@ namespace AITraffic.Core
                 score += 3000f * (recencyIdx + 1);
             }
 
-            // Small random jitter (+-200m) to ensure rich variety among nearby candidate corridors
-            score += (float)(_rng.NextDouble() * 400.0 - 200.0);
+            // Anti-repetition penalty for recent origins
+            if (_recentOrigins.Contains(corridor.OriginYardId))
+            {
+                int recencyIdx = _recentOrigins.IndexOf(corridor.OriginYardId);
+                score += 3000f * (recencyIdx + 1);
+            }
+
+            // Random jitter (+-300m) to ensure rich variety among nearby candidate corridors
+            score += (float)(_rng.NextDouble() * 600.0 - 300.0);
 
             return score;
         }
@@ -324,6 +357,10 @@ namespace AITraffic.Core
 
                 Vector3 playerPos = PlayerManager.PlayerTransform != null ? PlayerManager.PlayerTransform.position : Vector3.zero;
 
+                var occupiedSnapshot = (AITraffic.Navigation.RailGraph.Instance != null)
+                    ? AITraffic.Navigation.RailGraph.BuildOccupiedTracksSnapshot()
+                    : new HashSet<RailTrack>();
+
                 // 1. Shuffle all predefined corridors
                 var corridorList = new List<TrafficCorridor>(s_corridors);
                 for (int i = corridorList.Count - 1; i > 0; i--)
@@ -364,16 +401,16 @@ namespace AITraffic.Core
 
                     if (originStation == null || destStation == null) continue;
 
-                    // Avoid spawning directly on top of the player
+                    // Avoid spawning within 1000m of the player
                     if (playerPos != Vector3.zero)
                     {
                         float distToPlayer = Vector3.Distance(originStation.transform.position, playerPos);
-                        if (distToPlayer < 350f)
+                        if (distToPlayer < 1000f)
                             continue;
                     }
 
                     RailPath routePath;
-                    RailTrack spawnTrack = FindClearDepartureTrack(originStation, destStation, 100f, out routePath, corridor.PreferredConsist);
+                    RailTrack spawnTrack = FindClearDepartureTrack(originStation, destStation, 100f, out routePath, corridor.PreferredConsist, occupiedSnapshot);
                     if (spawnTrack == null || routePath == null || !routePath.IsValid)
                         continue;
 
@@ -462,6 +499,7 @@ namespace AITraffic.Core
                     engineer.IsTerminusDestination = true;
 
                     RecordDestination(corridor.DestinationYardId);
+                    RecordOrigin(corridor.OriginYardId);
 
                     if (Main.ModEntry != null && Main.ModEntry.Logger != null)
                         Main.ModEntry.Logger.Log(string.Format("[TrafficScheduler] Dispatched Tier 1 Ambient Train ({0} -> {1}, Consist: {2}) on track '{3}' (Route: {4:F0}m).",
@@ -488,8 +526,16 @@ namespace AITraffic.Core
                         float dA = Vector3.Distance(stA.transform.position, playerPos);
                         float dB = Vector3.Distance(stB.transform.position, playerPos);
 
-                        float scoreA = (dA < 350f) ? 99999f : (dA <= 2500f ? dA : 2500f + (dA - 2500f) * 2f);
-                        float scoreB = (dB < 350f) ? 99999f : (dB <= 2500f ? dB : 2500f + (dB - 2500f) * 2f);
+                        float scoreA = (dA < 1000f) ? 99999f : (dA <= 3000f ? dA : 3000f + (dA - 3000f) * 2f);
+                        float scoreB = (dB < 1000f) ? 99999f : (dB <= 3000f ? dB : 3000f + (dB - 3000f) * 2f);
+
+                        string yardA = (stA.stationInfo != null) ? (stA.stationInfo.YardID ?? "") : "";
+                        string yardB = (stB.stationInfo != null) ? (stB.stationInfo.YardID ?? "") : "";
+                        int recA = _recentOrigins.Contains(yardA) ? _recentOrigins.IndexOf(yardA) + 1 : 0;
+                        int recB = _recentOrigins.Contains(yardB) ? _recentOrigins.IndexOf(yardB) + 1 : 0;
+                        scoreA += 3000f * recA;
+                        scoreB += 3000f * recB;
+
                         return scoreA.CompareTo(scoreB);
                     });
                 }
@@ -501,8 +547,8 @@ namespace AITraffic.Core
                     var station = allStationList[s];
                     if (station == null) continue;
 
-                    // Avoid spawning directly on top of the player
-                    if (playerPos != Vector3.zero && Vector3.Distance(station.transform.position, playerPos) < 350f)
+                    // Avoid spawning within 1000m of the player
+                    if (playerPos != Vector3.zero && Vector3.Distance(station.transform.position, playerPos) < 1000f)
                         continue;
 
                     // Build shuffled destination candidates
@@ -540,7 +586,7 @@ namespace AITraffic.Core
                         ConsistType inferredConsist = InferConsistType(station, candidateDest, _rng);
 
                         RailPath fallbackPath;
-                        RailTrack spawnTrack = FindClearDepartureTrack(station, candidateDest, 80f, out fallbackPath, inferredConsist);
+                        RailTrack spawnTrack = FindClearDepartureTrack(station, candidateDest, 80f, out fallbackPath, inferredConsist, occupiedSnapshot);
                         if (spawnTrack != null && fallbackPath != null && fallbackPath.IsValid)
                         {
                             double startSpan = 15.0;
@@ -628,6 +674,7 @@ namespace AITraffic.Core
                                 engineer.IsTerminusDestination = true;
 
                                 RecordDestination(destYard);
+                                RecordOrigin(origYard);
 
                                 if (Main.ModEntry != null && Main.ModEntry.Logger != null)
                                     Main.ModEntry.Logger.Log(string.Format("[TrafficScheduler] Dispatched Dynamic Ambient Train ({0} -> {1}, Consist: {2}) on track '{3}' (Route: {4:F0}m).",
@@ -815,6 +862,14 @@ namespace AITraffic.Core
                 {
                     if (!s_stationIndex.ContainsKey("FM")) s_stationIndex["FM"] = sc;
                     if (!s_stationIndex.ContainsKey("FR")) s_stationIndex["FR"] = sc;
+                }
+
+                // Handle Coal Power Plant aliases: CP / CPP
+                if (string.Equals(sYard, "CP", StringComparison.OrdinalIgnoreCase) || string.Equals(sYard, "CPP", StringComparison.OrdinalIgnoreCase) ||
+                    (!string.IsNullOrEmpty(sName) && (sName.IndexOf("Power", StringComparison.OrdinalIgnoreCase) >= 0 || sName.IndexOf("Coal Power", StringComparison.OrdinalIgnoreCase) >= 0)))
+                {
+                    if (!s_stationIndex.ContainsKey("CP")) s_stationIndex["CP"] = sc;
+                    if (!s_stationIndex.ContainsKey("CPP")) s_stationIndex["CPP"] = sc;
                 }
             }
         }
@@ -1206,25 +1261,54 @@ namespace AITraffic.Core
                 }
             }
 
-            // Sort candidate tracks: flatter tracks first
-            results.Sort((a, b) =>
-            {
-                float gradeA = (a.curve != null && a.curve.length > 1f) ? Mathf.Abs(a.curve.GetPointAt(1f).y - a.curve.GetPointAt(0f).y) / a.curve.length : 0f;
-                float gradeB = (b.curve != null && b.curve.length > 1f) ? Mathf.Abs(b.curve.GetPointAt(1f).y - b.curve.GetPointAt(0f).y) / b.curve.length : 0f;
-                return gradeA.CompareTo(gradeB);
-            });
+            // Separate candidate tracks into flat departure tracks (grade <= MaxSpawnInclineGrade) and others
+            var flatTracks = new List<RailTrack>();
+            var otherTracks = new List<RailTrack>();
 
-            return results;
+            for (int i = 0; i < results.Count; i++)
+            {
+                var t = results[i];
+                float g = (t.curve != null && t.curve.length > 1f) ? Mathf.Abs(t.curve.GetPointAt(1f).y - t.curve.GetPointAt(0f).y) / t.curve.length : 0f;
+                if (g <= MaxSpawnInclineGrade)
+                {
+                    flatTracks.Add(t);
+                }
+                else
+                {
+                    otherTracks.Add(t);
+                }
+            }
+
+            // Shuffle flat tracks using UnityEngine.Random so different candidate tracks are selected across spawns
+            for (int i = flatTracks.Count - 1; i > 0; i--)
+            {
+                int r = UnityEngine.Random.Range(0, i + 1);
+                var temp = flatTracks[i];
+                flatTracks[i] = flatTracks[r];
+                flatTracks[r] = temp;
+            }
+
+            flatTracks.AddRange(otherTracks);
+            return flatTracks;
         }
 
-        private static RailTrack FindClearDepartureTrack(StationController station, StationController destStation, float minLength, out RailPath routePath, ConsistType consistType = ConsistType.RegionalFreight)
+        private static RailTrack FindClearDepartureTrack(
+            StationController station,
+            StationController destStation,
+            float minLength,
+            out RailPath routePath,
+            ConsistType consistType = ConsistType.RegionalFreight,
+            HashSet<RailTrack> occupiedSnapshot = null)
         {
             routePath = null;
             if (station == null) return null;
 
-            var occupiedSnapshot = (AITraffic.Navigation.RailGraph.Instance != null)
-                ? AITraffic.Navigation.RailGraph.BuildOccupiedTracksSnapshot()
-                : new HashSet<RailTrack>();
+            if (occupiedSnapshot == null)
+            {
+                occupiedSnapshot = (AITraffic.Navigation.RailGraph.Instance != null)
+                    ? AITraffic.Navigation.RailGraph.BuildOccupiedTracksSnapshot()
+                    : new HashSet<RailTrack>();
+            }
 
             var depTracks = GetCandidateDepartureTracks(station, minLength, occupiedSnapshot);
             if (depTracks == null || depTracks.Count == 0) return null;
@@ -1237,6 +1321,15 @@ namespace AITraffic.Core
             var destTracks = GetCandidateDestinationTracks(destStation, consistType, occupiedSnapshot);
             if (destTracks == null || destTracks.Count == 0) return null;
 
+            // Randomize destination tracks so arrivals don't always target the identical siding
+            for (int i = destTracks.Count - 1; i > 0; i--)
+            {
+                int r = UnityEngine.Random.Range(0, i + 1);
+                var temp = destTracks[i];
+                destTracks[i] = destTracks[r];
+                destTracks[r] = temp;
+            }
+
             float directStationDist = Vector3.Distance(station.transform.position, destStation.transform.position);
             // Multi-station corridors MUST span a realistic distance between stations (at least 45% of direct Euclidean distance)
             float minCorridorDist = Mathf.Max(350f, directStationDist * 0.45f);
@@ -1248,8 +1341,8 @@ namespace AITraffic.Core
                 OccupiedTracksSnapshot = occupiedSnapshot
             };
 
-            // Limit candidates: evaluate at most top 2 departure tracks and top 2 destination tracks to eliminate lag spikes.
-            int maxDep = Math.Min(2, depTracks.Count);
+            // Evaluate up to top 3 departure tracks and top 2 destination tracks to eliminate lag spikes while giving rich track variety
+            int maxDep = Math.Min(3, depTracks.Count);
             int maxDest = Math.Min(2, destTracks.Count);
 
             for (int i = 0; i < maxDep; i++)

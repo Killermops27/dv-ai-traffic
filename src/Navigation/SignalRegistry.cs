@@ -99,6 +99,54 @@ namespace AITraffic.Navigation
         }
 
         /// <summary>
+        /// Checks whether a DVSignals controller is within wake distance of ANY active AI train.
+        /// Used by Harmony patch on BasicSignalController.ShouldUpdate to keep signals awake across the map.
+        /// </summary>
+        public static bool IsSignalNearAnyAITrain(Signals.Game.Controllers.BasicSignalController ctrl, float maxDist = 1500f)
+        {
+            if (ctrl == null) return false;
+            if (Core.TrafficManager.Instance == null) return false;
+
+            var engineers = Core.TrafficManager.Instance.ActiveEngineers;
+            if (engineers == null || engineers.Count == 0) return false;
+
+            Vector3 sigPos = (ctrl.Definition != null && ctrl.Definition.transform != null) ? ctrl.Definition.transform.position : ctrl.Position;
+            float maxDistSq = maxDist * maxDist;
+
+            for (int i = 0; i < engineers.Count; i++)
+            {
+                var eng = engineers[i];
+                if (eng == null || eng.TrainCar == null) continue;
+
+                float distSq = (eng.TrainCar.transform.position - sigPos).sqrMagnitude;
+                if (distSq <= maxDistSq)
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        /// <summary>
+        /// Flags a signal's block as dirty and forces an immediate state re-evaluation.
+        /// </summary>
+        public static void WakeAndForceUpdateSignal(DVSignal signal)
+        {
+            if (signal == null || signal.Controller == null) return;
+            try
+            {
+                signal.Controller.RequestUpdate(2);
+                if (signal.Block != null)
+                {
+                    signal.Block.FlagAsDirty();
+                }
+                signal.Controller.Update(true, true);
+            }
+            catch { }
+        }
+
+        /// <summary>
         /// Checks whether a track segment is currently occupied by the player's train, rolling stock, or player avatar.
         /// </summary>
         public static bool IsTrackOccupiedByPlayer(RailTrack track, Trainset ignoringTrainset = null)
@@ -381,6 +429,13 @@ namespace AITraffic.Navigation
                 Vector3 trainMoveVector = tangent * traversalDirection;
                 Vector3 signalForward = sig.Controller.Definition.transform.forward;
 
+                // Account for Double Track mod crossovers where RealisticSignalPlacer.cs applies flipFlag = true
+                // This inverts transform.localScale.z, which physically mirrors the mast and effectively reverses the forward vector
+                if (sig.Controller.Definition.transform.localScale.z < 0.0f)
+                {
+                    signalForward = -signalForward;
+                }
+
                 float dot = Vector3.Dot(signalForward, trainMoveVector);
                 if (Mathf.Abs(dot) > 0.2f)
                 {
@@ -402,12 +457,53 @@ namespace AITraffic.Navigation
         {
             if (signal == null) return false;
             if (signal.IsShunting) return false;
+
+            // 1. Controller type & flags from DVSignals
+            if (signal.Controller != null)
+            {
+                if (signal.Controller.Type == Signals.Game.SignalType.Distant || signal.Controller.ActingAsDistant)
+                {
+                    return false;
+                }
+                if (signal.Controller is Signals.Game.Controllers.DistantSignalController)
+                {
+                    return false;
+                }
+
+                string ctrlName = signal.Controller.NameOverride ?? "";
+                if (ctrlName.StartsWith("Ps", StringComparison.OrdinalIgnoreCase) ||
+                    ctrlName.IndexOf("DISTANT", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                    ctrlName.IndexOf("REPEATER", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                    ctrlName.IndexOf("VOR", StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    return false;
+                }
+            }
+
+            // 2. Definition properties
+            if (signal.Definition != null && signal.Definition.SelfActsAsDistant)
+            {
+                return false;
+            }
+
+            // 3. Signal name / prefix (DVSignals German pack uses "Ps {0}" format for distant signals / Vorsignale)
+            string sigName = signal.NameOverride ?? "";
+            if (sigName.StartsWith("Ps", StringComparison.OrdinalIgnoreCase) ||
+                sigName.IndexOf("DISTANT", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                sigName.IndexOf("REPEATER", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                sigName.IndexOf("VOR", StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                return false;
+            }
+
+            // 4. Aspect ID check
             if (signal.CurrentAspect != null)
             {
                 string aId = signal.CurrentAspect.Id ?? string.Empty;
                 if (aId.IndexOf("DISTANT", StringComparison.OrdinalIgnoreCase) >= 0 ||
                     aId.IndexOf("REPEATER", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                    aId.IndexOf("VR", StringComparison.OrdinalIgnoreCase) >= 0)
+                    aId.IndexOf("VR", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                    aId.StartsWith("NEXT_", StringComparison.OrdinalIgnoreCase))
                 {
                     return false;
                 }
@@ -571,52 +667,67 @@ namespace AITraffic.Navigation
 
             if (trackA == null || trackB == null) return false;
 
-            junction = trackA.outJunction ?? trackA.inJunction ?? trackB.inJunction ?? trackB.outJunction;
-            if (junction == null) return false;
-
-            // 1. Facing move: trackA is inBranch, diverging to trackB (one of outBranches)
-            if (junction.inBranch != null && junction.inBranch.track == trackA)
+            Junction[] candidates = new Junction[] { trackA.outJunction, trackA.inJunction, trackB.inJunction, trackB.outJunction };
+            for (int c = 0; c < candidates.Length; c++)
             {
-                if (junction.outBranches != null)
+                var junc = candidates[c];
+                if (junc == null) continue;
+
+                // 1. Facing move: trackA is inBranch, diverging to trackB (one of outBranches)
+                if (junc.inBranch != null && junc.inBranch.track == trackA)
                 {
-                    for (byte i = 0; i < (byte)junction.outBranches.Count; i++)
+                    if (junc.outBranches != null)
                     {
-                        var branch = junction.outBranches[i];
-                        if (branch != null && branch.track == trackB)
+                        for (byte i = 0; i < (byte)junc.outBranches.Count; i++)
                         {
-                            requiredBranch = i;
-                            return true;
+                            var branch = junc.outBranches[i];
+                            if (branch != null && branch.track == trackB)
+                            {
+                                junction = junc;
+                                requiredBranch = i;
+                                return true;
+                            }
                         }
                     }
                 }
-            }
 
-            // 2. Trailing move: trackA is one of outBranches, converging to trackB (the inBranch)
-            if (junction.inBranch != null && junction.inBranch.track == trackB)
-            {
-                if (junction.outBranches != null)
+                // 2. Trailing move: trackA is one of outBranches, converging to trackB (the inBranch)
+                if (junc.inBranch != null && junc.inBranch.track == trackB)
                 {
-                    for (byte i = 0; i < (byte)junction.outBranches.Count; i++)
+                    if (junc.outBranches != null)
                     {
-                        var branch = junction.outBranches[i];
-                        if (branch != null && branch.track == trackA)
+                        for (byte i = 0; i < (byte)junc.outBranches.Count; i++)
                         {
-                            requiredBranch = i;
-                            return true;
+                            var branch = junc.outBranches[i];
+                            if (branch != null && branch.track == trackA)
+                            {
+                                junction = junc;
+                                requiredBranch = i;
+                                return true;
+                            }
                         }
                     }
                 }
-            }
 
-            // 3. Out-to-out or multi-branch connectivity
-            if (junction.outBranches != null)
-            {
-                for (byte i = 0; i < (byte)junction.outBranches.Count; i++)
+                // 3. Out-to-out or multi-branch connectivity
+                if (junc.outBranches != null)
                 {
-                    var branch = junction.outBranches[i];
-                    if (branch != null && (branch.track == trackB || branch.track == trackA))
+                    bool hasA = false;
+                    bool hasB = false;
+                    byte branchIdx = 0;
+                    for (byte i = 0; i < (byte)junc.outBranches.Count; i++)
                     {
-                        requiredBranch = i;
+                        var branch = junc.outBranches[i];
+                        if (branch != null)
+                        {
+                            if (branch.track == trackA) hasA = true;
+                            if (branch.track == trackB) { hasB = true; branchIdx = i; }
+                        }
+                    }
+                    if (hasA && hasB)
+                    {
+                        junction = junc;
+                        requiredBranch = branchIdx;
                         return true;
                     }
                 }

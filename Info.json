@@ -2,7 +2,7 @@
   "Id": "AITraffic",
   "DisplayName": "AI Traffic",
   "Author": "Killermops27",
-  "Version": "0.2.2",
+  "Version": "0.2.3",
   "Requirements": [
     "DVSignals",
     "CommsRadioAPI"
