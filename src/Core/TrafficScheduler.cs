@@ -133,7 +133,25 @@ namespace AITraffic.Core
             new TrafficCorridor("FR", "SW", ConsistType.ShunterFreight),
             new TrafficCorridor("SW", "FR", ConsistType.ShunterFreight),
             new TrafficCorridor("FR", "FF", ConsistType.ShunterFreight),
-            new TrafficCorridor("FF", "FR", ConsistType.ShunterFreight)
+            new TrafficCorridor("FF", "FR", ConsistType.ShunterFreight),
+
+            // City South (CS) Corridors
+            new TrafficCorridor("CS", "HB", ConsistType.PassengerCommuter),
+            new TrafficCorridor("HB", "CS", ConsistType.PassengerCommuter),
+            new TrafficCorridor("CS", "SM", ConsistType.RegionalFreight),
+            new TrafficCorridor("SM", "CS", ConsistType.RegionalFreight),
+            new TrafficCorridor("CS", "SW", ConsistType.RegionalFreight),
+            new TrafficCorridor("SW", "CS", ConsistType.RegionalFreight),
+            new TrafficCorridor("CS", "MF", ConsistType.RegionalFreight),
+            new TrafficCorridor("MF", "CS", ConsistType.RegionalFreight),
+
+            // Forest South (FS / FRS) & Logging Corridors
+            new TrafficCorridor("FS", "SW", ConsistType.ShunterFreight),
+            new TrafficCorridor("SW", "FS", ConsistType.ShunterFreight),
+            new TrafficCorridor("FS", "CS", ConsistType.ShunterFreight),
+            new TrafficCorridor("CS", "FS", ConsistType.ShunterFreight),
+            new TrafficCorridor("FS", "HB", ConsistType.RegionalFreight),
+            new TrafficCorridor("HB", "FS", ConsistType.RegionalFreight)
         };
 
         private float _lastDispatchTime = -9999f;
@@ -414,6 +432,9 @@ namespace AITraffic.Core
                     if (spawnTrack == null || routePath == null || !routePath.IsValid)
                         continue;
 
+                    if (playerPos != Vector3.zero && IsDepartureHeadingTowardsPlayer(spawnTrack, routePath, playerPos))
+                        continue;
+
                     double startSpan = 15.0;
                     bool flipConsist = false;
 
@@ -589,6 +610,9 @@ namespace AITraffic.Core
                         RailTrack spawnTrack = FindClearDepartureTrack(station, candidateDest, 80f, out fallbackPath, inferredConsist, occupiedSnapshot);
                         if (spawnTrack != null && fallbackPath != null && fallbackPath.IsValid)
                         {
+                            if (playerPos != Vector3.zero && IsDepartureHeadingTowardsPlayer(spawnTrack, fallbackPath, playerPos))
+                                continue;
+
                             double startSpan = 15.0;
                             bool flipConsist = false;
 
@@ -695,6 +719,36 @@ namespace AITraffic.Core
         }
 
         #region Helper Methods
+
+        /// <summary>
+        /// Verifies that candidate spawn track and initial departure route are safely distanced from the player.
+        /// Prevents dangerous situations where an AI train spawns on a long yard track (e.g. Harbor D/G)
+        /// heading straight toward an oncoming player within 1200m.
+        /// </summary>
+        private static bool IsDepartureHeadingTowardsPlayer(RailTrack spawnTrack, RailPath routePath, Vector3 playerPos)
+        {
+            if (spawnTrack == null || routePath == null || playerPos == Vector3.zero) return false;
+
+            // Direct track distance to player (must be at least 800m away from player)
+            float spawnDistToPlayer = Vector3.Distance(spawnTrack.transform.position, playerPos);
+            if (spawnDistToPlayer < 800f) return true;
+
+            // Check if initial departure route heads directly toward a player who is within 1400m
+            if (spawnDistToPlayer < 1400f && routePath.Tracks != null && routePath.Tracks.Count > 1)
+            {
+                int checkLimit = Math.Min(routePath.Tracks.Count, 6);
+                for (int i = 1; i < checkLimit; i++)
+                {
+                    var t = routePath.Tracks[i];
+                    if (t != null && Vector3.Distance(t.transform.position, playerPos) < 350f)
+                    {
+                        return true;
+                    }
+                }
+            }
+
+            return false;
+        }
 
         /// <summary>
         /// Checks whether a rail track is currently occupied by any rolling stock or logic track cars.
@@ -848,17 +902,32 @@ namespace AITraffic.Core
                     s_stationIndex[sName] = sc;
                 }
 
-                // Handle common aliases: CW / CSW (City South West / City West)
+                // Handle City South: CS
+                if (string.Equals(sYard, "CS", StringComparison.OrdinalIgnoreCase) ||
+                    (!string.IsNullOrEmpty(sName) && sName.IndexOf("City South", StringComparison.OrdinalIgnoreCase) >= 0 && sName.IndexOf("West", StringComparison.OrdinalIgnoreCase) < 0))
+                {
+                    if (!s_stationIndex.ContainsKey("CS")) s_stationIndex["CS"] = sc;
+                }
+
+                // Handle City South West / City West: CW / CSW
                 if (string.Equals(sYard, "CSW", StringComparison.OrdinalIgnoreCase) || string.Equals(sYard, "CW", StringComparison.OrdinalIgnoreCase) ||
-                    (!string.IsNullOrEmpty(sName) && (sName.IndexOf("City South", StringComparison.OrdinalIgnoreCase) >= 0 || sName.IndexOf("City West", StringComparison.OrdinalIgnoreCase) >= 0)))
+                    (!string.IsNullOrEmpty(sName) && (sName.IndexOf("City South West", StringComparison.OrdinalIgnoreCase) >= 0 || sName.IndexOf("City West", StringComparison.OrdinalIgnoreCase) >= 0)))
                 {
                     if (!s_stationIndex.ContainsKey("CW")) s_stationIndex["CW"] = sc;
                     if (!s_stationIndex.ContainsKey("CSW")) s_stationIndex["CSW"] = sc;
                 }
 
-                // Handle Farm / Forest Meadow aliases
+                // Handle Forest South: FS / FRS
+                if (string.Equals(sYard, "FS", StringComparison.OrdinalIgnoreCase) || string.Equals(sYard, "FRS", StringComparison.OrdinalIgnoreCase) ||
+                    (!string.IsNullOrEmpty(sName) && sName.IndexOf("Forest South", StringComparison.OrdinalIgnoreCase) >= 0))
+                {
+                    if (!s_stationIndex.ContainsKey("FS")) s_stationIndex["FS"] = sc;
+                    if (!s_stationIndex.ContainsKey("FRS")) s_stationIndex["FRS"] = sc;
+                }
+
+                // Handle Farm / Forest Meadow aliases: FM / FR
                 if (string.Equals(sYard, "FM", StringComparison.OrdinalIgnoreCase) || string.Equals(sYard, "FR", StringComparison.OrdinalIgnoreCase) ||
-                    (!string.IsNullOrEmpty(sName) && (sName.IndexOf("Farm", StringComparison.OrdinalIgnoreCase) >= 0 || sName.IndexOf("Forest", StringComparison.OrdinalIgnoreCase) >= 0)))
+                    (!string.IsNullOrEmpty(sName) && (sName.IndexOf("Farm", StringComparison.OrdinalIgnoreCase) >= 0 || sName.IndexOf("Forest Meadow", StringComparison.OrdinalIgnoreCase) >= 0)))
                 {
                     if (!s_stationIndex.ContainsKey("FM")) s_stationIndex["FM"] = sc;
                     if (!s_stationIndex.ContainsKey("FR")) s_stationIndex["FR"] = sc;

@@ -370,12 +370,7 @@ namespace AITraffic.Fleet
                 carCount = rng.Next(4, 7);
             }
 
-            for (int i = 0; i < carCount; i++)
-            {
-                var opt = freightPool[rng.Next(0, freightPool.Count)];
-                CargoType cargoToLoad = isEmptyReturn ? CargoType.None : opt.Cargo;
-                AddCar(result, opt.CarType, cargoToLoad);
-            }
+            PopulateFreightWagons(result, freightPool, carCount, isHeavyBulk, isEmptyReturn, rng, isShunter: true);
 
             // 50% chance of Caboose on rear
             if (rng.NextDouble() > 0.5)
@@ -412,12 +407,7 @@ namespace AITraffic.Fleet
                 carCount = rng.Next(8, 12);
             }
 
-            for (int i = 0; i < carCount; i++)
-            {
-                var opt = freightPool[rng.Next(0, freightPool.Count)];
-                CargoType cargoToLoad = isEmptyReturn ? CargoType.None : opt.Cargo;
-                AddCar(result, opt.CarType, cargoToLoad);
-            }
+            PopulateFreightWagons(result, freightPool, carCount, isHeavyBulk, isEmptyReturn, rng);
 
             // Rear Caboose
             AddCar(result, TrainCarType.CabooseRed, CargoType.None);
@@ -468,15 +458,53 @@ namespace AITraffic.Fleet
                     carCount = rng.Next(12, 17);
             }
 
-            for (int i = 0; i < carCount; i++)
-            {
-                var opt = freightPool[rng.Next(0, freightPool.Count)];
-                CargoType cargoToLoad = isEmptyReturn ? CargoType.None : opt.Cargo;
-                AddCar(result, opt.CarType, cargoToLoad);
-            }
+            PopulateFreightWagons(result, freightPool, carCount, isHeavyBulk, isEmptyReturn, rng);
 
             // Rear Caboose
             AddCar(result, TrainCarType.CabooseRed, CargoType.None);
+        }
+
+        private static void PopulateFreightWagons(
+            List<ConsistCarSpec> result,
+            List<CarCargoOption> freightPool,
+            int carCount,
+            bool isHeavyBulk,
+            bool isEmptyReturn,
+            System.Random rng,
+            bool isShunter = false)
+        {
+            if (freightPool == null || freightPool.Count == 0 || carCount <= 0) return;
+
+            // Unit Train Selection: 60% chance for bulk cargo (or 35% for general freight) to be a pure homogeneous consist
+            bool isUnitTrain = isHeavyBulk ? (rng.NextDouble() < 0.60) : (rng.NextDouble() < 0.35);
+            if (isUnitTrain)
+            {
+                var unitOpt = freightPool[rng.Next(0, freightPool.Count)];
+                CargoType cargoToLoad = isEmptyReturn ? CargoType.None : unitOpt.Cargo;
+                for (int i = 0; i < carCount; i++)
+                {
+                    AddCar(result, unitOpt.CarType, cargoToLoad);
+                }
+                return;
+            }
+
+            // Block Grouping: Generate cars in cuts/blocks of matching wagons (2-4 for shunter, 3-6 for regional/mainline)
+            int minBlock = isShunter ? 2 : 3;
+            int maxBlock = isShunter ? 5 : 7;
+            int index = 0;
+            while (index < carCount)
+            {
+                var blockOpt = freightPool[rng.Next(0, freightPool.Count)];
+                CargoType cargoToLoad = isEmptyReturn ? CargoType.None : blockOpt.Cargo;
+                int blockSize = rng.Next(minBlock, maxBlock);
+                int countInBlock = Math.Min(blockSize, carCount - index);
+
+                for (int b = 0; b < countInBlock; b++)
+                {
+                    AddCar(result, blockOpt.CarType, cargoToLoad);
+                }
+                index += countInBlock;
+            }
         }
 
         /// <summary>

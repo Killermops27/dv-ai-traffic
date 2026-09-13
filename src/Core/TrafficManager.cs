@@ -352,12 +352,18 @@ namespace AITraffic.Core
 
                 if (isStoppedAtTerminus)
                 {
-                    // Terminus safe despawn distance: 500m (outside camera view) or 750m absolute
-                    if (TrainDespawner.CanDespawnSafely(engineer.TrainCar.trainset, minDistance: 500f, frustumDistance: 750f))
+                    // Terminus safe despawn distance:
+                    // Standard: 500m (outside camera view) or 750m absolute
+                    // After resting 120s at terminus: 150m (outside camera view) or 500m absolute to prevent yard throat congestion
+                    bool hasDwelledAtTerminus = (engineer.TerminusArrivalTime > 0f && (Time.time - engineer.TerminusArrivalTime > 120f));
+                    float minClearDist = hasDwelledAtTerminus ? 150f : 500f;
+                    float frustumDist = hasDwelledAtTerminus ? 500f : 750f;
+
+                    if (TrainDespawner.CanDespawnSafely(engineer.TrainCar.trainset, minDistance: minClearDist, frustumDistance: frustumDist))
                     {
                         if (Main.ModEntry != null && Main.ModEntry.Logger != null)
-                            Main.ModEntry.Logger.Log(string.Format("[TrafficManager] Despawning completed terminus train '{0}' (player distance cleared).",
-                                engineer.TrainCar.ID));
+                            Main.ModEntry.Logger.Log(string.Format("[TrafficManager] Despawning completed terminus train '{0}' (player distance cleared: {1:F0}m).",
+                                engineer.TrainCar.ID, minClearDist));
 
                         _activeEngineers.RemoveAt(i);
                         TrainDespawner.DespawnTrain(engineer.TrainCar.trainset, forceInstant: true);

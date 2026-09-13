@@ -96,6 +96,7 @@ namespace AITraffic.Driver
         public float DistanceToDestination { get; set; }
         public bool IsStationDestination { get; set; }
         public bool IsTerminusDestination { get; set; }
+        public float TerminusArrivalTime { get; private set; }
         public List<AITraffic.Navigation.SignalBlockInfo> UpcomingSignalBlocks
         {
             get { return _upcomingSignalBlocks; }
@@ -246,6 +247,7 @@ namespace AITraffic.Driver
         private RailTrack _obstacleTrack;
         private float _obstacleRerouteCooldown;
         private float _signalRerouteCooldown;
+        private float _signalWaitRetryTimer = 5.0f;
 
         #endregion
 
@@ -719,6 +721,49 @@ namespace AITraffic.Driver
                     {
                         bool rerouted = TryDynamicRedSignalReroute(curTrack);
                         _signalRerouteCooldown = rerouted ? 4.0f : 6.0f;
+                    }
+
+                    // 1e. Periodic Signal Wait Retry & DVSignals Wakeup:
+                    // When stopped at an Hp 0 (Red) signal, periodically re-request switch alignment
+                    // for upcoming clear tracks and wake DVSignals controllers to re-evaluate block state.
+                    if (CurrentSpeedKmh < 1.0f)
+                    {
+                        _signalWaitRetryTimer -= dt;
+                        if (_signalWaitRetryTimer <= 0.0f)
+                        {
+                            _signalWaitRetryTimer = 20.0f;
+
+                            // Re-request alignment for clear upcoming switches along planned route
+                            if (_upcomingTracks != null && _upcomingTracks.Count > 1 && AITraffic.Navigation.JunctionController.Instance != null)
+                            {
+                                int scanLimit = Math.Min(_upcomingTracks.Count, 12);
+                                for (int sIdx = 1; sIdx < scanLimit; sIdx++)
+                                {
+                                    var tA = _upcomingTracks[sIdx - 1];
+                                    var tB = _upcomingTracks[sIdx];
+                                    if (tA != null && tB != null && tA != tB)
+                                    {
+                                        Junction junc;
+                                        byte reqBr;
+                                        if (AITraffic.Navigation.SignalRegistry.TryGetJunctionBetweenTracks(tA, tB, out junc, out reqBr))
+                                        {
+                                            if (junc.selectedBranch != reqBr)
+                                            {
+                                                AITraffic.Navigation.JunctionController.Instance.RequestJunctionAlignment(junc, reqBr, this);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            // Awaken DVSignals to re-evaluate block clearance and clear signal aspect
+                            AITraffic.Navigation.SignalRegistry.WakeAndForceUpdateSignal(ApproachingSignal);
+                            AITraffic.Navigation.SignalRegistry.TryReserveDVSignal(ApproachingSignal);
+                        }
+                    }
+                    else
+                    {
+                        _signalWaitRetryTimer = 5.0f;
                     }
                 }
             }
@@ -3203,6 +3248,7 @@ namespace AITraffic.Driver
         private void EnterTerminusStop()
         {
             State = EngineState.TerminusStop;
+            TerminusArrivalTime = Time.time;
             ShutdownEngine();
 
             // Release track reservations and junction locks when safely stopped at terminus
