@@ -1,8 +1,8 @@
 [center][size=5][b][color=#FFB833]Derail Valley AI Traffic (AITraffic)[/color][/b][/size]
 [size=3][i]Autonomous AI Train Traffic, Timetable Dispatching & Player-Employed AI Workers[/i][/size]
-[size=2]Author: [b]Killermops27[/b] | Version: [b][color=#55DD55]0.2.3 (Alpha)[/color][/b][/size]
+[size=2]Author: [b]Killermops27[/b] | Version: [b][color=#55DD55]0.2.4 (Alpha)[/color][/b][/size]
 
-[url=https://github.com/Killermops27/dv-ai-traffic][b]GitHub Repository[/b][/url] • [url=https://github.com/Killermops27/dv-ai-traffic/releases/tag/v0.2.3][b]Latest Release[/b][/url] • [url=https://github.com/Killermops27/dv-ai-traffic/issues][b]Report a Bug[/b][/url] • [url=https://www.nexusmods.com/derailvalley/mods/1685][b]Nexus Mods #1685[/b][/url]
+[url=https://github.com/Killermops27/dv-ai-traffic][b]GitHub Repository[/b][/url] • [url=https://github.com/Killermops27/dv-ai-traffic/releases/tag/v0.2.4][b]Latest Release[/b][/url] • [url=https://github.com/Killermops27/dv-ai-traffic/issues][b]Report a Bug[/b][/url] • [url=https://www.nexusmods.com/derailvalley/mods/1685][b]Nexus Mods #1685[/b][/url]
 [/center]
 
 [hr]
@@ -16,19 +16,14 @@ If you find reproducible bugs, please report them on our [url=https://github.com
 
 [hr]
 
-[size=4][b][color=#FFB833]✦ What's New in Version 0.2.3[/color][/b][/size]
+[size=4][b][color=#FFB833]✦ What's New in Version 0.2.4[/color][/b][/size]
 
 [list]
-[*][b]DVSignals Remote Controller Keep-Alive:[/b] Added a Harmony postfix keeping signal controllers awake within 1500m of approaching AI trains even when far from the player camera. Eliminates dormant signals freezing on clear aspects.
-[*][b]Double Track Crossover & Mirrored Mast Support:[/b] Detects inverted mast scale on Double Track crossovers and negates the facing vector, ensuring AI trains read the correct governing signals on mirrored masts.
-[*][b]Signal Route Verification & False Green Rejection:[/b] AI engineers verify upcoming switches in the signal's block are physically aligned before trusting green aspects. Misaligned routes enforce an immediate 0 km/h stop line 15m before the signal until aligned.
-[*][b]Whole-Trainset Switch Straddle Interlocking:[/b] Evaluates entire consists across switches. If ANY car or bogie is spanning switch points, the switch is unconditionally locked against throwing, eliminating switch splits and derailments caused by collider lag.
-[*][b]Forward Angular Continuity (No Hairpin U-Turns):[/b] Pathfinder enforces vector travel continuity, strictly preventing acute-angle hairpin U-turns (> 90 degrees) across junction frogs.
-[*][b]Double-Track Stagger & Crossover Routing:[/b] Pairs staggered parallel double-track segments accurately and penalizes unnecessary zigzagging across crossovers ([i]CX[/i], [i]Cross[/i], [i]Xing[/i]) to maintain smooth right-hand running.
-[*][b]Ambient Reverser Locking & Dynamic Off-Route Recovery:[/b] Ambient trains lock their reverser at spawn, preventing reverser flapping. If diverted off-path, trains dynamically recalculate an A* recovery route forward once the rear car clears the switch.
-[*][b]Brake Pipe Pressure Integrity:[/b] Outer uncoupled angle cocks at front and rear are automatically closed at spawn ([i]IsCockOpen = false[/i]), guaranteeing full air pressure. Coupler connections and locomotive initializations are time-sliced across frames (1 loco per frame) to eliminate spawn stutter.
-[*][b]Encounter-Driven Traffic Scheduling:[/b] Prevents ambient trains from spawning closer than 1000m to the player while biasing origins between 1000m and 3000m so trains travel toward the player for frequent mainline meets. Anti-repetition tracking remembers both recent origins and destinations. Candidate departure and arrival tracks are shuffled across spawns.
-[*][b]Tightened Encounter Despawning:[/b] Trains that have passed the player and moved beyond 1000m (outside camera view and moving away) despawn promptly to free mainline capacity.
+[*][b]Periodic Signal Wait Retry & DVSignals Wakeup:[/b] When stopped at an [i]Hp 0[/i] (Red) signal, AI trains run an automatic 20-second retry timer to re-request switch alignment and wake DVSignals controllers to re-evaluate downstream blocks, preventing trains from being stranded indefinitely when blocks clear.
+[*][b]Prototype Consist Cuts & Unit Trains:[/b] Bulk freight (Coal, Ore, Crude Oil) has a 60% probability (35% for general freight) of spawning as a dedicated homogeneous unit train. Mixed freight rakes generate cars in realistic matching cuts/blocks of 2–4 wagons (shunter) or 3–6 wagons (regional/mainline) rather than random single-car clown trains.
+[*][b]Spawner Head-On Safety Interlock:[/b] Analyzes candidate spawn tracks and initial 6 departure waypoints against player location, rejecting spawns within 800m of the player or heading directly toward an oncoming player within 1400m to eliminate head-on conflicts on long yard ladders (e.g. Harbor D/G).
+[*][b]City South & Forest South Scheduled Corridors:[/b] Timetabled corridors expanded to include City South ([i]CS[/i]) and Forest South ([i]FS[/i]/[i]FRS[/i]) connections to Harbor, Steel Mill, Sawmill, and Machine Factory, with precision station alias disambiguation.
+[*][b]Terminus Arrival Tracking & Safe Clearance Despawning:[/b] AI Engineer records the exact arrival timestamp ([i]TerminusArrivalTime[/i]) upon reaching terminus tracks, ensuring completed ambient trains remain parked safely in yards until the player has physically moved beyond clearance distance.
 [/list]
 
 [hr]
@@ -57,9 +52,12 @@ If you find reproducible bugs, please report them on our [url=https://github.com
 [b][color=#55DD55]3. Signaling, Corridor Holding & Safety Interlocking[/color][/b]
 [list]
 [*][b]DVSignals Integration & Remote Keep-Alive:[/b] Evaluates physical signal aspects, block reservations, and headway control down to 0m stop lines, keeping distant signal controllers active within 1500m of AI trains.
+[*][b]Periodic Signal Wait Retry:[/b] Automatically re-requests switch alignment and wakes DVSignals controllers every 20s when halted at red signals.
+[*][b]Double Track Crossover & Mirrored Mast Support:[/b] Automatically accounts for inverted mast scales on Double Track crossovers, correctly resolving governing signal aspects across mirrored masts.
+[*][b]False Green Rejection:[/b] AI engineers verify that upcoming switches within a signal's governing block are physically aligned before trusting a green aspect. Misaligned routes enforce an immediate 0 km/h stop line 15m before the signal.
+[*][b]Whole-Trainset Switch Straddle Interlocking:[/b] Switches are strictly locked against throwing while any car body or bogie in a consist is physically straddling switch points.
 [*][b]Single-Track Corridor Protection:[/b] Evaluates single-track corridors ahead of passing loops. Holds safely inside passing sidings outside the switch fouling envelope (45m buffer) until the corridor clears.
 [*][b]Direction-Aware Corridor Arbitration:[/b] Distinguishes opposing trains from same-direction followers, allowing consecutive trains to proceed smoothly without deadlock.
-[*][b]Anti-Split Switch & Bogie Interlocking:[/b] Switches are strictly locked against throwing while any railcar body or bogie is physically straddling switch points.
 [*][b]Ride-Along Mode:[/b] Ride along as a passenger in an AI train cab or nearby track without triggering occupancy stop sensors.
 [/list]
 
@@ -68,7 +66,6 @@ If you find reproducible bugs, please report them on our [url=https://github.com
 [*][b]Frame-Cached Snapshot Occupancy:[/b] Evaluates track occupancy in under 3ms via O(1) frame snapshots, eliminating lag spikes.
 [*][b]True Time-Sliced Ambient Spawning:[/b] Ambient train cars instantiate one car per frame across 15–25 frames, completely eliminating main-thread freezes.
 [*][b]Station Wake-Up & Yard Persistence:[/b] Approaching AI trains (~1200m) dynamically activate destination yards without despawning jobs or existing rolling stock.
-[*][b]Dynamic Cargo Consists:[/b] Ambient freight rakes spawn loaded with industry-appropriate cargo types rather than empty wagons.
 [/list]
 
 [hr]
@@ -112,7 +109,7 @@ If you find reproducible bugs, please report them on our [url=https://github.com
 
 [size=4][b][color=#FFB833]✦ Installation[/color][/b][/size]
 
-1. Download [b]AITraffic-v0.2.3.zip[/b] from the Files tab.
+1. Download [b]AITraffic-v0.2.4.zip[/b] from the Files tab.
 2. Drag and drop the archive directly into the Unity Mod Manager [b]Mods[/b] tab, OR extract into your [i]Derail Valley/Mods/[/i] folder so that [i]Info.json[/i] is at [i]Derail Valley/Mods/AITraffic/Info.json[/i].
 3. Start Derail Valley and verify that [b]AI Traffic[/b], [b]DVSignals[/b], and [b]CommsRadioAPI[/b] show green status lights in UMM ([b]Ctrl + F10[/b]).
 

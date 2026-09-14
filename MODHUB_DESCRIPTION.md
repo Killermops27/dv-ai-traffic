@@ -5,7 +5,7 @@
 [![Requires: DVSignals](https://img.shields.io/badge/Requires-DVSignals-green.svg)](https://github.com/WhistleWiz/dv-signals)
 [![Requires: CommsRadioAPI](https://img.shields.io/badge/Requires-CommsRadioAPI-purple.svg)](https://github.com/Killermops27/dv-ai-traffic)
 [![Compatible: ZCouplers](https://img.shields.io/badge/Compatible-ZCouplers-blueviolet.svg)](https://www.nexusmods.com/derailvalley/mods/813)
-[![Latest Release: v0.2.3](https://img.shields.io/badge/Release-v0.2.3-brightgreen.svg)](https://github.com/Killermops27/dv-ai-traffic/releases/tag/v0.2.3)
+[![Latest Release: v0.2.4](https://img.shields.io/badge/Release-v0.2.4-brightgreen.svg)](https://github.com/Killermops27/dv-ai-traffic/releases/tag/v0.2.4)
 [![Nexus Mods](https://img.shields.io/badge/Nexus%20Mods-1685-orange.svg)](https://www.nexusmods.com/derailvalley/mods/1685)
 
 An autonomous AI train traffic, timetable dispatching, and player-employed AI worker system for **Derail Valley**, bringing the railway network to life with schedule-driven freight, passenger, shunting, and haulage movements.
@@ -22,18 +22,13 @@ An autonomous AI train traffic, timetable dispatching, and player-employed AI wo
 
 ---
 
-## 🌟 What's New in v0.2.3
+## 🌟 What's New in v0.2.4
 
-- 🚦 **DVSignals Remote Controller Keep-Alive:** Implemented a Harmony postfix on `BasicSignalController.ShouldUpdate` ensuring signal controllers evaluate block occupancy and physical signal aspects when AI trains approach within 1500m, even when far from the player camera. Eliminates dormant signals freezing on clear aspects.
-- 🔀 **Double Track Crossover & Mirrored Mast Resolution:** Detects inverted mast localScale (`transform.localScale.z < 0`) applied on Double Track crossovers, correctly negating the facing vector so trains read the correct governing signals on mirrored masts.
-- 🛡️ **Signal Route Verification & False Green Protection:** If a signal displays green but upcoming switches within its block are not yet aligned (e.g. held by another train or player), the AI engineer flags the signal as untrustworthy and enforces a 0 km/h stop line 15m before the signal until switches are aligned and locked.
-- 🔀 **Whole-Trainset Switch Straddle Interlocking:** JunctionController evaluates entire consists across `inBranch` and all `outBranches`. If ANY car or bogie is spanning switch points, the switch is unconditionally locked against throwing, eliminating switch splits and derailments caused by collider lag.
-- 📐 **Forward Angular Continuity:** Enforces vector travel continuity (`alignment <= 0.0f`), strictly eliminating acute-angle hairpin U-turns (> 90 degrees) across junction frogs.
-- 🛤️ **Double-Track Stagger & Crossover Routing:** Pairs staggered parallel double-track segments accurately and penalizes unnecessary zigzagging across mainline crossovers (`CX`, `Cross`, `Xing`) to maintain smooth right-hand running.
-- 🧠 **Ambient Reverser Locking & Dynamic Off-Route Recovery:** Ambient trains lock their reverser at spawn, preventing reverser flapping. If an ambient train is diverted off-path, it dynamically recalculates an A* recovery route forward to its destination or a safe siding once the rear car clears the switch.
-- 💨 **Brake Pipe Pressure Integrity:** Outer uncoupled angle cocks at front and rear are automatically closed at spawn (`IsCockOpen = false`), guaranteeing full air pressure. Coupler connections and locomotive initializations are time-sliced across frames (1 loco per frame) to eliminate spawn stutter.
-- 🚉 **Encounter-Driven Traffic Scheduling:** Prevents ambient trains from spawning closer than 1000m to the player while biasing origins between 1000m and 3000m so trains travel toward the player for frequent mainline meets. Anti-repetition tracking remembers both recent origins and destinations. Candidate departure and arrival tracks are shuffled across spawns.
-- 🧹 **Tightened Encounter Despawning:** Trains that have passed the player and moved beyond 1000m (outside camera view and moving away) despawn promptly to free mainline capacity.
+- 🚦 **Periodic Signal Wait Retry & Controller Wakeup:** When stopped at an `Hp 0` (Red) signal, AI trains run an automatic 20s retry timer to re-request switch alignment and force DVSignals controllers to re-evaluate downstream blocks, preventing trains from being stranded indefinitely when blocks clear.
+- 🚂 **Prototype Consist Cuts & Unit Trains:** Bulk freight (Coal, Ore, Crude Oil) has a 60% probability (35% for general freight) of spawning as a dedicated homogeneous unit train. Mixed freight rakes generate cars in realistic matching cuts/blocks of 2–4 wagons (shunter) or 3–6 wagons (regional/mainline) rather than random single-car clown trains.
+- 🛡️ **Spawner Head-On Safety Interlock:** Analyzes candidate spawn tracks and initial 6 departure waypoints against player location, rejecting spawns within 800m of the player or heading directly toward an oncoming player within 1400m to eliminate head-on conflicts on long yard ladders (e.g. Harbor D/G).
+- 🚉 **City South & Forest South Scheduled Corridors:** Timetabled corridors expanded to include City South (`CS`) and Forest South (`FS`/`FRS`) connections to Harbor, Steel Mill, Sawmill, and Machine Factory, with precision station alias disambiguation.
+- ⏱️ **Terminus Arrival Tracking & Safe Clearance Despawning:** AI Engineer records the exact arrival timestamp (`TerminusArrivalTime`) upon reaching terminus tracks, ensuring completed ambient trains remain parked safely in yards until the player has physically moved beyond clearance distance.
 
 ---
 
@@ -57,6 +52,7 @@ An autonomous AI train traffic, timetable dispatching, and player-employed AI wo
 
 ### 3. 🚦 Signaling, Corridor Holding & Safety Interlocking
 - **DVSignals Integration & Remote Keep-Alive:** Interacts directly with DVSignals for physical signal aspect resolution, block reservation, and headway control down to the 0m stop line, keeping distant signal controllers active within 1500m of AI trains.
+- **Periodic Signal Wait Retry:** Automatically re-requests switch alignment and wakes DVSignals controllers every 20s when halted at red signals.
 - **Double Track Crossover & Mirrored Mast Support:** Automatically accounts for inverted mast scales on Double Track crossovers, correctly resolving governing signal aspects across mirrored masts.
 - **False Green Rejection:** AI engineers verify that upcoming switches within a signal's governing block are physically aligned before trusting a green aspect. Misaligned routes enforce an immediate 0 km/h stop line 15m before the signal.
 - **Whole-Trainset Switch Straddle Interlocking:** Switches are strictly locked against throwing while any car body or bogie in a consist is physically straddling switch points.
@@ -82,7 +78,6 @@ An autonomous AI train traffic, timetable dispatching, and player-employed AI wo
 - **Brake Pipe Integrity & Staggered Spawning:** Closes outer uncoupled angle cocks at spawn and time-slices locomotive initialization (1 loco per frame) and coupler settling across frames, ensuring full air pressure with zero frame drops.
 - **Frame-Cached Snapshot Occupancy:** Evaluates track occupancy in under 3ms via O(1) frame snapshots (`BuildOccupiedTracksSnapshot()`), eliminating lag spikes.
 - **Station Wake-Up & Yard Persistence:** Approaching AI trains ($\approx 1200\text{m}$) dynamically activate destination yards without despawning jobs or existing rolling stock.
-- **Dynamic Cargo Consists:** Ambient freight rakes spawn loaded with industry-appropriate cargo types rather than empty wagons.
 
 ### 7. 🧩 Mod Compatibility
 Built with cross-mod interoperability in mind:
@@ -129,7 +124,7 @@ Built with cross-mod interoperability in mind:
 
 ## 🛠️ Installation
 
-1. Download the latest **`AITraffic-v0.2.3.zip`** from [GitHub Releases](https://github.com/Killermops27/dv-ai-traffic/releases) or [Nexus Mods](https://www.nexusmods.com/derailvalley/mods/1685).
+1. Download the latest **`AITraffic-v0.2.4.zip`** from [GitHub Releases](https://github.com/Killermops27/dv-ai-traffic/releases) or [Nexus Mods](https://www.nexusmods.com/derailvalley/mods/1685).
 2. Install via **Unity Mod Manager (UMM)**:
    - Drag and drop the downloaded `.zip` file directly into the UMM **Mods** tab, **OR**
    - Extract the `.zip` archive into your `Derail Valley/Mods/` folder so that `Info.json` is located at:

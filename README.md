@@ -43,6 +43,7 @@ An autonomous AI train traffic, timetable dispatching, and player-employed AI wo
 
 ### 3. 🚦 Signaling, Corridor Holding & Safety Interlocking
 - **DVSignals Integration & Remote Keep-Alive:** Interacts directly with [DVSignals](https://github.com/WhistleWiz/dv-signals) for block reservation and aspect enforcement down to the 0m stop line. Includes a Harmony patch keeping distant signal controllers actively evaluating block occupancy within 1500m of AI trains, eliminating dormant false greens.
+- **Periodic Signal Wait Retry & Controller Wakeup:** Stopped trains at red signals run a 20s retry timer to re-request switch alignment and force DVSignals controllers to re-evaluate downstream blocks, preventing trains from being stranded indefinitely when blocks clear.
 - **Double Track Crossover & Mirrored Mast Support:** Automatically accounts for inverted mast scales on Double Track crossovers, correctly resolving governing signal aspects across mirrored masts.
 - **False Green Rejection:** AI engineers verify that upcoming switches within a signal's governing block are physically aligned before trusting a green aspect. Misaligned routes enforce an immediate 0 km/h stop line 15m before the signal.
 - **Whole-Trainset Switch Straddle Interlocking:** Evaluates entire consists across switches (`inBranch` and all `outBranches`). Switches are strictly locked against throwing while any car body or bogie is straddling switch points, preventing switch splits and derailments.
@@ -63,12 +64,14 @@ An autonomous AI train traffic, timetable dispatching, and player-employed AI wo
 - **Automatic MU Cables:** Adjacent locomotives and slug units (e.g. DE6 + DE6, DE2 + Slug) automatically couple both physical 3D Multiple Unit cables and logical control block propagators upon spawn and worker preparation, without requiring career license unlocks.
 
 ### 6. ⚡ Ambient Fleet Simulation & Yard Persistence
+- **Prototype Consist Cuts & Unit Trains:** Bulk freight (Coal, Ore, Crude Oil) has a 60% probability (35% for general freight) of spawning as a dedicated homogeneous unit train. Mixed freight rakes generate cars in realistic matching cuts/blocks of 2–4 wagons (shunter) or 3–6 wagons (regional/mainline) rather than random single-car clown trains.
+- **Spawner Head-On Safety Interlock:** Analyzes candidate spawn tracks and initial 6 departure waypoints against player location, rejecting spawns within 800m of the player or heading directly toward an oncoming player within 1400m to eliminate head-on conflicts on long yard ladders (e.g. Harbor D/G).
+- **Expanded Scheduled Corridors:** Timetabled corridors expanded to include City South (`CS`) and Forest South (`FS`/`FRS`) connections to Harbor, Steel Mill, Sawmill, and Machine Factory, with precision station alias disambiguation.
 - **Encounter-Driven Traffic Scheduling:** Prevents ambient trains from spawning closer than 1000m to the player while biasing origin stations between 1000m and 3000m to generate frequent, natural mainline meets.
 - **Origin & Destination Anti-Repetition:** Dynamically records recent origins and destinations to prevent repetitive spawn loops from identical stations.
 - **Brake Pipe Integrity & Staggered Spawning:** Closes outer uncoupled angle cocks at spawn and time-slices locomotive initialization (1 loco per frame) and coupler settling across frames, ensuring full air pressure with zero frame drops.
 - **Frame-Cached Snapshot Occupancy:** Evaluates track occupancy in under 3ms via O(1) frame snapshots (`BuildOccupiedTracksSnapshot()`), eliminating lag spikes.
 - **Station Wake-Up & Yard Persistence:** Approaching AI trains ($\approx 1200\text{m}$) dynamically activate destination yards without despawning jobs or existing rolling stock.
-- **Dynamic Cargo Consists:** Ambient freight rakes spawn loaded with industry-appropriate cargo types rather than empty wagons.
 
 ### 7. 🧩 Mod Compatibility
 Built with cross-mod interoperability in mind:
@@ -115,7 +118,7 @@ Built with cross-mod interoperability in mind:
 
 ## 🛠️ Installation
 
-1. Download the latest **`AITraffic-v0.2.3.zip`** from the **[Releases](https://github.com/Killermops27/dv-ai-traffic/releases)** section or **[Nexus Mods](https://www.nexusmods.com/derailvalley/mods/1685)**.
+1. Download the latest **`AITraffic-v0.2.4.zip`** from the **[Releases](https://github.com/Killermops27/dv-ai-traffic/releases)** section or **[Nexus Mods](https://www.nexusmods.com/derailvalley/mods/1685)**.
 2. Install via **Unity Mod Manager (UMM)**:
    - Drag and drop the downloaded `.zip` file directly into the UMM **Mods** tab, **OR**
    - Extract the `.zip` archive into your `Derail Valley/Mods/` folder so that `Info.json` is located at:
