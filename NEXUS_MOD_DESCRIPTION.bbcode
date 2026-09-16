@@ -1,8 +1,8 @@
 [center][size=5][b][color=#FFB833]Derail Valley AI Traffic (AITraffic)[/color][/b][/size]
 [size=3][i]Autonomous AI Train Traffic, Timetable Dispatching & Player-Employed AI Workers[/i][/size]
-[size=2]Author: [b]Killermops27[/b] | Version: [b][color=#55DD55]0.2.4 (Alpha)[/color][/b][/size]
+[size=2]Author: [b]Killermops27[/b] | Version: [b][color=#55DD55]0.2.5 (Alpha)[/color][/b][/size]
 
-[url=https://github.com/Killermops27/dv-ai-traffic][b]GitHub Repository[/b][/url] • [url=https://github.com/Killermops27/dv-ai-traffic/releases/tag/v0.2.4][b]Latest Release[/b][/url] • [url=https://github.com/Killermops27/dv-ai-traffic/issues][b]Report a Bug[/b][/url] • [url=https://www.nexusmods.com/derailvalley/mods/1685][b]Nexus Mods #1685[/b][/url]
+[url=https://github.com/Killermops27/dv-ai-traffic][b]GitHub Repository[/b][/url] • [url=https://github.com/Killermops27/dv-ai-traffic/releases/tag/v0.2.5][b]Latest Release[/b][/url] • [url=https://github.com/Killermops27/dv-ai-traffic/issues][b]Report a Bug[/b][/url] • [url=https://www.nexusmods.com/derailvalley/mods/1685][b]Nexus Mods #1685[/b][/url]
 [/center]
 
 [hr]
@@ -16,14 +16,16 @@ If you find reproducible bugs, please report them on our [url=https://github.com
 
 [hr]
 
-[size=4][b][color=#FFB833]✦ What's New in Version 0.2.4[/color][/b][/size]
+[size=4][b][color=#FFB833]✦ What's New in Version 0.2.5[/color][/b][/size]
 
 [list]
-[*][b]Periodic Signal Wait Retry & DVSignals Wakeup:[/b] When stopped at an [i]Hp 0[/i] (Red) signal, AI trains run an automatic 20-second retry timer to re-request switch alignment and wake DVSignals controllers to re-evaluate downstream blocks, preventing trains from being stranded indefinitely when blocks clear.
-[*][b]Prototype Consist Cuts & Unit Trains:[/b] Bulk freight (Coal, Ore, Crude Oil) has a 60% probability (35% for general freight) of spawning as a dedicated homogeneous unit train. Mixed freight rakes generate cars in realistic matching cuts/blocks of 2–4 wagons (shunter) or 3–6 wagons (regional/mainline) rather than random single-car clown trains.
-[*][b]Spawner Head-On Safety Interlock:[/b] Analyzes candidate spawn tracks and initial 6 departure waypoints against player location, rejecting spawns within 800m of the player or heading directly toward an oncoming player within 1400m to eliminate head-on conflicts on long yard ladders (e.g. Harbor D/G).
-[*][b]City South & Forest South Scheduled Corridors:[/b] Timetabled corridors expanded to include City South ([i]CS[/i]) and Forest South ([i]FS[/i]/[i]FRS[/i]) connections to Harbor, Steel Mill, Sawmill, and Machine Factory, with precision station alias disambiguation.
-[*][b]Terminus Arrival Tracking & Safe Clearance Despawning:[/b] AI Engineer records the exact arrival timestamp ([i]TerminusArrivalTime[/i]) upon reaching terminus tracks, ensuring completed ambient trains remain parked safely in yards until the player has physically moved beyond clearance distance.
+[*][b]Steep Grade Hillstarts & Decoupled 2-Stage Brake Release:[/b] Evaluates physical cab throttle lever precharge scaled with grade (0.40–0.65). Vents train brake pipe first while holding independent brakes at 100%, smoothly graduating independent brakes only after positive forward tractive effort is established to prevent backward runaways on steep mountain inclines.
+[*][b]True Traction Wheel-Slip Sensing & Sander Regulation:[/b] Decouples power slip from brake skidding, enforces a 0.50 minimum throttle floor on hill starts, and applies sanders dynamically on genuine traction slip or steep grades (> 1.5%).
+[*][b]Dynamic Deadlock-Breaking Yield Inversion:[/b] Physical feasibility strictly overrides nominal priority at bottlenecks and siding throats. Stationary trains blocked by obstacles yield priority, release all junction locks, and drop DVSignals reservations, allowing unblocked clearing trains to align switches to detours and vacate the line.
+[*][b]Junction Self-Occupancy Differentiation:[/b] Switches distinguish the requesting train from external trains, eliminating false self-denials during approach while keeping points locked when bogies are directly over movable blades (<= 6.5m).
+[*][b]Interactive Encounter Trains & Passing Dispatch:[/b] Dynamically dispatches trains to pass or meet the player along active valley corridors, backed by predictive single-track deadlock conflict checking ([i]PredictDeadlockConflict[/i]).
+[*][b]Instant Spline Length Pre-Checking & Smooth Spawning:[/b] Mathematical spline length pre-check ([i]CanConsistFitOnTrack[/i]) verifies clearance before spawning; capped path searches at 8 max with 1 search/frame pacing to eliminate freezes; pre-charges brake pipes before coupling to suppress base-game warnings.
+[*][b]Performance Profiler & Vector Map Exporter (Debug):[/b] Live rolling FPS and pathfinding profiler ([b][ ⚡ Perf ][/b] HUD) and standalone interactive HTML5/SVG vector map exporter ([b]Ctrl + Shift + M[/b]).
 [/list]
 
 [hr]
@@ -45,13 +47,16 @@ If you find reproducible bugs, please report them on our [url=https://github.com
 [*][b]Closed-Loop Speed Regulation:[/b] Custom PID controllers modulate throttle, dynamic braking, and independent/train air brakes to track dynamic target velocities smoothly across varying terrain and gradients.
 [*][b]Speed Profile Calculation:[/b] Generates realistic deceleration and braking curves based on upcoming track speed limits, curves (evaluated in the 2D horizontal plane), red/yellow signal aspects, and station stopping points.
 [*][b]Powertrain Thermal Protection:[/b] Proactive throttle derating between 95°C and 105°C prevents engine explosions on steep grades; pneumatic grade anti-rollback clamp holds trains if power is lost.
-[*][b]Hill-Start Pre-Charge Sequence:[/b] Prime mover throttles up and builds tractive effort before brakes release on grades (>= 0.15%), eliminating rollback stalls.
+[*][b]Hill-Start Decoupled 2-Stage Brake Release:[/b] Precharges prime mover against cab lever, vents train brake pipe while holding independent brakes at 100%, and graduates off only under forward power.
+[*][b]True Traction Wheel-Slip Sensing:[/b] Decouples power slip from brake skidding, enforces 0.50 throttle floor on hillstarts, and applies sand on real slip or steep grades.
 [*][b]Traction Motor Over-Current Protection:[/b] Fast amperage derating (>380A) and automatic stationary fuse reset for diesel-electrics.
 [/list]
 
 [b][color=#55DD55]3. Signaling, Corridor Holding & Safety Interlocking[/color][/b]
 [list]
 [*][b]DVSignals Integration & Remote Keep-Alive:[/b] Evaluates physical signal aspects, block reservations, and headway control down to 0m stop lines, keeping distant signal controllers active within 1500m of AI trains.
+[*][b]Dynamic Deadlock-Breaking Yield Inversion:[/b] Physical feasibility strictly overrides nominal priority at bottlenecks. Blocked stationary trains yield priority and drop locks, allowing clearing trains to align detours and vacate bottlenecks.
+[*][b]Junction Self-Occupancy Differentiation:[/b] Switches distinguish requester train from external trains, eliminating false self-denials during approach while keeping points locked when bogies are over points.
 [*][b]Periodic Signal Wait Retry:[/b] Automatically re-requests switch alignment and wakes DVSignals controllers every 20s when halted at red signals.
 [*][b]Double Track Crossover & Mirrored Mast Support:[/b] Automatically accounts for inverted mast scales on Double Track crossovers, correctly resolving governing signal aspects across mirrored masts.
 [*][b]False Green Rejection:[/b] AI engineers verify that upcoming switches within a signal's governing block are physically aligned before trusting a green aspect. Misaligned routes enforce an immediate 0 km/h stop line 15m before the signal.
@@ -63,8 +68,11 @@ If you find reproducible bugs, please report them on our [url=https://github.com
 
 [b][color=#55DD55]4. Ambient Fleet Simulation & Yard Persistence[/color][/b]
 [list]
+[*][b]Interactive Encounter Trains & Passing Dispatch:[/b] Dynamically schedules meets and passing trains along active valley routes with predictive single-track conflict checking.
+[*][b]Strict Passing Loop Yard Exclusion:[/b] Industrial yard storage tracks ([i][Y][/i]) are strictly excluded from candidate passing loops, preventing trains from dodging into yard ladders.
+[*][b]Instant Spline Length Pre-Checking:[/b] Mathematically checks consist length against track splines (<0.05ms) before instantiation, eliminating freezes and oversized spawns.
+[*][b]Prototype Consist Cuts & Unit Trains:[/b] Bulk commodities spawn as dedicated unit trains (60% probability) and general freight groups cars into realistic blocks of 2–6 cars.
 [*][b]Frame-Cached Snapshot Occupancy:[/b] Evaluates track occupancy in under 3ms via O(1) frame snapshots, eliminating lag spikes.
-[*][b]True Time-Sliced Ambient Spawning:[/b] Ambient train cars instantiate one car per frame across 15–25 frames, completely eliminating main-thread freezes.
 [*][b]Station Wake-Up & Yard Persistence:[/b] Approaching AI trains (~1200m) dynamically activate destination yards without despawning jobs or existing rolling stock.
 [/list]
 
@@ -86,6 +94,7 @@ If you find reproducible bugs, please report them on our [url=https://github.com
 [*]Toggle [b]Debug HUD[/b] to view live train telemetry, target speeds, and limiting factors.
 [*]Toggle [b][ 3D Locos ][/b] to display overhead floating tags.
 [*]Toggle [b][ Ride-Along ][/b] when riding inside AI locomotive cabs.
+[*]Toggle [b][ ⚡ Perf ][/b] in Debug HUD to view rolling FPS and pathfinding profiler metrics.
 [/list]
 
 [hr]
@@ -109,7 +118,7 @@ If you find reproducible bugs, please report them on our [url=https://github.com
 
 [size=4][b][color=#FFB833]✦ Installation[/color][/b][/size]
 
-1. Download [b]AITraffic-v0.2.4.zip[/b] from the Files tab.
+1. Download [b]AITraffic-v0.2.5.zip[/b] from the Files tab.
 2. Drag and drop the archive directly into the Unity Mod Manager [b]Mods[/b] tab, OR extract into your [i]Derail Valley/Mods/[/i] folder so that [i]Info.json[/i] is at [i]Derail Valley/Mods/AITraffic/Info.json[/i].
 3. Start Derail Valley and verify that [b]AI Traffic[/b], [b]DVSignals[/b], and [b]CommsRadioAPI[/b] show green status lights in UMM ([b]Ctrl + F10[/b]).
 

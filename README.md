@@ -37,13 +37,16 @@ An autonomous AI train traffic, timetable dispatching, and player-employed AI wo
 - **Closed-Loop Speed Regulation:** Custom PID controllers modulate throttle, dynamic braking, and independent/train air brakes to track dynamic target velocities smoothly across varying terrain and gradients.
 - **Speed Profile Calculation:** Generates realistic deceleration and braking curves based on upcoming track speed limits, curves (evaluated in the 2D horizontal plane using native Bezier arc approximations), red/yellow signal aspects, and station stopping points.
 - **Powertrain Thermal Protection & Overheating Roll-Off:** Actively tracks engine coolant and oil temperatures across all locomotives, linearly rolling off throttle between 95°C and 105°C to prevent blown prime movers on long grades.
-- **Hill-Start Pre-Charge & Grade Anti-Rollback:** On upgrades ($\ge 0.15\%$), independent and train brakes remain firmly clamped while the prime mover ramps throttle up to build launching torque before brakes graduate off. Guarantees zero backward rollback on steep mountain starts.
+- **Hill-Start Decoupled 2-Stage Brake Release:** Evaluates physical cab throttle lever precharge scaled with grade (0.40–0.65). Vents train brake pipe first while holding independent brakes at 100%, smoothly graduating independent brakes only after tractive effort is established to prevent backward runaways.
+- **True Traction Wheel-Slip Protection:** Decouples power slip from brake skidding, enforces a 0.50 minimum throttle floor on hill starts, and applies sanders dynamically on genuine traction slip or steep grades (> 1.5%).
 - **DM3 Mechanical Shunter Automation:** Specialized automatic gear-shifting controller (`DM3TransmissionController`), neutral gear-shift brake hold, and high-power fluid coupling launches.
 - **Traction Motor Over-Current Protection:** Fast amperage derating (>380A) and automatic stationary fuse reset for diesel-electrics.
 
 ### 3. 🚦 Signaling, Corridor Holding & Safety Interlocking
 - **DVSignals Integration & Remote Keep-Alive:** Interacts directly with [DVSignals](https://github.com/WhistleWiz/dv-signals) for block reservation and aspect enforcement down to the 0m stop line. Includes a Harmony patch keeping distant signal controllers actively evaluating block occupancy within 1500m of AI trains, eliminating dormant false greens.
 - **Periodic Signal Wait Retry & Controller Wakeup:** Stopped trains at red signals run a 20s retry timer to re-request switch alignment and force DVSignals controllers to re-evaluate downstream blocks, preventing trains from being stranded indefinitely when blocks clear.
+- **Dynamic Deadlock-Breaking Yield Inversion:** Physical feasibility strictly overrides nominal priority at bottlenecks and siding throats. Stationary trains blocked by obstacles yield priority, release all junction locks, and drop DVSignals reservations, allowing unblocked clearing trains to align switches to detours and vacate the line.
+- **Junction Self-Occupancy Differentiation:** Switches distinguish the requesting train from external trains, eliminating false self-denials during approach while keeping points locked when bogies are directly over movable blades (<= 6.5m).
 - **Double Track Crossover & Mirrored Mast Support:** Automatically accounts for inverted mast scales on Double Track crossovers, correctly resolving governing signal aspects across mirrored masts.
 - **False Green Rejection:** AI engineers verify that upcoming switches within a signal's governing block are physically aligned before trusting a green aspect. Misaligned routes enforce an immediate 0 km/h stop line 15m before the signal.
 - **Whole-Trainset Switch Straddle Interlocking:** Evaluates entire consists across switches (`inBranch` and all `outBranches`). Switches are strictly locked against throwing while any car body or bogie is straddling switch points, preventing switch splits and derailments.
@@ -64,16 +67,22 @@ An autonomous AI train traffic, timetable dispatching, and player-employed AI wo
 - **Automatic MU Cables:** Adjacent locomotives and slug units (e.g. DE6 + DE6, DE2 + Slug) automatically couple both physical 3D Multiple Unit cables and logical control block propagators upon spawn and worker preparation, without requiring career license unlocks.
 
 ### 6. ⚡ Ambient Fleet Simulation & Yard Persistence
+- **Interactive Encounter Trains & Passing Dispatch:** Dynamically dispatches trains to pass or meet the player along active valley corridors, backed by predictive single-track deadlock conflict checking (`PredictDeadlockConflict`).
+- **Strict Passing Loop Yard Exclusion:** Industrial yard storage tracks (`[Y]`) are strictly excluded from candidate passing loops (`IsDedicatedPassingLoopTrack`), preventing passing trains from diverting into active yard ladders.
+- **Instant Spline Length Pre-Checking:** Evaluates consist lengths against departure track splines mathematically in under 0.05ms (`CanConsistFitOnTrack`) before attempting physical instantiation, preventing oversized spawns and path search lockups.
+- **Expanded Valley & Mining Corridors:** Timetabled corridors expanded to include Iron Mine East (`IME`), Coal Mine East (`CME`), Coal Mine (`CM`), City South (`CS`), and Forest South (`FS`/`FRS`) with precision station alias disambiguation.
 - **Prototype Consist Cuts & Unit Trains:** Bulk freight (Coal, Ore, Crude Oil) has a 60% probability (35% for general freight) of spawning as a dedicated homogeneous unit train. Mixed freight rakes generate cars in realistic matching cuts/blocks of 2–4 wagons (shunter) or 3–6 wagons (regional/mainline) rather than random single-car clown trains.
 - **Spawner Head-On Safety Interlock:** Analyzes candidate spawn tracks and initial 6 departure waypoints against player location, rejecting spawns within 800m of the player or heading directly toward an oncoming player within 1400m to eliminate head-on conflicts on long yard ladders (e.g. Harbor D/G).
-- **Expanded Scheduled Corridors:** Timetabled corridors expanded to include City South (`CS`) and Forest South (`FS`/`FRS`) connections to Harbor, Steel Mill, Sawmill, and Machine Factory, with precision station alias disambiguation.
-- **Encounter-Driven Traffic Scheduling:** Prevents ambient trains from spawning closer than 1000m to the player while biasing origin stations between 1000m and 3000m to generate frequent, natural mainline meets.
 - **Origin & Destination Anti-Repetition:** Dynamically records recent origins and destinations to prevent repetitive spawn loops from identical stations.
-- **Brake Pipe Integrity & Staggered Spawning:** Closes outer uncoupled angle cocks at spawn and time-slices locomotive initialization (1 loco per frame) and coupler settling across frames, ensuring full air pressure with zero frame drops.
+- **Brake Pipe Integrity & Staggered Spawning:** Pre-charges brake pipe before coupling to eliminate multiple-car brakeset warnings, closes outer angle cocks, and time-slices car instantiation across frames.
 - **Frame-Cached Snapshot Occupancy:** Evaluates track occupancy in under 3ms via O(1) frame snapshots (`BuildOccupiedTracksSnapshot()`), eliminating lag spikes.
 - **Station Wake-Up & Yard Persistence:** Approaching AI trains ($\approx 1200\text{m}$) dynamically activate destination yards without despawning jobs or existing rolling stock.
 
-### 7. 🧩 Mod Compatibility
+### 7. 🛠️ Diagnostics & Interactive Vector Map (Debug)
+- **Live Performance Profiler (`PerformanceProfiler`):** Tracks rolling FPS, A* path search durations, explored node counts, slow search detections, and consist spawn timings, toggleable via `[ ⚡ Perf ]` in the Debug HUD.
+- **Desktop Topology Vector Map Exporter (`TopologyMapExporter`):** Press <kbd>Ctrl</kbd> + <kbd>Shift</kbd> + <kbd>M</kbd> in Debug mode to export an interactive HTML5/SVG vector map of Derail Valley's entire rail network directly to your Desktop.
+
+### 8. 🧩 Mod Compatibility
 Built with cross-mod interoperability in mind:
 - **DVSignals** *(Required)* – Signaling and block protection.
 - **CommsRadioAPI** *(Required)* – Diegetic Comms Radio dispatch mode.
@@ -118,7 +127,7 @@ Built with cross-mod interoperability in mind:
 
 ## 🛠️ Installation
 
-1. Download the latest **`AITraffic-v0.2.4.zip`** from the **[Releases](https://github.com/Killermops27/dv-ai-traffic/releases)** section or **[Nexus Mods](https://www.nexusmods.com/derailvalley/mods/1685)**.
+1. Download the latest **`AITraffic-v0.2.5.zip`** from the **[Releases](https://github.com/Killermops27/dv-ai-traffic/releases)** section or **[Nexus Mods](https://www.nexusmods.com/derailvalley/mods/1685)**.
 2. Install via **Unity Mod Manager (UMM)**:
    - Drag and drop the downloaded `.zip` file directly into the UMM **Mods** tab, **OR**
    - Extract the `.zip` archive into your `Derail Valley/Mods/` folder so that `Info.json` is located at:
