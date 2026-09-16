@@ -293,33 +293,34 @@ namespace AITraffic.Compat
                 DV.Logic.Job.Track logicTrack = GetLogicTrack(track);
                 if (logicTrack != null && logicTrack.ID != null)
                 {
-                    string part = logicTrack.ID.TrackPartOnly;
+                    string part = logicTrack.ID.TrackPartOnly ?? "";
                     string display = logicTrack.ID.FullDisplayID ?? "";
 
-                    // Mainline [#], Inbound [I], Passenger [P], and Passing [S] are NEVER blocked as active yard zones
-                    if (part == DV.Logic.Job.TrackID.MAIN_LINE_TYPE || display.Contains("[#]") ||
-                        part == DV.Logic.Job.TrackID.REGULAR_IN_TYPE || display.Contains("[I]") ||
-                        part == DV.Logic.Job.TrackID.STORAGE_PASSENGER_TYPE || display.Contains("[P]") ||
-                        part == DV.Logic.Job.TrackID.STORAGE_TYPE || display.Contains("[S]"))
+                    // Mainline [#], Inbound [I], Passenger [P], and Passing/Storage [S] are NEVER blocked as active yard zones
+                    if (part.EndsWith(DV.Logic.Job.TrackID.MAIN_LINE_TYPE, StringComparison.OrdinalIgnoreCase) || display.Contains("[#]") ||
+                        part.EndsWith(DV.Logic.Job.TrackID.REGULAR_IN_TYPE, StringComparison.OrdinalIgnoreCase) || display.EndsWith("I", StringComparison.OrdinalIgnoreCase) ||
+                        part.EndsWith(DV.Logic.Job.TrackID.STORAGE_PASSENGER_TYPE, StringComparison.OrdinalIgnoreCase) || display.EndsWith("P", StringComparison.OrdinalIgnoreCase) ||
+                        part.EndsWith(DV.Logic.Job.TrackID.STORAGE_TYPE, StringComparison.OrdinalIgnoreCase) || display.EndsWith("S", StringComparison.OrdinalIgnoreCase))
                     {
                         return false;
                     }
 
-                    // Warehouse loading tracks [L] and internal classification tracks [Y] are active yard zones
-                    if (part == DV.Logic.Job.TrackID.LOADING_TYPE || display.StartsWith("[Y]") || display.StartsWith("[L]"))
+                    // Warehouse loading tracks [L] are active yard zones
+                    if (part.EndsWith(DV.Logic.Job.TrackID.LOADING_TYPE, StringComparison.OrdinalIgnoreCase) || display.EndsWith("L", StringComparison.OrdinalIgnoreCase) || display.StartsWith("[L]"))
                     {
                         return true;
                     }
                 }
 
                 string trackName = track.name ?? string.Empty;
-                if (trackName.Contains("[#]") || trackName.Contains("[I]") || trackName.Contains("[P]") || trackName.Contains("[S]"))
+                string lower = trackName.ToLowerInvariant();
+                if (lower.Contains("[#]") || lower.Contains("-i]") || lower.Contains("-p]") || lower.Contains("-s]") || lower.Contains("-m]") ||
+                    lower.Contains("[i]") || lower.Contains("[p]") || lower.Contains("[s]"))
                 {
                     return false;
                 }
 
-                if (trackName.StartsWith("[L]", StringComparison.OrdinalIgnoreCase) ||
-                    trackName.StartsWith("[Y]", StringComparison.OrdinalIgnoreCase))
+                if (lower.Contains("-l]") || lower.StartsWith("[l]"))
                 {
                     return true;
                 }

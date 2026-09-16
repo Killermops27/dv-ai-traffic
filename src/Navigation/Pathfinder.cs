@@ -132,6 +132,32 @@ namespace AITraffic.Navigation
             PreferSpeedOverDistance = true;
             MaxSearchDistance = 5000000f;
         }
+
+        public PathfinderOptions Clone()
+        {
+            return new PathfinderOptions
+            {
+                AllowWrongDirection = this.AllowWrongDirection,
+                WrongDirectionFlatPenalty = this.WrongDirectionFlatPenalty,
+                WrongDirectionMultiplier = this.WrongDirectionMultiplier,
+                AvoidOccupiedTracks = this.AvoidOccupiedTracks,
+                OccupiedTrackPenalty = this.OccupiedTrackPenalty,
+                StrictlyAvoidOccupied = this.StrictlyAvoidOccupied,
+                AvoidReservedTracks = this.AvoidReservedTracks,
+                ReservedTrackPenalty = this.ReservedTrackPenalty,
+                StrictlyAvoidReserved = this.StrictlyAvoidReserved,
+                PreventPlayerOvertake = this.PreventPlayerOvertake,
+                Requester = this.Requester,
+                RequesterTrainset = this.RequesterTrainset,
+                ExcludedTracks = this.ExcludedTracks != null ? new HashSet<RailTrack>(this.ExcludedTracks) : null,
+                OccupiedTracksSnapshot = this.OccupiedTracksSnapshot,
+                TurnoutDivergingPenalty = this.TurnoutDivergingPenalty,
+                CrossoverPenalty = this.CrossoverPenalty,
+                YardTrackPenaltyPerMeter = this.YardTrackPenaltyPerMeter,
+                PreferSpeedOverDistance = this.PreferSpeedOverDistance,
+                MaxSearchDistance = this.MaxSearchDistance
+            };
+        }
     }
 
     /// <summary>
@@ -358,18 +384,89 @@ namespace AITraffic.Navigation
 
         /// <summary>
         /// Finds the shortest route from start track to destination track searching both forward and reverse headings.
+        /// Optimizes search by inspecting dead ends, preferring the direction pointing towards destination,
+        /// skipping opposing search if a direct route is found, and bounding reverse distance to the primary route length.
         /// </summary>
         public RailPath FindPath(RailTrack startTrack, RailTrack destinationTrack, PathfinderOptions options)
         {
             if (startTrack == null || destinationTrack == null) return null;
 
-            var pathForward = FindPath(startTrack, destinationTrack, true, options);
-            var pathReverse = FindPath(startTrack, destinationTrack, false, options);
+            if (!_graph.IsInitialized)
+            {
+                _graph.Initialize();
+            }
 
-            if (pathForward == null) return pathReverse;
-            if (pathReverse == null) return pathForward;
+            var startEdge = _graph.GetEdge(startTrack);
+            var destEdge = _graph.GetEdge(destinationTrack);
 
-            return pathForward.TotalDistance <= pathReverse.TotalDistance ? pathForward : pathReverse;
+            if (startEdge == null || destEdge == null)
+            {
+                return null;
+            }
+
+            if (startTrack == destinationTrack)
+            {
+                return CreateSingleTrackPath(startEdge);
+            }
+
+            options = options ?? PathfinderOptions.Default;
+
+            // 1. Dead-end check: Buffer stops / dead ends cannot be exited
+            bool toNodeDeadEnd = startEdge.ToNode != null && startEdge.ToNode.IsDeadEnd;
+            bool fromNodeDeadEnd = startEdge.FromNode != null && startEdge.FromNode.IsDeadEnd;
+
+            if (toNodeDeadEnd && fromNodeDeadEnd)
+            {
+                // Isolated track with dead ends on both sides
+                return null;
+            }
+            if (toNodeDeadEnd)
+            {
+                // Forward departure reaches buffer stop, search reverse only
+                return FindPath(startTrack, destinationTrack, false, options);
+            }
+            if (fromNodeDeadEnd)
+            {
+                // Reverse departure reaches buffer stop, search forward only
+                return FindPath(startTrack, destinationTrack, true, options);
+            }
+
+            // 2. Directional heuristic: Determine which direction faces towards destination
+            Vector3 startPos = startEdge.GetMidPoint();
+            Vector3 destPos = destEdge.GetMidPoint();
+            Vector3 trackDir = (startEdge.ToNode != null && startEdge.FromNode != null)
+                ? (startEdge.ToNode.Position - startEdge.FromNode.Position).normalized
+                : Vector3.forward;
+            Vector3 toDest = (destPos - startPos).normalized;
+            bool searchForwardFirst = Vector3.Dot(trackDir, toDest) >= 0f;
+
+            // Execute primary search in preferred direction
+            var primaryPath = FindPath(startTrack, destinationTrack, searchForwardFirst, options);
+
+            // 3. Early skip: If primary path is reasonably direct, opposing departure is guaranteed to be a huge detour
+            float straightDist = Vector3.Distance(startPos, destPos);
+            if (primaryPath != null && primaryPath.IsValid)
+            {
+                if (primaryPath.TotalDistance <= Math.Max(1000f, straightDist * 1.5f))
+                {
+                    return primaryPath;
+                }
+            }
+
+            // 4. Bounded secondary search: Bound MaxSearchDistance by primary route distance so it aborts early if worse
+            PathfinderOptions secondaryOptions = options;
+            if (primaryPath != null && primaryPath.IsValid && primaryPath.TotalDistance < options.MaxSearchDistance)
+            {
+                secondaryOptions = options.Clone();
+                secondaryOptions.MaxSearchDistance = primaryPath.TotalDistance;
+            }
+
+            var secondaryPath = FindPath(startTrack, destinationTrack, !searchForwardFirst, secondaryOptions);
+
+            if (primaryPath == null) return secondaryPath;
+            if (secondaryPath == null) return primaryPath;
+
+            return primaryPath.TotalDistance <= secondaryPath.TotalDistance ? primaryPath : secondaryPath;
         }
 
         /// <summary>
@@ -565,6 +662,10 @@ namespace AITraffic.Navigation
             _nodeBestCost.Clear();
             var nodeBestCost = _nodeBestCost;
 
+#if DEBUG
+            var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+#endif
+
             // Pre-index requester's own cars into a HashSet<RailTrack> for O(1) checks during A*
             HashSet<RailTrack> requesterTracks = null;
             if (options.RequesterTrainset != null && options.RequesterTrainset.cars != null)
@@ -687,6 +788,20 @@ namespace AITraffic.Navigation
                 }
             }
 
+#if DEBUG
+            stopwatch.Stop();
+            long searchDurationMs = stopwatch.ElapsedMilliseconds;
+            string startTrackName = initialEdge != null && initialEdge.Track != null ? initialEdge.Track.name : "null";
+            string destTrackName = destEdge != null && destEdge.Track != null ? destEdge.Track.name : "null";
+            AITraffic.Diagnostics.PerformanceProfiler.RecordPathSearch(searchDurationMs, exploredNodes, startTrackName, destTrackName, goalNode != null);
+
+            if (searchDurationMs > 15 && AITraffic.Main.ModEntry != null && AITraffic.Main.ModEntry.Logger != null)
+            {
+                AITraffic.Main.ModEntry.Logger.Log(string.Format("[AITraffic-Perf] SLOW PathSearch: {0}ms ({1} nodes explored) '{2}' -> '{3}' (Found: {4})",
+                    searchDurationMs, exploredNodes, startTrackName, destTrackName, goalNode != null));
+            }
+#endif
+
             if (goalNode == null)
             {
                 if (AITraffic.Main.ModEntry != null && AITraffic.Main.ModEntry.Logger != null)
@@ -803,6 +918,12 @@ namespace AITraffic.Navigation
 
             string trackName = edge.Track.name ?? string.Empty;
 
+            // Station Ladders, Passing Sidings & Industrial Yard Handling:
+            Vector3 edgeMid = edge.GetMidPoint();
+            bool isApproachingDest = (destEdge != null && Vector3.Distance(edgeMid, destEdge.GetMidPoint()) < 2500f);
+            bool isLeavingOrigin = (initialEdge != null && Vector3.Distance(edgeMid, initialEdge.GetMidPoint()) < 2500f);
+            bool isImmediateLadder = isApproachingDest || isLeavingOrigin;
+
             // City West (CW / CSW) Station Avoidance:
             // City West contains dead-end passenger terminals and tight yard ladders.
             // Trains traveling across the valley MUST use the mainline bypass (DT-CWNAA, DT-CWSAA, or mainline bypass)
@@ -812,7 +933,7 @@ namespace AITraffic.Navigation
                              trackName.IndexOf("CityWest", StringComparison.OrdinalIgnoreCase) >= 0 ||
                              trackName.IndexOf("CitySouthWest", StringComparison.OrdinalIgnoreCase) >= 0;
 
-            if (isCWTrack && !isStartOrDest)
+            if (isCWTrack && !isStartOrDest && !isImmediateLadder)
             {
                 bool isBypass = trackName.IndexOf("DT-CWNAA", StringComparison.OrdinalIgnoreCase) >= 0 ||
                                 trackName.IndexOf("DT-CWSAA", StringComparison.OrdinalIgnoreCase) >= 0 ||
@@ -825,12 +946,6 @@ namespace AITraffic.Navigation
                     cost += 500000f;
                 }
             }
-
-            // Station Ladders, Passing Sidings & Industrial Yard Handling:
-            Vector3 edgeMid = edge.GetMidPoint();
-            bool isApproachingDest = (destEdge != null && Vector3.Distance(edgeMid, destEdge.GetMidPoint()) < 350f);
-            bool isLeavingOrigin = (initialEdge != null && Vector3.Distance(edgeMid, initialEdge.GetMidPoint()) < 350f);
-            bool isImmediateLadder = isApproachingDest || isLeavingOrigin;
 
             // Passing loops and sidings [S]: valid secondary through-tracks.
             // Apply a modest preference penalty (+350m) when not approaching origin/destination,
@@ -1110,11 +1225,15 @@ namespace AITraffic.Navigation
                 tName.IndexOf("Loop", StringComparison.OrdinalIgnoreCase) >= 0 ||
                 tName.IndexOf("Pass", StringComparison.OrdinalIgnoreCase) >= 0)
             {
-                // Ensure it's not actually an industrial storage [Y], loading [L], or transfer track
-                if (!tName.StartsWith("[Y]", StringComparison.OrdinalIgnoreCase) &&
-                    !tName.StartsWith("[L]", StringComparison.OrdinalIgnoreCase) &&
+                // Ensure it's not actually an industrial loading [L], caboose [C], or transfer track [I]/[O],
+                // but ALLOW station passing sidings (e.g. [Y]_[GF]_[B-01-S] or [Y]_[HB]_[D-01-S])
+                if (!tName.StartsWith("[L]", StringComparison.OrdinalIgnoreCase) &&
                     !tName.StartsWith("[I]", StringComparison.OrdinalIgnoreCase) &&
-                    !tName.StartsWith("[O]", StringComparison.OrdinalIgnoreCase))
+                    !tName.StartsWith("[O]", StringComparison.OrdinalIgnoreCase) &&
+                    !tName.EndsWith("-L]", StringComparison.OrdinalIgnoreCase) &&
+                    !tName.EndsWith("-I]", StringComparison.OrdinalIgnoreCase) &&
+                    !tName.EndsWith("-O]", StringComparison.OrdinalIgnoreCase) &&
+                    !tName.EndsWith("-C]", StringComparison.OrdinalIgnoreCase))
                 {
                     return true;
                 }
@@ -1140,6 +1259,12 @@ namespace AITraffic.Navigation
                 tName.StartsWith("[P]", StringComparison.OrdinalIgnoreCase) ||
                 tName.IndexOf("Platform", StringComparison.OrdinalIgnoreCase) >= 0 ||
                 tName.IndexOf("Pax", StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                return false;
+            }
+
+            // Passing loops and station sidings are valid through-tracks, NOT industrial dead-end/storage traps
+            if (IsPassingOrSidingTrack(track))
             {
                 return false;
             }

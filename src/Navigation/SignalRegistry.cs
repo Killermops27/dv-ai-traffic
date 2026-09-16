@@ -342,7 +342,7 @@ namespace AITraffic.Navigation
                 return;
             }
 
-            if (!force && s_isInitialized && (Time.time - s_lastScanTime < 30f))
+            if (!force && s_isInitialized && s_trackSignals.Count > 0)
             {
                 return;
             }
@@ -756,7 +756,7 @@ namespace AITraffic.Navigation
 
             if (currentTrack == null) return false;
 
-            if (!s_isInitialized || s_trackSignals.Count == 0 || (Time.time - s_lastScanTime > 60f))
+            if (!s_isInitialized || s_trackSignals.Count == 0)
             {
                 Initialize();
             }

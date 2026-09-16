@@ -77,6 +77,7 @@ namespace AITraffic
 
                 // Initialize Rail Graph navigation network
                 RailGraph.Instance.Initialize();
+                TrafficScheduler.ClearCaches();
 
                 // Start Traffic Manager
                 TrafficManager.Instance.Settings = Settings;

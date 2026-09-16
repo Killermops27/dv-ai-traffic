@@ -43,6 +43,7 @@ namespace AITraffic.Config
         public bool RideAlongMode = false;
         public StationWakeUpMode StationWakeUp = StationWakeUpMode.WorkerTrainsOnly;
         public bool ReserveArrivalTrackFirst = true;
+        public bool MoreTrainEncounters = true;
 
         // Custom styling cache
         [NonSerialized]
@@ -203,6 +204,7 @@ namespace AITraffic.Config
                 ShowRouteVisualizer = GUILayout.Toggle(ShowRouteVisualizer, " Show 3D Route Visualization (Draws luminous 3D path line along tracks in world)");
                 ShowSignalTags = GUILayout.Toggle(ShowSignalTags, " Show 3D Signal Tags (Renders in-world floating status tags over upcoming signals)");
                 DebugVisuals = GUILayout.Toggle(DebugVisuals, " Debug Visuals (Render AI monitor, sensors and route gizmos)");
+                MoreTrainEncounters = GUILayout.Toggle(MoreTrainEncounters, " More Train Encounters (Spawns passing loop trains routed via player position)");
 
                 GUILayout.Space(12);
 

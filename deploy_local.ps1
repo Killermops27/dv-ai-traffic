@@ -3,6 +3,7 @@
     Builds and deploys AITraffic mod directly to the local Derail Valley Mods directory.
 #>
 param(
+    [string]$Configuration = "Debug",
     [switch]$NoBuild = $false
 )
 
@@ -16,23 +17,23 @@ if (-not (Test-Path $destDir)) {
 }
 
 if (-not $NoBuild) {
-    Write-Host "[Deploy] Building AITraffic in Release configuration..." -ForegroundColor Yellow
+    Write-Host "[Deploy] Building AITraffic in $Configuration configuration..." -ForegroundColor Yellow
     $msbuildPath = "C:\Windows\Microsoft.NET\Framework64\v4.0.30319\MSBuild.exe"
     if (-not (Test-Path $msbuildPath)) {
         $msbuildPath = "C:\Windows\Microsoft.NET\Framework\v4.0.30319\MSBuild.exe"
     }
 
     $csprojPath = Join-Path $scriptDir "AITraffic.csproj"
-    & $msbuildPath "$csprojPath" /p:Configuration=Release /t:Build /verbosity:minimal /nologo
+    & $msbuildPath "$csprojPath" /p:Configuration=$Configuration /t:Build /verbosity:minimal /nologo
 
     if ($LASTEXITCODE -ne 0) {
         Write-Error "Build failed with exit code $LASTEXITCODE"
     }
 }
 
-$binReleaseDir = Join-Path $scriptDir "bin\Release"
-$dllPath = Join-Path $binReleaseDir "AITraffic.dll"
-$pdbPath = Join-Path $binReleaseDir "AITraffic.pdb"
+$binDir = Join-Path $scriptDir "bin\$Configuration"
+$dllPath = Join-Path $binDir "AITraffic.dll"
+$pdbPath = Join-Path $binDir "AITraffic.pdb"
 
 if (-not (Test-Path $dllPath)) {
     Write-Error "Compiled assembly not found at $dllPath"

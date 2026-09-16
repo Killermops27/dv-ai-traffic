@@ -22,6 +22,88 @@ namespace AITraffic.Fleet
         /// </summary>
         public static bool IsSpawningAmbientConsist { get; private set; }
 
+        private static readonly Type s_couplerBreakerType = Type.GetType("ZCouplers.CouplerBreaker, ZCouplers", false);
+
+        /// <summary>
+        /// Estimates the physical length of a consist (in meters) including couplers for track suitability validation.
+        /// </summary>
+        public static float CalculateConsistLength(ConsistType consistType, string originYard = null, string destYard = null, System.Random rng = null)
+        {
+            if (rng == null) rng = new System.Random();
+            List<ConsistCarSpec> specs = ConsistDefinitions.GetConsistSpecs(consistType, originYard, destYard, rng);
+            if (specs == null || specs.Count == 0) return 100f;
+
+            List<TrainCarLivery> liveries = new List<TrainCarLivery>(specs.Count);
+            for (int i = 0; i < specs.Count; i++)
+            {
+                if (specs[i].Livery != null) liveries.Add(specs[i].Livery);
+            }
+
+            if (CarSpawner.Instance != null && liveries.Count > 0)
+            {
+                try
+                {
+                    float len = CarSpawner.Instance.GetTotalCarLiveriesLength(liveries);
+                    if (len > 0f) return len;
+                }
+                catch { }
+            }
+
+            // Fallback estimation: average 18m per car
+            return specs.Count * 18f;
+        }
+
+        /// <summary>
+        /// Instantly verifies mathematically (&lt;0.05ms) if a consist of the given liveries can physically fit
+        /// on the target track without colliding with track buffer limits.
+        /// </summary>
+        public static bool CanConsistFitOnTrack(
+            List<TrainCarLivery> liveries,
+            RailTrack track,
+            double startSpan = 15.0,
+            bool flipTrainConsist = false)
+        {
+            if (track == null || track.curve == null || liveries == null || liveries.Count == 0)
+                return false;
+
+            float totalLength = CarSpawner.Instance != null
+                ? CarSpawner.Instance.GetTotalCarLiveriesLength(liveries)
+                : 0f;
+
+            if (track.curve.length < totalLength + 20f)
+                return false;
+
+            double checkSpan = 15.0;
+            if (track.curve.length >= totalLength + 30f)
+            {
+                checkSpan = Math.Max(15.0, (track.curve.length - totalLength) * 0.5);
+            }
+
+            var orientationList = new List<bool>(liveries.Count);
+            for (int i = 0; i < liveries.Count; i++)
+            {
+                orientationList.Add(flipTrainConsist);
+            }
+
+            try
+            {
+                var spawnData = CarSpawner.GetTrackMiddleBasedSpawnData(
+                    liveries,
+                    orientationList,
+                    track,
+                    checkSpan,
+                    flipTrainConsist);
+
+                return (spawnData.result == CarSpawner.SpawnDataResult.OK &&
+                        spawnData.carData != null &&
+                        spawnData.carData.Length > 0);
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
         /// <summary>
         /// Spawns an AI train consist of the specified type on the given track, matching origin and destination industrial chains.
         /// </summary>
@@ -121,7 +203,8 @@ namespace AITraffic.Fleet
             List<ConsistCarSpec> specs,
             double startSpan = 15.0,
             bool flipTrainConsist = false,
-            Action<AIEngineer> onComplete = null)
+            Action<AIEngineer> onComplete = null,
+            ConsistType consistType = ConsistType.RegionalFreight)
         {
             if (track == null || specs == null || specs.Count == 0)
             {
@@ -143,11 +226,12 @@ namespace AITraffic.Fleet
             if (Core.TrafficManager.Instance != null)
             {
                 yield return Core.TrafficManager.Instance.StartCoroutine(
-                    SpawnAITrainInternalCoroutine(track, liveries, specs, startSpan, flipTrainConsist, onComplete));
+                    SpawnAITrainInternalCoroutine(track, liveries, specs, startSpan, flipTrainConsist, onComplete, consistType));
             }
             else
             {
                 var eng = SpawnAITrainInternal(track, liveries, specs, startSpan, flipTrainConsist);
+                if (eng != null) eng.ConsistType = consistType;
                 if (onComplete != null) onComplete(eng);
             }
         }
@@ -246,32 +330,22 @@ namespace AITraffic.Fleet
 
             if (trackLength > 0f)
             {
-                if (!flipTrainConsist)
+                if (totalConsistLength + 30f <= trackLength)
                 {
-                    // Forward travel (0 -> L): start near 0, extend towards L
-                    if (startSpan + totalConsistLength > trackLength)
-                    {
-                        if (totalConsistLength + 10f <= trackLength)
-                        {
-                            startSpan = Math.Max(5.0, (trackLength - totalConsistLength) * 0.5);
-                        }
-                    }
+                    startSpan = Math.Max(15.0, (trackLength - totalConsistLength) * 0.5);
                 }
                 else
                 {
-                    // Reverse travel (L -> 0): start near L, extend towards 0
-                    if (startSpan < totalConsistLength + 5.0 || startSpan > trackLength)
-                    {
-                        startSpan = Math.Max(totalConsistLength + 5.0, trackLength - 15.0);
-                    }
+                    startSpan = 15.0;
                 }
             }
 
-            // Build orientation list matching flipTrainConsist so locomotives and cars physically face the travel direction
+            // Base game CarSpawner.PopulateSpawnData already negates worldForward when flipTrainConsist is true.
+            // All car orientation entries must be false to avoid double-negation which would invert the locomotive backwards.
             List<bool> orientationList = new List<bool>(liveries.Count);
             for (int i = 0; i < liveries.Count; i++)
             {
-                orientationList.Add(flipTrainConsist);
+                orientationList.Add(false);
             }
 
             // Precalculate track curve placements mathematically (instantaneous, < 1ms)
@@ -303,6 +377,8 @@ namespace AITraffic.Fleet
 
             List<TrainCar> spawnedCars = new List<TrainCar>(spawnData.carData.Length);
             IsSpawningAmbientConsist = true;
+            float spawnStartTime = Time.realtimeSinceStartup;
+            AITraffic.Diagnostics.PerformanceProfiler.RecordSpawnStart(track.name, spawnData.carData.Length);
 
             try
             {
@@ -332,6 +408,7 @@ namespace AITraffic.Fleet
                     if (car != null)
                     {
                         spawnedCars.Add(car);
+                        AITraffic.Diagnostics.PerformanceProfiler.RecordSpawnCar(spawnedCars.Count, spawnData.carData.Length);
 
                         // Clamp handbrake immediately so newly spawned car stays rock-solid stationary on grades while consist assembles
                         if (car.brakeSystem != null)
@@ -341,6 +418,7 @@ namespace AITraffic.Fleet
 
                         car.playerSpawnedCar = true;
                         car.preventDebtDisplay = true;
+                        car.preventAutoCouple = true;
 
                         var cdc = car.GetComponent<DV.ServicePenalty.CarDebtController>();
                         if (cdc != null) cdc.SetDummyDebtTracker();
@@ -351,8 +429,8 @@ namespace AITraffic.Fleet
                         }
                     }
 
-                    // Time-slice: yield 1 frame between car instantiations to spread GameObject cloning smoothly
-                    yield return null;
+                    // Time-slice: yield 0.18s (~11 frames at 60 FPS) between car instantiations to guarantee smooth rendering headroom
+                    yield return new WaitForSeconds(0.18f);
                 }
             }
             finally
@@ -390,13 +468,48 @@ namespace AITraffic.Fleet
                 ModCompatManager.TagTrainAsAITraffic(leadLoco.trainset);
             }
 
-            // Connect couplers, air hoses, open angle cocks, tighten chains, time-sliced across frames (2 cars per frame)
+            // Pre-charge the air brake system across all individual cars and locomotives BEFORE coupling.
+            // (Charging each car while uncoupled avoids base game "Attempt to SetBrakePipePressure on Brakeset with multiple cars" warnings)
+            for (int i = 0; i < spawnedCars.Count; i++)
+            {
+                var car = spawnedCars[i];
+                if (car != null && car.brakeSystem != null)
+                {
+                    try
+                    {
+                        if (car.IsLoco)
+                        {
+                            car.brakeSystem.SetMainReservoirPressure(9.5f);
+                        }
+                        car.brakeSystem.SetBrakePipePressure(5.0f);
+                        car.brakeSystem.SetAuxReservoirPressure(5.0f);
+                        car.brakeSystem.SetControlReservoirPressure(5.0f);
+                    }
+                    catch { }
+                }
+
+                // Batch: yield a frame every 5 cars to spread brake calculations smoothly
+                if ((i + 1) % 5 == 0)
+                {
+                    yield return null;
+                }
+            }
+
+            yield return null;
+
+            // Connect couplers, air hoses, open angle cocks, tighten chains, time-sliced across frames (1 car pair per frame)
             for (int i = 0; i < spawnedCars.Count - 1; i++)
             {
                 CoupleAdjacentCars(spawnedCars[i], spawnedCars[i + 1]);
-                if (i % 2 == 1)
+                yield return null;
+            }
+
+            // Consist coupling complete: re-enable auto-coupling on all cars
+            for (int i = 0; i < spawnedCars.Count; i++)
+            {
+                if (spawnedCars[i] != null)
                 {
-                    yield return null;
+                    spawnedCars[i].preventAutoCouple = false;
                 }
             }
 
@@ -419,25 +532,6 @@ namespace AITraffic.Fleet
 
             // Yield 1 frame for coupler joint physics settling
             yield return null;
-
-            // Pre-charge the air brake system across all cars and locomotives in the consist
-            for (int i = 0; i < spawnedCars.Count; i++)
-            {
-                var car = spawnedCars[i];
-                if (car == null || car.brakeSystem == null) continue;
-
-                try
-                {
-                    if (car.IsLoco)
-                    {
-                        car.brakeSystem.SetMainReservoirPressure(9.5f);
-                    }
-                    car.brakeSystem.SetBrakePipePressure(5.0f);
-                    car.brakeSystem.SetAuxReservoirPressure(5.0f);
-                    car.brakeSystem.SetControlReservoirPressure(5.0f);
-                }
-                catch { }
-            }
 
             // Release temporary holding handbrakes and clean up debt records
             for (int i = 0; i < spawnedCars.Count; i++)
@@ -467,6 +561,12 @@ namespace AITraffic.Fleet
                             DV.ServicePenalty.CareerManagerDebtController.Instance.UnregisterDebt(existingDebt);
                         }
                     }
+                }
+
+                // Batch: yield a frame every 5 cars to spread handbrake releasing smoothly
+                if ((i + 1) % 5 == 0)
+                {
+                    yield return null;
                 }
             }
 
@@ -514,6 +614,9 @@ namespace AITraffic.Fleet
                     spawnedCars.Count, leadLoco.ID, track.name));
             }
 
+            float spawnDuration = Time.realtimeSinceStartup - spawnStartTime;
+            AITraffic.Diagnostics.PerformanceProfiler.RecordSpawnEnd(track.name, spawnedCars.Count, spawnDuration);
+
             if (onComplete != null)
             {
                 onComplete(engineer);
@@ -549,32 +652,22 @@ namespace AITraffic.Fleet
 
                 if (trackLength > 0f)
                 {
-                    if (!flipTrainConsist)
+                    if (totalConsistLength + 30f <= trackLength)
                     {
-                        // Forward travel (0 -> L): start near 0, extend towards L
-                        if (startSpan + totalConsistLength > trackLength)
-                        {
-                            if (totalConsistLength + 10f <= trackLength)
-                            {
-                                startSpan = Math.Max(5.0, (trackLength - totalConsistLength) * 0.5);
-                            }
-                        }
+                        startSpan = Math.Max(15.0, (trackLength - totalConsistLength) * 0.5);
                     }
                     else
                     {
-                        // Reverse travel (L -> 0): start near L, extend towards 0
-                        if (startSpan < totalConsistLength + 5.0 || startSpan > trackLength)
-                        {
-                            startSpan = Math.Max(totalConsistLength + 5.0, trackLength - 15.0);
-                        }
+                        startSpan = 15.0;
                     }
                 }
 
-                // Build orientation list matching flipTrainConsist so locomotives and cars physically face the travel direction
+                // Base game CarSpawner.PopulateSpawnData already negates worldForward when flipTrainConsist is true.
+                // All car orientation entries must be false to avoid double-negation which would invert the locomotive backwards.
                 List<bool> orientationList = new List<bool>(liveries.Count);
                 for (int i = 0; i < liveries.Count; i++)
                 {
-                    orientationList.Add(flipTrainConsist);
+                    orientationList.Add(false);
                 }
 
                 // 1. Spawn cars on track with playerSpawnedCars = true so SimController natively skips debt tracking
@@ -763,8 +856,8 @@ namespace AITraffic.Fleet
                             Main.ModEntry.Logger.Warning(string.Format("Failed loading cargo '{0}' onto car '{1}': {2}", cargoToLoad, car.ID, ex.Message));
                     }
 
-                    // Stagger: yield every car to distribute 3D mesh instantiation and texture uploads across frames
-                    yield return null;
+                    // Stagger: yield 0.10s (~6 frames at 60 FPS) between loaded cars to distribute 3D mesh instantiation and texture uploads smoothly
+                    yield return new WaitForSeconds(0.10f);
                 }
             }
 
@@ -863,14 +956,17 @@ namespace AITraffic.Fleet
 
                     // ZCouplers compatibility: remove any CouplerBreaker components attached during coupling
                     // to prevent initial frame settling impulses from tearing AI consist joints apart
-                    try
+                    if (s_couplerBreakerType != null)
                     {
-                        var cbA = bestA.GetComponent("CouplerBreaker");
-                        if (cbA != null) UnityEngine.Object.DestroyImmediate(cbA);
-                        var cbB = bestB.GetComponent("CouplerBreaker");
-                        if (cbB != null) UnityEngine.Object.DestroyImmediate(cbB);
+                        try
+                        {
+                            var cbA = bestA.GetComponent(s_couplerBreakerType);
+                            if (cbA != null) UnityEngine.Object.Destroy(cbA);
+                            var cbB = bestB.GetComponent(s_couplerBreakerType);
+                            if (cbB != null) UnityEngine.Object.Destroy(cbB);
+                        }
+                        catch { }
                     }
-                    catch { }
                 }
                 catch (Exception ex)
                 {
@@ -981,7 +1077,6 @@ namespace AITraffic.Fleet
                     try
                     {
                         loco.brakeSystem.SetMainReservoirPressure(9.5f);
-                        loco.brakeSystem.SetBrakePipePressure(5.0f);
                         loco.brakeSystem.SetAuxReservoirPressure(5.0f);
                         loco.brakeSystem.SetControlReservoirPressure(5.0f);
                     }

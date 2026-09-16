@@ -244,7 +244,8 @@ namespace AITraffic.Fleet
                 var destTrack = tracks[tracks.Count - 1];
                 if (destTrack != null)
                 {
-                    float destDistToPlayer = Vector3.Distance(destTrack.transform.position, playerPos);
+                    Vector3 destPos = (destTrack.curve != null) ? destTrack.curve.GetPointAt(0.5f) : destTrack.transform.position;
+                    float destDistToPlayer = Vector3.Distance(destPos, playerPos);
                     if (destDistToPlayer < currentDistToPlayer - 100f)
                     {
                         return true; // Journey is heading towards player
@@ -258,7 +259,8 @@ namespace AITraffic.Fleet
                     var t = tracks[i];
                     if (t == null) continue;
 
-                    float trackDist = Vector3.Distance(t.transform.position, playerPos);
+                    Vector3 tPos = (t.curve != null) ? t.curve.GetPointAt(0.5f) : t.transform.position;
+                    float trackDist = Vector3.Distance(tPos, playerPos);
                     // If route waypoint passes closer than current distance
                     if (trackDist < currentDistToPlayer - 150f)
                     {

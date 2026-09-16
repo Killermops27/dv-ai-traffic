@@ -652,6 +652,12 @@ namespace AITraffic.Core
         {
             CheckFloatingOriginShift();
             Update3DRouteVisualizer();
+#if DEBUG
+            if (Input.GetKey(KeyCode.LeftControl) && Input.GetKey(KeyCode.LeftShift) && Input.GetKeyDown(KeyCode.M))
+            {
+                AITraffic.Diagnostics.TopologyMapExporter.ExportToDesktop();
+            }
+#endif
         }
 
         private void Update3DRouteVisualizer()
@@ -832,11 +838,15 @@ namespace AITraffic.Core
         private readonly HashSet<string> _expandedRoutes = new HashSet<string>();
         private readonly HashSet<string> _expandedSignalBlocks = new HashSet<string>();
         private Vector2 _hudScrollPos = Vector2.zero;
+        private float _lastHeaderHeight = 180f;
         private GUIStyle _nameTagStyle;
         private GUIStyle _signalTagStyle;
         private GUIStyle _signalTagBoxStyle;
         private string _lastDispatchStatus = "";
         private bool _stylesInitialized = false;
+#if DEBUG
+        private bool _showPerformanceProfiler = true;
+#endif
         private Camera GetActiveCamera()
         {
             // 1. Derail Valley PlayerManager: ActiveCamera returns PlayerCameraOverride when PhotoMode/Freecam/OrbitCam is engaged
@@ -905,8 +915,8 @@ namespace AITraffic.Core
             {
                 float screenW = Screen.width;
                 float screenH = Screen.height;
-                float boxWidth = _showWorkerDispatcher ? 680f : 640f;
-                float boxHeight = _showWorkerDispatcher ? Mathf.Min(780f, screenH - 80f) : Mathf.Min(600f, screenH - 100f);
+                float boxWidth = _showWorkerDispatcher ? 740f : 720f;
+                float boxHeight = _showWorkerDispatcher ? Mathf.Min(880f, screenH - 70f) : Mathf.Min(780f, screenH - 70f);
 
                 Rect hudRect = new Rect(20f, 50f, boxWidth, boxHeight);
 
@@ -927,7 +937,15 @@ namespace AITraffic.Core
                     _settings.ShowSignalTags = GUILayout.Toggle(_settings.ShowSignalTags, " 3D Signals", GUILayout.Width(86));
                     _settings.RideAlongMode = GUILayout.Toggle(_settings.RideAlongMode, " Ride Along", GUILayout.Width(90));
                 }
-                _showWorkerDispatcher = GUILayout.Toggle(_showWorkerDispatcher, " 👷 Workers", GUILayout.Width(92));
+                bool newShowWorker = GUILayout.Toggle(_showWorkerDispatcher, " 👷 Workers", GUILayout.Width(92));
+                if (newShowWorker != _showWorkerDispatcher)
+                {
+                    _showWorkerDispatcher = newShowWorker;
+                    _lastHeaderHeight = _showWorkerDispatcher ? 480f : 180f;
+                }
+#if DEBUG
+                _showPerformanceProfiler = GUILayout.Toggle(_showPerformanceProfiler, " ⚡ Perf", GUILayout.Width(68));
+#endif
                 GUILayout.EndHorizontal();
                 GUILayout.Space(2f);
 
@@ -963,6 +981,12 @@ namespace AITraffic.Core
                     DespawnAllAITrains();
                     _lastDispatchStatus = "<color=#FFFFFF>All AI trains despawned.</color>";
                 }
+#if DEBUG
+                if (GUILayout.Button("🗺️ Export Map", GUILayout.Height(22)))
+                {
+                    AITraffic.Diagnostics.TopologyMapExporter.ExportToDesktop();
+                }
+#endif
                 GUILayout.EndHorizontal();
 
                 if (!string.IsNullOrEmpty(_lastDispatchStatus))
@@ -973,13 +997,23 @@ namespace AITraffic.Core
                 GUILayout.Space(6f);
                 GUILayout.Label("<b>--- Active Locomotives & Locations ---</b>");
 
+                if (Event.current.type == EventType.Repaint)
+                {
+                    Rect lastRect = GUILayoutUtility.GetLastRect();
+                    if (lastRect.yMax > 20f)
+                    {
+                        _lastHeaderHeight = lastRect.yMax;
+                    }
+                }
+
                 if (_activeEngineers.Count == 0)
                 {
                     GUILayout.Label("<i>No active AI trains currently on track. Click 'Spawn Ambient' to launch a train.</i>");
                 }
                 else
                 {
-                    float scrollHeight = _showWorkerDispatcher ? Mathf.Max(120f, boxHeight - 480f) : (boxHeight - 150f);
+                    float availableHeight = (hudRect.height - 20f) - _lastHeaderHeight;
+                    float scrollHeight = Mathf.Max(120f, availableHeight - 8f);
                     _hudScrollPos = GUILayout.BeginScrollView(_hudScrollPos, GUILayout.Height(scrollHeight));
                     for (int i = 0; i < _activeEngineers.Count; i++)
                     {
@@ -1007,9 +1041,10 @@ namespace AITraffic.Core
                             eng.CurrentSpeedProfile.TrackLimitKmh);
 
                         string locoColorHex = ColorUtility.ToHtmlStringRGB(TrainPathColors[i % TrainPathColors.Length]);
+                        string encounterTag = eng.IsEncounterTrain ? " <color=#00FFFF><b>[Encounter]</b></color>" : "";
 
                         GUILayout.BeginHorizontal();
-                        GUILayout.Label(string.Format("<color=#{0}>■</color> <b>{1}</b> [{2}]  Speed: <b>{3:F1}</b> / {4:F1} km/h{5}", locoColorHex, locoId, state, speed, targetSpeed, reasonStr));
+                        GUILayout.Label(string.Format("<color=#{0}>■</color> <b>{1}</b>{6} [{2}]  Speed: <b>{3:F1}</b> / {4:F1} km/h{5}", locoColorHex, locoId, state, speed, targetSpeed, reasonStr, encounterTag));
                         
                         bool isRouteExpanded = _expandedRoutes.Contains(locoId);
                         if (GUILayout.Button(isRouteExpanded ? "▲ Route" : "▼ Route", GUILayout.Width(62), GUILayout.Height(19)))
@@ -1159,11 +1194,23 @@ namespace AITraffic.Core
                         }
 
                         GUILayout.EndVertical();
+                        GUILayout.Space(4f);
                     }
+                    GUILayout.Space(16f);
                     GUILayout.EndScrollView();
                 }
 
                 GUILayout.EndArea();
+
+#if DEBUG
+                if (_showPerformanceProfiler)
+                {
+                    float profilerWidth = 380f;
+                    float profilerHeight = 440f;
+                    Rect profilerRect = new Rect(Screen.width - profilerWidth - 20f, 50f, profilerWidth, profilerHeight);
+                    AITraffic.Diagnostics.PerformanceProfiler.DrawProfilerGUI(profilerRect);
+                }
+#endif
             }
 
             // 2. Draw World-Space Floating Nametags over Active AI Trains & 3D Signal Tags
@@ -1186,8 +1233,9 @@ namespace AITraffic.Core
                             float guiY = Screen.height - screenPos.y;
                             string destShort = !string.IsNullOrEmpty(eng.DestinationStationName) ? eng.DestinationStationName : "Open Line";
                             string locoColorHex = ColorUtility.ToHtmlStringRGB(TrainPathColors[i % TrainPathColors.Length]);
-                            string tag = string.Format("<color=#{0}><b>[AI: {1}]</b></color>\n<color=white>{2:F0} km/h ({3})</color>\n<color=#98FB98>➜ {4}</color>",
-                                locoColorHex, eng.TrainCar.ID, eng.CurrentSpeedKmh, eng.State, destShort);
+                            string encounterBadge = eng.IsEncounterTrain ? " <color=#00FFFF>[Encounter]</color>" : "";
+                            string tag = string.Format("<color=#{0}><b>[AI: {1}]</b></color>{5}\n<color=white>{2:F0} km/h ({3})</color>\n<color=#98FB98>➜ {4}</color>",
+                                locoColorHex, eng.TrainCar.ID, eng.CurrentSpeedKmh, eng.State, destShort, encounterBadge);
                             GUI.Label(new Rect(screenPos.x - 120f, guiY - 30f, 240f, 60f), tag, _nameTagStyle);
                         }
                     }

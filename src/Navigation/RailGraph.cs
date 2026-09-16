@@ -363,6 +363,7 @@ namespace AITraffic.Navigation
                     MapLogicTracks();
                     CalculateSpeedLimits();
                     DetectDoubleTrackCorridors();
+                    BuildSpatialTrackGrid();
 
                     IsInitialized = true;
                     Log(string.Format("[RailGraph] Initialization complete: {0} nodes, {1} edges.", Nodes.Count, Edges.Count));
@@ -389,6 +390,7 @@ namespace AITraffic.Navigation
             _nodesById.Clear();
             _edgesById.Clear();
             _trackReservations.Clear();
+            _spatialGrid.Clear();
             IsInitialized = false;
         }
 
@@ -896,8 +898,60 @@ namespace AITraffic.Navigation
         }
 
         /// <summary>
+        /// Calculates the forward direction vector of a train arriving at currentNode via incomingEdge.
+        /// </summary>
+        public static Vector3 GetIncomingVector(RailNode currentNode, RailEdge incomingEdge)
+        {
+            if (incomingEdge == null || incomingEdge.Track == null || incomingEdge.Track.curve == null || incomingEdge.Track.curve.pointCount < 2)
+                return Vector3.forward;
+
+            if (currentNode == incomingEdge.ToNode)
+            {
+                return incomingEdge.Track.curve.GetTangentAt(1.0f).normalized;
+            }
+            if (currentNode == incomingEdge.FromNode)
+            {
+                return -incomingEdge.Track.curve.GetTangentAt(0.0f).normalized;
+            }
+
+            Vector3 p0 = incomingEdge.Track.curve[0].position;
+            Vector3 p1 = incomingEdge.Track.curve.Last().position;
+            if (Vector3.Distance(p1, currentNode.Position) <= Vector3.Distance(p0, currentNode.Position))
+            {
+                return incomingEdge.Track.curve.GetTangentAt(1.0f).normalized;
+            }
+            return -incomingEdge.Track.curve.GetTangentAt(0.0f).normalized;
+        }
+
+        /// <summary>
+        /// Calculates the departing direction vector of a train leaving currentNode along candidateEdge.
+        /// </summary>
+        public static Vector3 GetDepartingVector(RailNode currentNode, RailEdge candidateEdge)
+        {
+            if (candidateEdge == null || candidateEdge.Track == null || candidateEdge.Track.curve == null || candidateEdge.Track.curve.pointCount < 2)
+                return Vector3.forward;
+
+            if (currentNode == candidateEdge.FromNode)
+            {
+                return candidateEdge.Track.curve.GetTangentAt(0.0f).normalized;
+            }
+            if (currentNode == candidateEdge.ToNode)
+            {
+                return -candidateEdge.Track.curve.GetTangentAt(1.0f).normalized;
+            }
+
+            Vector3 p0 = candidateEdge.Track.curve[0].position;
+            Vector3 p1 = candidateEdge.Track.curve.Last().position;
+            if (Vector3.Distance(p0, currentNode.Position) <= Vector3.Distance(p1, currentNode.Position))
+            {
+                return candidateEdge.Track.curve.GetTangentAt(0.0f).normalized;
+            }
+            return -candidateEdge.Track.curve.GetTangentAt(1.0f).normalized;
+        }
+
+        /// <summary>
         /// Returns all traversable outgoing edges from currentNode when arriving via incomingEdge,
-        /// respecting junction geometry and switch constraints.
+        /// respecting junction geometry, switch constraints, and vector angular continuity.
         /// </summary>
         public List<RailEdge> GetTraversableEdges(RailNode currentNode, RailEdge incomingEdge)
         {
@@ -908,6 +962,20 @@ namespace AITraffic.Navigation
             {
                 result.AddRange(currentNode.IncidentEdges);
                 return result;
+            }
+
+            var junction = currentNode.Junction;
+            bool isTrailingFromOutBranch = false;
+            if (junction != null && junction.outBranches != null)
+            {
+                for (int b = 0; b < junction.outBranches.Count; b++)
+                {
+                    if (junction.outBranches[b] != null && junction.outBranches[b].track == incomingEdge.Track)
+                    {
+                        isTrailingFromOutBranch = true;
+                        break;
+                    }
+                }
             }
 
             var track = incomingEdge.Track;
@@ -948,52 +1016,34 @@ namespace AITraffic.Navigation
             }
 
             // Fallback 1: Use Junction heuristics if result is still empty
-            if (result.Count == 0)
+            if (result.Count == 0 && junction != null)
             {
-                var junction = currentNode.Junction;
-                if (junction != null)
+                // Facing move: entering from inBranch -> can exit onto any outBranch
+                if (junction.inBranch != null && junction.inBranch.track == incomingEdge.Track)
                 {
-                    // Facing move: entering from inBranch -> can exit onto any outBranch
-                    if (junction.inBranch != null && junction.inBranch.track == incomingEdge.Track)
+                    if (junction.outBranches != null)
                     {
-                        if (junction.outBranches != null)
+                        for (int i = 0; i < junction.outBranches.Count; i++)
                         {
-                            for (int i = 0; i < junction.outBranches.Count; i++)
+                            var branch = junction.outBranches[i];
+                            if (branch != null && branch.track != null)
                             {
-                                var branch = junction.outBranches[i];
-                                if (branch != null && branch.track != null)
+                                var edge = GetEdge(branch.track);
+                                if (edge != null && edge != incomingEdge && !result.Contains(edge))
                                 {
-                                    var edge = GetEdge(branch.track);
-                                    if (edge != null && edge != incomingEdge && !result.Contains(edge))
-                                    {
-                                        result.Add(edge);
-                                    }
+                                    result.Add(edge);
                                 }
                             }
                         }
                     }
-                    // Trailing move: entering from an outBranch -> can only exit onto inBranch
-                    else if (junction.outBranches != null)
+                }
+                // Trailing move: entering from an outBranch -> can only exit onto inBranch
+                else if (isTrailingFromOutBranch && junction.inBranch != null && junction.inBranch.track != null)
+                {
+                    var inEdge = GetEdge(junction.inBranch.track);
+                    if (inEdge != null && inEdge != incomingEdge && !result.Contains(inEdge))
                     {
-                        bool isTrailing = false;
-                        for (int i = 0; i < junction.outBranches.Count; i++)
-                        {
-                            var branch = junction.outBranches[i];
-                            if (branch != null && branch.track == incomingEdge.Track)
-                            {
-                                isTrailing = true;
-                                break;
-                            }
-                        }
-
-                        if (isTrailing && junction.inBranch != null && junction.inBranch.track != null)
-                        {
-                            var inEdge = GetEdge(junction.inBranch.track);
-                            if (inEdge != null && inEdge != incomingEdge && !result.Contains(inEdge))
-                            {
-                                result.Add(inEdge);
-                            }
-                        }
+                        result.Add(inEdge);
                     }
                 }
             }
@@ -1007,6 +1057,49 @@ namespace AITraffic.Navigation
                     if (edge != null && edge != incomingEdge && !result.Contains(edge))
                     {
                         result.Add(edge);
+                    }
+                }
+            }
+
+            // Angular Vector Continuity & Trailing Switch Filter:
+            // Eliminate impossible 180-degree hairpin U-turns, reverse forks, and trailing outBranch crossovers.
+            if (result.Count > 0)
+            {
+                Vector3 inDir = GetIncomingVector(currentNode, incomingEdge);
+                for (int i = result.Count - 1; i >= 0; i--)
+                {
+                    var candidate = result[i];
+                    if (candidate == null || candidate == incomingEdge)
+                    {
+                        result.RemoveAt(i);
+                        continue;
+                    }
+
+                    // Trailing move rule: cannot exit onto another outBranch of the same junction
+                    if (isTrailingFromOutBranch && junction != null && junction.outBranches != null)
+                    {
+                        bool isAnotherOutBranch = false;
+                        for (int b = 0; b < junction.outBranches.Count; b++)
+                        {
+                            if (junction.outBranches[b] != null && junction.outBranches[b].track == candidate.Track)
+                            {
+                                isAnotherOutBranch = true;
+                                break;
+                            }
+                        }
+                        if (isAnotherOutBranch)
+                        {
+                            result.RemoveAt(i);
+                            continue;
+                        }
+                    }
+
+                    // Vector angular continuity: reject any turn sharper than ~78 degrees (Dot < 0.20f)
+                    Vector3 outDir = GetDepartingVector(currentNode, candidate);
+                    float dot = Vector3.Dot(inDir, outDir);
+                    if (dot < 0.20f)
+                    {
+                        result.RemoveAt(i);
                     }
                 }
             }
@@ -1294,6 +1387,143 @@ namespace AITraffic.Navigation
                 for (int i = 0; i < keysToRemove.Count; i++)
                 {
                     _trackReservations.Remove(keysToRemove[i]);
+                }
+            }
+        }
+
+        #endregion
+
+        #region Spatial Track Grid
+
+        private const float SpatialGridCellSize = 500f;
+
+        public struct SpatialCellKey : IEquatable<SpatialCellKey>
+        {
+            public readonly int X;
+            public readonly int Z;
+
+            public SpatialCellKey(int x, int z)
+            {
+                X = x;
+                Z = z;
+            }
+
+            public bool Equals(SpatialCellKey other)
+            {
+                return X == other.X && Z == other.Z;
+            }
+
+            public override bool Equals(object obj)
+            {
+                if (obj is SpatialCellKey)
+                {
+                    return Equals((SpatialCellKey)obj);
+                }
+                return false;
+            }
+
+            public override int GetHashCode()
+            {
+                unchecked
+                {
+                    return (X * 397) ^ Z;
+                }
+            }
+        }
+
+        private readonly Dictionary<SpatialCellKey, List<RailTrack>> _spatialGrid = new Dictionary<SpatialCellKey, List<RailTrack>>();
+
+        private void BuildSpatialTrackGrid()
+        {
+            _spatialGrid.Clear();
+            for (int i = 0; i < Edges.Count; i++)
+            {
+                var edge = Edges[i];
+                if (edge == null || edge.Track == null || edge.Track.curve == null) continue;
+
+                var trk = edge.Track;
+                Vector3 mid = edge.GetMidPoint();
+                int midX = Mathf.FloorToInt(mid.x / SpatialGridCellSize);
+                int midZ = Mathf.FloorToInt(mid.z / SpatialGridCellSize);
+                AddTrackToSpatialCell(midX, midZ, trk);
+
+                // For tracks longer than 250m, also register endpoints so long tracks aren't missed
+                if (edge.Length > 250f)
+                {
+                    Vector3 start = edge.Track.curve.GetPointAt(0f);
+                    int sX = Mathf.FloorToInt(start.x / SpatialGridCellSize);
+                    int sZ = Mathf.FloorToInt(start.z / SpatialGridCellSize);
+                    if (sX != midX || sZ != midZ)
+                    {
+                        AddTrackToSpatialCell(sX, sZ, trk);
+                    }
+
+                    Vector3 end = edge.Track.curve.GetPointAt(1f);
+                    int eX = Mathf.FloorToInt(end.x / SpatialGridCellSize);
+                    int eZ = Mathf.FloorToInt(end.z / SpatialGridCellSize);
+                    if ((eX != midX || eZ != midZ) && (eX != sX || eZ != sZ))
+                    {
+                        AddTrackToSpatialCell(eX, eZ, trk);
+                    }
+                }
+            }
+        }
+
+        private void AddTrackToSpatialCell(int x, int z, RailTrack trk)
+        {
+            var key = new SpatialCellKey(x, z);
+            List<RailTrack> list;
+            if (!_spatialGrid.TryGetValue(key, out list))
+            {
+                list = new List<RailTrack>(8);
+                _spatialGrid[key] = list;
+            }
+            if (!list.Contains(trk))
+            {
+                list.Add(trk);
+            }
+        }
+
+        /// <summary>
+        /// Retrieves candidate tracks within an annular spatial ring [minRadius, maxRadius] around center.
+        /// Uses the pre-indexed 2D spatial grid for instantaneous O(1) cell lookup.
+        /// </summary>
+        public void GetTracksInRadius(Vector3 center, float minRadius, float maxRadius, List<RailTrack> results)
+        {
+            if (results == null) return;
+            results.Clear();
+
+            int minX = Mathf.FloorToInt((center.x - maxRadius) / SpatialGridCellSize);
+            int maxX = Mathf.FloorToInt((center.x + maxRadius) / SpatialGridCellSize);
+            int minZ = Mathf.FloorToInt((center.z - maxRadius) / SpatialGridCellSize);
+            int maxZ = Mathf.FloorToInt((center.z + maxRadius) / SpatialGridCellSize);
+
+            float minRadSq = minRadius * minRadius;
+            float maxRadSq = maxRadius * maxRadius;
+
+            for (int x = minX; x <= maxX; x++)
+            {
+                for (int z = minZ; z <= maxZ; z++)
+                {
+                    List<RailTrack> cellTracks;
+                    if (_spatialGrid.TryGetValue(new SpatialCellKey(x, z), out cellTracks) && cellTracks != null)
+                    {
+                        for (int i = 0; i < cellTracks.Count; i++)
+                        {
+                            var trk = cellTracks[i];
+                            if (trk == null || trk.curve == null) continue;
+
+                            Vector3 mid = trk.curve.GetPointAt(0.5f);
+                            float dSq = (mid.x - center.x) * (mid.x - center.x) + (mid.z - center.z) * (mid.z - center.z);
+                            if (dSq >= minRadSq && dSq <= maxRadSq)
+                            {
+                                if (!results.Contains(trk))
+                                {
+                                    results.Add(trk);
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }

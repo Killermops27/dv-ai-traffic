@@ -132,8 +132,9 @@ namespace AITraffic.Navigation
                 }
 
                 // 1. Strict Physical Occupancy Safety Interlock: NEVER throw a switch under rolling stock!
+                Trainset requesterTrainset = GetTrainsetFromRequester(requester);
                 TrainCar occupyingCar;
-                if (IsJunctionPhysicallyOccupied(junction, out occupyingCar))
+                if (IsJunctionPhysicallyOccupied(junction, out occupyingCar, requesterTrainset))
                 {
                     Log(string.Format("[JunctionController] Junction '{0}' is physically OCCUPIED by car '{1}'; alignment to branch {2} strictly DENIED for requester '{3}'.",
                         junction.name, occupyingCar != null ? occupyingCar.ID : "unknown", desiredBranch, requester));
@@ -146,7 +147,6 @@ namespace AITraffic.Navigation
                     bool rideAlong = (Main.Settings != null && Main.Settings.RideAlongMode);
                     if (!rideAlong)
                     {
-                        Trainset requesterTrainset = GetTrainsetFromRequester(requester);
                         if (SignalRegistry.IsJunctionOccupiedByPlayer(junction, requesterTrainset))
                         {
                             Log(string.Format("[JunctionController] Junction '{0}' is occupied by the player; AI alignment denied.", junction.name));
@@ -396,6 +396,14 @@ namespace AITraffic.Navigation
                     if (!IsRequesterAlive(lockInfo.Requester))
                     {
                         ReleaseJunctionInternal(junction, lockInfo.Requester);
+                        return false;
+                    }
+
+                    // Deadlock defense-in-depth: If the lock holder is an AIEngineer that is stopped and blocked by an obstacle ahead:
+                    var holderEng = lockInfo.Requester as AITraffic.Driver.AIEngineer;
+                    if (holderEng != null && holderEng.CurrentSpeedKmh < 1.5f && holderEng.DistanceToObstacle < 150f)
+                    {
+                        // The lock holder is blocked and unable to move; do not block other agents from aligning switch to clear out
                         return false;
                     }
 
@@ -718,7 +726,7 @@ namespace AITraffic.Navigation
         /// Evaluates whole-trainset spanning across in/out branches, individual car straddling,
         /// distance to switch points / frog clearance boundaries, and live AI/player trainsets.
         /// </summary>
-        public static bool IsJunctionPhysicallyOccupied(Junction junction, out TrainCar occupyingCar)
+        public static bool IsJunctionPhysicallyOccupied(Junction junction, out TrainCar occupyingCar, Trainset requesterTrainset = null)
         {
             occupyingCar = null;
             if (junction == null) return false;
@@ -733,6 +741,8 @@ namespace AITraffic.Navigation
             var trainsetToTracks = new Dictionary<Trainset, HashSet<RailTrack>>();
             var trainsetToCars = new Dictionary<Trainset, List<TrainCar>>();
             TrainCar detectedCar = null;
+            TrainCar externalCar = null;
+            TrainCar requesterBladeCar = null;
 
             Action<Bogie, RailTrack> processBogie = (bogie, track) =>
             {
@@ -758,11 +768,22 @@ namespace AITraffic.Navigation
                     if (!cList.Contains(car)) cList.Add(car);
                 }
 
+                bool isRequester = (requesterTrainset != null && car.trainset == requesterTrainset);
+
                 // 1. Check bogie 3D distance to switch points
                 float bogieDist = Vector3.Distance(bogie.transform.position, junction.position);
                 if (bogieDist <= clearanceMargin)
                 {
                     if (detectedCar == null) detectedCar = car;
+                    if (!isRequester)
+                    {
+                        if (externalCar == null) externalCar = car;
+                    }
+                    else if (bogieDist <= 6.5f)
+                    {
+                        // Requester's wheels are directly over movable switch blades/points
+                        if (requesterBladeCar == null) requesterBladeCar = car;
+                    }
                 }
 
                 // 2. Check car center 3D distance to switch points
@@ -770,6 +791,10 @@ namespace AITraffic.Navigation
                 if (carDist <= clearanceMargin)
                 {
                     if (detectedCar == null) detectedCar = car;
+                    if (!isRequester)
+                    {
+                        if (externalCar == null) externalCar = car;
+                    }
                 }
 
                 // 3. Check individual car straddling across branches
@@ -788,6 +813,14 @@ namespace AITraffic.Navigation
                         if ((fOnIn && rOnConn) || (rOnIn && fOnConn) || (fOnConn && rOnConn))
                         {
                             if (detectedCar == null) detectedCar = car;
+                            if (!isRequester)
+                            {
+                                if (externalCar == null) externalCar = car;
+                            }
+                            else
+                            {
+                                if (requesterBladeCar == null) requesterBladeCar = car;
+                            }
                         }
                     }
                 }
@@ -862,7 +895,20 @@ namespace AITraffic.Navigation
                 }
             }
 
-            if (detectedCar != null)
+            if (requesterTrainset != null)
+            {
+                if (externalCar != null)
+                {
+                    occupyingCar = externalCar;
+                    return true;
+                }
+                if (requesterBladeCar != null)
+                {
+                    occupyingCar = requesterBladeCar;
+                    return true;
+                }
+            }
+            else if (detectedCar != null)
             {
                 occupyingCar = detectedCar;
                 return true;
