@@ -22,7 +22,17 @@ namespace AITraffic.Fleet
         /// </summary>
         public static bool IsSpawningAmbientConsist { get; private set; }
 
-        private static readonly Type s_couplerBreakerType = Type.GetType("ZCouplers.CouplerBreaker, ZCouplers", false);
+        private static Type s_couplerBreakerType;
+        private static Type GetCouplerBreakerType()
+        {
+            if (s_couplerBreakerType != null) return s_couplerBreakerType;
+            foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
+            {
+                s_couplerBreakerType = asm.GetType("DvMod.ZCouplers.Physics.CouplerBreaker");
+                if (s_couplerBreakerType != null) break;
+            }
+            return s_couplerBreakerType;
+        }
 
         /// <summary>
         /// Estimates the physical length of a consist (in meters) including couplers for track suitability validation.
@@ -449,6 +459,10 @@ namespace AITraffic.Fleet
             // Yield 1 frame for physics / bogie registering and initial coupler settling
             yield return null;
 
+            // Tag ALL spawned cars immediately as AI traffic so every car receives an AITrafficCarMarker,
+            // is registered in AI car collections, and is omitted from savegames and player debt systems
+            ModCompatManager.TagCarsAsAITraffic(spawnedCars);
+
             // Locate lead locomotive
             TrainCar leadLoco = null;
             for (int i = 0; i < spawnedCars.Count; i++)
@@ -533,6 +547,12 @@ namespace AITraffic.Fleet
             // Yield 1 frame for coupler joint physics settling
             yield return null;
 
+            // Retag full coupled trainset now that all cars are unified into a single consist
+            if (leadLoco != null && leadLoco.trainset != null)
+            {
+                ModCompatManager.TagTrainAsAITraffic(leadLoco.trainset);
+            }
+
             // Release temporary holding handbrakes and clean up debt records
             for (int i = 0; i < spawnedCars.Count; i++)
             {
@@ -597,6 +617,7 @@ namespace AITraffic.Fleet
             if (engineer != null)
             {
                 engineer.ConsistType = consistType;
+                engineer.RegisterConsistCars(spawnedCars);
             }
 
             // Stagger cargo loading across frames in background
@@ -697,6 +718,17 @@ namespace AITraffic.Fleet
                         Main.ModEntry.Logger.Error(string.Format("TrainSpawner: CarSpawner returned null or empty car list on track '{0}'.", track.name));
                     return null;
                 }
+
+                for (int i = 0; i < spawnedCars.Count; i++)
+                {
+                    var c = spawnedCars[i];
+                    if (c != null)
+                    {
+                        c.playerSpawnedCar = true;
+                        c.preventDebtDisplay = true;
+                    }
+                }
+                ModCompatManager.TagCarsAsAITraffic(spawnedCars);
 
                 // 2. Locate lead locomotive (first supported diesel/mechanical/electric locomotive in consist)
                 TrainCar leadLoco = null;
@@ -801,6 +833,7 @@ namespace AITraffic.Fleet
                 if (engineer != null)
                 {
                     engineer.ConsistType = ConsistType.RegionalFreight;
+                    engineer.RegisterConsistCars(spawnedCars);
                 }
 
                 // 8. Time-slice procedural cargo loading across frames to eliminate spawn stutter while maintaining 100% visual/weight fidelity
@@ -956,13 +989,14 @@ namespace AITraffic.Fleet
 
                     // ZCouplers compatibility: remove any CouplerBreaker components attached during coupling
                     // to prevent initial frame settling impulses from tearing AI consist joints apart
-                    if (s_couplerBreakerType != null)
+                    var cbType = GetCouplerBreakerType();
+                    if (cbType != null)
                     {
                         try
                         {
-                            var cbA = bestA.GetComponent(s_couplerBreakerType);
+                            var cbA = bestA.GetComponent(cbType);
                             if (cbA != null) UnityEngine.Object.Destroy(cbA);
-                            var cbB = bestB.GetComponent(s_couplerBreakerType);
+                            var cbB = bestB.GetComponent(cbType);
                             if (cbB != null) UnityEngine.Object.Destroy(cbB);
                         }
                         catch { }

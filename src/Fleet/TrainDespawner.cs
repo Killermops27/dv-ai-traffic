@@ -21,19 +21,65 @@ namespace AITraffic.Fleet
         /// Checks whether a given AI trainset can be safely despawned without visible pop-in/pop-out
         /// or disrupting the player.
         /// </summary>
-        /// <param name="trainset">The trainset to evaluate.</param>
-        /// <param name="minDistance">Minimum absolute distance required between all cars and the player (even when out of view).</param>
-        /// <param name="frustumDistance">Distance required when the train is within the player's camera view frustum.</param>
-        /// <returns>True if the trainset is safe to despawn.</returns>
         public static bool CanDespawnSafely(Trainset trainset, float minDistance = DefaultTerminusSafeDespawnDistance, float frustumDistance = DefaultTerminusFrustumDistance)
         {
             if (trainset == null || trainset.cars == null || trainset.cars.Count == 0)
                 return true;
+            return CanDespawnCarsSafely(trainset.cars, minDistance, frustumDistance);
+        }
+
+        /// <summary>
+        /// Checks whether all cars belonging to an AI train (including any separated/derailed consist cars)
+        /// can be safely despawned without visible pop-in/pop-out or disrupting the player.
+        /// </summary>
+        public static bool CanDespawnSafely(AIEngineer engineer, float minDistance = DefaultTerminusSafeDespawnDistance, float frustumDistance = DefaultTerminusFrustumDistance)
+        {
+            if (engineer == null)
+                return true;
+
+            List<TrainCar> allCars = new List<TrainCar>();
+            if (engineer.RegisteredConsistCars != null && engineer.RegisteredConsistCars.Count > 0)
+            {
+                for (int i = 0; i < engineer.RegisteredConsistCars.Count; i++)
+                {
+                    var c = engineer.RegisteredConsistCars[i];
+                    if (c != null && !allCars.Contains(c))
+                    {
+                        allCars.Add(c);
+                    }
+                }
+            }
+            if (engineer.TrainCar != null && engineer.TrainCar.trainset != null && engineer.TrainCar.trainset.cars != null)
+            {
+                for (int i = 0; i < engineer.TrainCar.trainset.cars.Count; i++)
+                {
+                    var c = engineer.TrainCar.trainset.cars[i];
+                    if (c != null && !allCars.Contains(c))
+                    {
+                        allCars.Add(c);
+                    }
+                }
+            }
+            else if (engineer.TrainCar != null && !allCars.Contains(engineer.TrainCar))
+            {
+                allCars.Add(engineer.TrainCar);
+            }
+
+            return CanDespawnCarsSafely(allCars, minDistance, frustumDistance);
+        }
+
+        /// <summary>
+        /// Checks whether a list of cars can be safely despawned without visible pop-in/pop-out or disrupting the player.
+        /// </summary>
+        public static bool CanDespawnCarsSafely(List<TrainCar> cars, float minDistance = DefaultTerminusSafeDespawnDistance, float frustumDistance = DefaultTerminusFrustumDistance)
+        {
+            if (cars == null || cars.Count == 0)
+                return true;
 
             // 0. Worker trains or player consists must NEVER be despawned!
-            for (int i = 0; i < trainset.cars.Count; i++)
+            for (int i = 0; i < cars.Count; i++)
             {
-                var car = trainset.cars[i];
+                var car = cars[i];
                 if (car == null) continue;
                 if (ModCompatManager.IsWorkerTrain(car) || WorkerManager.IsTrainCarInAnyWorkerTask(car))
                 {
@@ -48,16 +94,16 @@ namespace AITraffic.Fleet
             Vector3 playerPos = playerTransform.position;
             TrainCar playerCar = PlayerManager.Car;
 
-            // 1. Check if the player is riding, coupled to, or standing inside any car in this trainset
-            if (playerCar != null && trainset.cars.Contains(playerCar))
+            // 1. Check if the player is riding, coupled to, or standing inside any car in this list
+            if (playerCar != null && cars.Contains(playerCar))
             {
                 return false;
             }
 
             // Also check proximity to any car (e.g. player standing on walkway/roof or immediately next to train)
-            for (int i = 0; i < trainset.cars.Count; i++)
+            for (int i = 0; i < cars.Count; i++)
             {
-                var car = trainset.cars[i];
+                var car = cars[i];
                 if (car == null) continue;
 
                 // Absolute minimum safety distance: if player is within 30m of any car, never despawn
@@ -67,11 +113,11 @@ namespace AITraffic.Fleet
                 }
             }
 
-            // 2. Check distance from player to every car in the trainset
+            // 2. Check distance from player to every car
             float minDistanceSq = minDistance * minDistance;
-            for (int i = 0; i < trainset.cars.Count; i++)
+            for (int i = 0; i < cars.Count; i++)
             {
-                var car = trainset.cars[i];
+                var car = cars[i];
                 if (car == null) continue;
 
                 float distSq = (car.transform.position - playerPos).sqrMagnitude;
@@ -86,9 +132,9 @@ namespace AITraffic.Fleet
             if (playerCam != null)
             {
                 float frustumDistSq = frustumDistance * frustumDistance;
-                for (int i = 0; i < trainset.cars.Count; i++)
+                for (int i = 0; i < cars.Count; i++)
                 {
-                    var car = trainset.cars[i];
+                    var car = cars[i];
                     if (car == null) continue;
 
                     float distSq = (car.transform.position - playerPos).sqrMagnitude;
@@ -196,14 +242,140 @@ namespace AITraffic.Fleet
         }
 
         /// <summary>
-        /// Despawns an AI train by its lead engineer controller.
+        /// Despawns an AI train and ALL of its registered consist cars (including any cars
+        /// separated or derailed during a collision) from the game world.
         /// </summary>
         public static bool DespawnTrain(AIEngineer engineer, bool forceInstant = true)
         {
-            if (engineer == null || engineer.TrainCar == null || engineer.TrainCar.trainset == null)
+            if (engineer == null)
                 return false;
 
-            return DespawnTrain(engineer.TrainCar.trainset, forceInstant);
+            if (CarSpawner.Instance == null)
+            {
+                if (Main.ModEntry != null && Main.ModEntry.Logger != null)
+                    Main.ModEntry.Logger.Error("TrainDespawner: CarSpawner instance is null.");
+                return false;
+            }
+
+            try
+            {
+                // 1. Gather all cars belonging to this engineer (loco, current trainset, and registered consist cars)
+                List<TrainCar> carsToDelete = new List<TrainCar>();
+                if (engineer.RegisteredConsistCars != null && engineer.RegisteredConsistCars.Count > 0)
+                {
+                    for (int i = 0; i < engineer.RegisteredConsistCars.Count; i++)
+                    {
+                        var c = engineer.RegisteredConsistCars[i];
+                        if (c != null && !carsToDelete.Contains(c))
+                        {
+                            carsToDelete.Add(c);
+                        }
+                    }
+                }
+                if (engineer.TrainCar != null && engineer.TrainCar.trainset != null && engineer.TrainCar.trainset.cars != null)
+                {
+                    for (int i = 0; i < engineer.TrainCar.trainset.cars.Count; i++)
+                    {
+                        var c = engineer.TrainCar.trainset.cars[i];
+                        if (c != null && !carsToDelete.Contains(c))
+                        {
+                            carsToDelete.Add(c);
+                        }
+                    }
+                }
+                else if (engineer.TrainCar != null && !carsToDelete.Contains(engineer.TrainCar))
+                {
+                    carsToDelete.Add(engineer.TrainCar);
+                }
+
+                if (carsToDelete.Count == 0)
+                    return false;
+
+                // Safety guard: NEVER despawn a player consist or worker train!
+                for (int i = 0; i < carsToDelete.Count; i++)
+                {
+                    var car = carsToDelete[i];
+                    if (car == null) continue;
+                    if (ModCompatManager.IsWorkerTrain(car) || WorkerManager.IsTrainCarInAnyWorkerTask(car))
+                    {
+                        if (Main.ModEntry != null && Main.ModEntry.Logger != null)
+                            Main.ModEntry.Logger.Warning(string.Format("[TrainDespawner] Aborting despawn of train: car '{0}' is part of an AI worker task or player consist!", car.ID));
+                        return false;
+                    }
+                }
+
+                string leadId = engineer.TrainCar != null ? engineer.TrainCar.ID : "Unknown";
+                int carCount = carsToDelete.Count;
+
+                // 2. Untag all affected Trainsets and cleanup markers/reservations
+                HashSet<Trainset> affectedTrainsets = new HashSet<Trainset>();
+                for (int i = 0; i < carsToDelete.Count; i++)
+                {
+                    var car = carsToDelete[i];
+                    if (car == null) continue;
+
+                    if (car.trainset != null)
+                    {
+                        affectedTrainsets.Add(car.trainset);
+                    }
+
+                    var eng = car.GetComponent<AIEngineer>();
+                    if (eng != null)
+                    {
+                        eng.EmergencyBrake();
+                        eng.ReleaseAllSignalReservations();
+                        if (AITraffic.Navigation.JunctionController.Instance != null)
+                        {
+                            AITraffic.Navigation.JunctionController.Instance.ReleaseAllLocksFor(eng);
+                        }
+                        if (AITraffic.Navigation.RailGraph.Instance != null)
+                        {
+                            AITraffic.Navigation.RailGraph.Instance.ReleaseAllReservationsFor(eng);
+                        }
+                        UnityEngine.Object.Destroy(eng);
+                    }
+
+                    if (AITraffic.Navigation.JunctionController.Instance != null)
+                    {
+                        AITraffic.Navigation.JunctionController.Instance.ReleaseAllLocksFor(car);
+                    }
+                    if (AITraffic.Navigation.RailGraph.Instance != null)
+                    {
+                        AITraffic.Navigation.RailGraph.Instance.ReleaseAllReservationsFor(car);
+                    }
+
+                    if (car.gameObject != null)
+                    {
+                        var marker = car.gameObject.GetComponent<AITrafficCarMarker>();
+                        if (marker != null)
+                        {
+                            UnityEngine.Object.Destroy(marker);
+                        }
+                    }
+                }
+
+                foreach (var ts in affectedTrainsets)
+                {
+                    if (ts != null)
+                    {
+                        ModCompatManager.UntagTrain(ts);
+                    }
+                }
+
+                // 3. Delete cars using CarSpawner
+                CarSpawner.Instance.DeleteTrainCars(carsToDelete, forceInstantDestroy: forceInstant);
+
+                if (Main.ModEntry != null && Main.ModEntry.Logger != null)
+                    Main.ModEntry.Logger.Log(string.Format("[TrainDespawner] Despawned entire AI consist (Lead: {0}, Total Cars: {1}).", leadId, carCount));
+
+                return true;
+            }
+            catch (Exception ex)
+            {
+                if (Main.ModEntry != null && Main.ModEntry.Logger != null)
+                    Main.ModEntry.Logger.Error(string.Format("Error in TrainDespawner.DespawnTrain(AIEngineer): {0}", ex));
+                return false;
+            }
         }
 
         /// <summary>

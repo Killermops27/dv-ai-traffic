@@ -83,6 +83,13 @@ namespace AITraffic
                 TrafficManager.Instance.Settings = Settings;
                 TrafficManager.Instance.enabled = true;
 
+                // Purge any stale ambient AI cars lingering from previous sessions or legacy save files
+                try
+                {
+                    TrafficManager.Instance.PurgeAllWorldAICars();
+                }
+                catch { }
+
                 // Ensure Worker Radio mode is registered with Comms Radio
                 try
                 {

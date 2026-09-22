@@ -144,14 +144,22 @@ namespace AITraffic.Navigation
                 // 2. Player occupancy / presence check (respects Ride-Along mode and ignores requester's train)
                 if (requester != null && requester is AITraffic.Driver.AIEngineer)
                 {
+                    var eng = (AITraffic.Driver.AIEngineer)requester;
                     bool rideAlong = (Main.Settings != null && Main.Settings.RideAlongMode);
-                    if (!rideAlong)
+                    bool protectLock = eng.ShouldProtectJunctionLock(junction);
+                    if (!rideAlong && !protectLock)
                     {
                         if (SignalRegistry.IsJunctionOccupiedByPlayer(junction, requesterTrainset))
                         {
                             Log(string.Format("[JunctionController] Junction '{0}' is occupied by the player; AI alignment denied.", junction.name));
                             return false;
                         }
+                    }
+
+                    if (!protectLock && SignalRegistry.IsJunctionReservedByPlayerSignal(junction))
+                    {
+                        Log(string.Format("[JunctionController] Junction '{0}' is reserved by player signal; AI alignment denied.", junction.name));
+                        return false;
                     }
                 }
 
@@ -213,14 +221,21 @@ namespace AITraffic.Navigation
 
                 if (requester is AITraffic.Driver.AIEngineer)
                 {
+                    var eng = (AITraffic.Driver.AIEngineer)requester;
                     bool rideAlong = (Main.Settings != null && Main.Settings.RideAlongMode);
-                    if (!rideAlong)
+                    bool protectLock = eng.ShouldProtectJunctionLock(junction);
+                    if (!rideAlong && !protectLock)
                     {
                         Trainset requesterTrainset = GetTrainsetFromRequester(requester);
                         if (SignalRegistry.IsJunctionOccupiedByPlayer(junction, requesterTrainset))
                         {
                             return false;
                         }
+                    }
+
+                    if (!protectLock && SignalRegistry.IsJunctionReservedByPlayerSignal(junction))
+                    {
+                        return false;
                     }
                 }
 
@@ -308,6 +323,42 @@ namespace AITraffic.Navigation
             }
         }
 
+        /// <summary>
+        /// Checks whether a junction is currently locked by an active AI engineer that is moving at speed
+        /// or protecting its route through an entered signal block.
+        /// </summary>
+        public bool IsJunctionLockedByAI(Junction junction)
+        {
+            if (junction == null) return false;
+
+            lock (_lock)
+            {
+                JunctionLockInfo lockInfo;
+                if (_activeLocks.TryGetValue(junction, out lockInfo))
+                {
+                    if (lockInfo.IsExpired)
+                    {
+                        return false;
+                    }
+
+                    var eng = lockInfo.Requester as AITraffic.Driver.AIEngineer;
+                    if (eng != null)
+                    {
+                        // AI engineer holds lock: protected against player intervention if moving at speed (>= 1.5 km/h) or protecting entered block
+                        if (eng.CurrentSpeedKmh >= 1.5f || eng.ShouldProtectJunctionLock(junction))
+                        {
+                            return true;
+                        }
+                    }
+                    else if (lockInfo.Requester != null)
+                    {
+                        return true;
+                    }
+                }
+                return false;
+            }
+        }
+
         private bool IsRequesterAlive(object requester)
         {
             if (requester == null) return false;
@@ -378,6 +429,17 @@ namespace AITraffic.Navigation
                     if (lockInfo.Requester == requester)
                     {
                         return false;
+                    }
+
+                    // Player Signal Priority: If reserved by player signal, immediately purge AI lock and allow player alignment UNLESS AI is actively moving at speed in this block!
+                    if (SignalRegistry.IsJunctionReservedByPlayerSignal(junction))
+                    {
+                        var eng = lockInfo.Requester as AITraffic.Driver.AIEngineer;
+                        if (eng != null && !eng.ShouldProtectJunctionLock(junction))
+                        {
+                            ReleaseJunctionInternal(junction, lockInfo.Requester);
+                            return false;
+                        }
                     }
 
                     // If the switch is physically occupied, lock MUST be preserved and extended!
@@ -550,6 +612,17 @@ namespace AITraffic.Navigation
                         continue;
                     }
 
+                    var rearBogie = info.MonitoredRearBogie;
+                    if (rearBogie != null && info.Junction != null)
+                    {
+                        float distToJunction = Vector3.Distance(rearBogie.transform.position, info.Junction.position);
+                        if (distToJunction < info.ClearanceDistanceMeters)
+                        {
+                            info.ExpirationTime = Mathf.Max(info.ExpirationTime, Time.time + 30f);
+                            continue;
+                        }
+                    }
+
                     // Check if train cars are still physically on the junction
                     TrainCar occupyingCar;
                     bool isStillOnJunction = IsJunctionPhysicallyOccupied(info.Junction, out occupyingCar);
@@ -600,14 +673,21 @@ namespace AITraffic.Navigation
             Log(string.Format("[JunctionController] Junction '{0}' lock released for requester '{1}'.", junction.name, requester));
         }
 
+        private static readonly List<JunctionLockInfo> s_expiredLocksScratch = new List<JunctionLockInfo>();
+
         public void ClearExpiredLocks()
         {
             lock (_lock)
             {
-                var expiredList = _activeLocks.Values.Where(l => l.IsExpired).ToList();
-                for (int i = 0; i < expiredList.Count; i++)
+                s_expiredLocksScratch.Clear();
+                foreach (var lockItem in _activeLocks.Values)
                 {
-                    var item = expiredList[i];
+                    if (lockItem.IsExpired) s_expiredLocksScratch.Add(lockItem);
+                }
+
+                for (int i = 0; i < s_expiredLocksScratch.Count; i++)
+                {
+                    var item = s_expiredLocksScratch[i];
                     if (IsJunctionPhysicallyOccupied(item.Junction))
                     {
                         // Train is still physically traversing or sitting on the switch: extend lock!
@@ -618,6 +698,7 @@ namespace AITraffic.Navigation
                         ReleaseJunctionInternal(item.Junction, item.Requester);
                     }
                 }
+                s_expiredLocksScratch.Clear();
             }
         }
 
@@ -726,6 +807,9 @@ namespace AITraffic.Navigation
         /// Evaluates whole-trainset spanning across in/out branches, individual car straddling,
         /// distance to switch points / frog clearance boundaries, and live AI/player trainsets.
         /// </summary>
+        private static readonly Dictionary<Trainset, HashSet<RailTrack>> s_trainsetToTracksScratch = new Dictionary<Trainset, HashSet<RailTrack>>();
+        private static readonly Dictionary<Trainset, List<TrainCar>> s_trainsetToCarsScratch = new Dictionary<Trainset, List<TrainCar>>();
+
         public static bool IsJunctionPhysicallyOccupied(Junction junction, out TrainCar occupyingCar, Trainset requesterTrainset = null)
         {
             occupyingCar = null;
@@ -738,8 +822,8 @@ namespace AITraffic.Navigation
             var inTrack = junction.inBranch != null ? junction.inBranch.track : null;
 
             // Map each trainset detected on any connected track to the tracks its bogies are on
-            var trainsetToTracks = new Dictionary<Trainset, HashSet<RailTrack>>();
-            var trainsetToCars = new Dictionary<Trainset, List<TrainCar>>();
+            s_trainsetToTracksScratch.Clear();
+            s_trainsetToCarsScratch.Clear();
             TrainCar detectedCar = null;
             TrainCar externalCar = null;
             TrainCar requesterBladeCar = null;
@@ -752,18 +836,18 @@ namespace AITraffic.Navigation
                 if (car.trainset != null)
                 {
                     HashSet<RailTrack> tSet;
-                    if (!trainsetToTracks.TryGetValue(car.trainset, out tSet))
+                    if (!s_trainsetToTracksScratch.TryGetValue(car.trainset, out tSet))
                     {
                         tSet = new HashSet<RailTrack>();
-                        trainsetToTracks[car.trainset] = tSet;
+                        s_trainsetToTracksScratch[car.trainset] = tSet;
                     }
                     if (track != null) tSet.Add(track);
 
                     List<TrainCar> cList;
-                    if (!trainsetToCars.TryGetValue(car.trainset, out cList))
+                    if (!s_trainsetToCarsScratch.TryGetValue(car.trainset, out cList))
                     {
                         cList = new List<TrainCar>();
-                        trainsetToCars[car.trainset] = cList;
+                        s_trainsetToCarsScratch[car.trainset] = cList;
                     }
                     if (!cList.Contains(car)) cList.Add(car);
                 }
@@ -917,7 +1001,7 @@ namespace AITraffic.Navigation
             // 4. Whole-Trainset Multi-Car Spanning Check:
             // If any trainset has cars/bogies spanning across inBranch and ANY outBranch (or between two outBranches),
             // the consist is physically over the switch points and actively traversing!
-            foreach (var kvp in trainsetToTracks)
+            foreach (var kvp in s_trainsetToTracksScratch)
             {
                 var tSet = kvp.Value;
                 bool hasInTrack = inTrack != null && tSet.Contains(inTrack);
@@ -939,7 +1023,7 @@ namespace AITraffic.Navigation
                 if (hasInTrack && hasOutTrack)
                 {
                     List<TrainCar> cList;
-                    trainsetToCars.TryGetValue(kvp.Key, out cList);
+                    s_trainsetToCarsScratch.TryGetValue(kvp.Key, out cList);
                     occupyingCar = (cList != null && cList.Count > 0) ? cList[0] : null;
                     return true;
                 }
@@ -959,7 +1043,7 @@ namespace AITraffic.Navigation
                     if (outBranchCount > 1)
                     {
                         List<TrainCar> cList;
-                        trainsetToCars.TryGetValue(kvp.Key, out cList);
+                        s_trainsetToCarsScratch.TryGetValue(kvp.Key, out cList);
                         occupyingCar = (cList != null && cList.Count > 0) ? cList[0] : null;
                         return true;
                     }

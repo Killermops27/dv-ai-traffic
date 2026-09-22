@@ -39,7 +39,18 @@ namespace AITraffic.Navigation
         public List<JunctionSwitchInfo> Switches = new List<JunctionSwitchInfo>();
         public bool IsClear = true;
         public bool IsPlayerOccupied = false;
-        public bool AreSwitchesAligned = false;
+        public bool AreSwitchesAligned
+        {
+            get
+            {
+                if (Switches == null || Switches.Count == 0) return true;
+                for (int s = 0; s < Switches.Count; s++)
+                {
+                    if (!Switches[s].IsAligned) return false;
+                }
+                return true;
+            }
+        }
         public string AspectName = "Hp 1 (Green / Clear)";
         public Color AspectColor = new Color(0.0f, 1.0f, 0.55f);
     }
@@ -362,6 +373,13 @@ namespace AITraffic.Navigation
                         if (sig == null || sig.Controller == null || !sig.Controller.PlacementInfo.HasValue)
                             continue;
 
+                        // If this light belongs to a sub-distant signal mounted on a parent main signal,
+                        // map it to the governing parent main signal!
+                        if (sig.Parent != null)
+                        {
+                            sig = sig.Parent;
+                        }
+
                         var info = sig.Controller.PlacementInfo.Value;
                         if (info.Track == null) continue;
 
@@ -450,18 +468,19 @@ namespace AITraffic.Navigation
         }
 
         /// <summary>
-        /// Checks whether a DVSignals signal acts as a Main Signal (governs block entry/exit).
-        /// Filters out shunting signals and distant repeaters.
+        /// Checks whether a DVSignals signal acts as a Governing Signal (governs train movement / block entry / exit).
+        /// Includes Main Signals, Entry/Exit Signals, and Shunting Signals (Sperrsignale).
+        /// Filters out distant signals and repeaters.
         /// </summary>
-        public static bool IsMainSignal(DVSignal signal)
+        public static bool IsGoverningSignal(DVSignal signal)
         {
             if (signal == null) return false;
-            if (signal.IsShunting) return false;
+            if (signal.Parent != null) return false; // Sub-distant repeater head mounted on main mast
 
             // 1. Controller type & flags from DVSignals
             if (signal.Controller != null)
             {
-                if (signal.Controller.Type == Signals.Game.SignalType.Distant || signal.Controller.ActingAsDistant)
+                if (signal.Controller.Type == Signals.Game.SignalType.Distant || signal.Controller.Type == Signals.Game.SignalType.Repeater)
                 {
                     return false;
                 }
@@ -470,11 +489,13 @@ namespace AITraffic.Navigation
                     return false;
                 }
 
+                // NOTICE: Do NOT check signal.Controller.ActingAsDistant!
+                // In DVSignals, ActingAsDistant is true on any Main signal that has a distant repeater attached to its mast!
                 string ctrlName = signal.Controller.NameOverride ?? "";
-                if (ctrlName.StartsWith("Ps", StringComparison.OrdinalIgnoreCase) ||
+                if (ctrlName.StartsWith("Ps ", StringComparison.OrdinalIgnoreCase) ||
+                    ctrlName.StartsWith("Pp ", StringComparison.OrdinalIgnoreCase) ||
                     ctrlName.IndexOf("DISTANT", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                    ctrlName.IndexOf("REPEATER", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                    ctrlName.IndexOf("VOR", StringComparison.OrdinalIgnoreCase) >= 0)
+                    ctrlName.IndexOf("REPEATER", StringComparison.OrdinalIgnoreCase) >= 0)
                 {
                     return false;
                 }
@@ -488,27 +509,25 @@ namespace AITraffic.Navigation
 
             // 3. Signal name / prefix (DVSignals German pack uses "Ps {0}" format for distant signals / Vorsignale)
             string sigName = signal.NameOverride ?? "";
-            if (sigName.StartsWith("Ps", StringComparison.OrdinalIgnoreCase) ||
+            if (sigName.StartsWith("Ps ", StringComparison.OrdinalIgnoreCase) ||
+                sigName.StartsWith("Pp ", StringComparison.OrdinalIgnoreCase) ||
                 sigName.IndexOf("DISTANT", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                sigName.IndexOf("REPEATER", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                sigName.IndexOf("VOR", StringComparison.OrdinalIgnoreCase) >= 0)
+                sigName.IndexOf("REPEATER", StringComparison.OrdinalIgnoreCase) >= 0)
             {
                 return false;
             }
 
-            // 4. Aspect ID check
-            if (signal.CurrentAspect != null)
-            {
-                string aId = signal.CurrentAspect.Id ?? string.Empty;
-                if (aId.IndexOf("DISTANT", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                    aId.IndexOf("REPEATER", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                    aId.IndexOf("VR", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                    aId.StartsWith("NEXT_", StringComparison.OrdinalIgnoreCase))
-                {
-                    return false;
-                }
-            }
             return true;
+        }
+
+        /// <summary>
+        /// Checks whether a DVSignals signal acts as a Main Signal (governs mainline block entry/exit).
+        /// Filters out shunting signals and distant repeaters.
+        /// </summary>
+        public static bool IsMainSignal(DVSignal signal)
+        {
+            if (signal != null && signal.IsShunting) return false;
+            return IsGoverningSignal(signal);
         }
 
         /// <summary>
@@ -616,6 +635,7 @@ namespace AITraffic.Navigation
         public static bool TryReserveDVSignal(DVSignal signal)
         {
             if (signal == null || !ModCompatManager.IsDVSignalsLoaded) return false;
+            if (signal.Parent != null) signal = signal.Parent;
             try
             {
                 if (!Signals.Game.Railway.TrackReserver.HasReservation(signal))
@@ -642,6 +662,7 @@ namespace AITraffic.Navigation
         public static void ClearDVSignalReservation(DVSignal signal)
         {
             if (signal == null || !ModCompatManager.IsDVSignalsLoaded) return;
+            if (signal.Parent != null) signal = signal.Parent;
             try
             {
                 Signals.Game.Railway.TrackReserver.ClearFromSignal(signal);
@@ -655,6 +676,77 @@ namespace AITraffic.Navigation
                 if (Main.ModEntry != null && Main.ModEntry.Logger != null)
                     Main.ModEntry.Logger.Warning(string.Format("[SignalRegistry] Error clearing DVSignal reservation '{0}': {1}", GetSignalName(signal), ex.Message));
             }
+        }
+
+        /// <summary>
+        /// Checks whether a DVSignal reservation is held by an active AI train.
+        /// </summary>
+        public static bool IsSignalReservedByAI(DVSignal signal)
+        {
+            if (signal == null) return false;
+            if (signal.Parent != null) signal = signal.Parent;
+            var mgr = AITraffic.Core.TrafficManager.Instance;
+            if (mgr != null && mgr.ActiveEngineers != null)
+            {
+                for (int i = 0; i < mgr.ActiveEngineers.Count; i++)
+                {
+                    var eng = mgr.ActiveEngineers[i];
+                    if (eng != null && eng.HoldsSignalReservation(signal))
+                    {
+                        return true;
+                    }
+                }
+            }
+            return false;
+        }
+
+        /// <summary>
+        /// Checks whether a track has been reserved by a player signal route in DVSignals.
+        /// </summary>
+        public static bool IsTrackReservedByPlayerSignal(RailTrack track)
+        {
+            if (track == null || !ModCompatManager.IsDVSignalsLoaded) return false;
+            try
+            {
+                DVSignal by;
+                if (Signals.Game.Railway.TrackReserver.IsTrackReserved(track, out by))
+                {
+                    if (by != null && !IsSignalReservedByAI(by))
+                    {
+                        return true;
+                    }
+                }
+            }
+            catch { }
+            return false;
+        }
+
+        /// <summary>
+        /// Checks whether any branch connected to a junction is reserved by a player signal route in DVSignals.
+        /// </summary>
+        public static bool IsJunctionReservedByPlayerSignal(Junction junction)
+        {
+            if (junction == null || !ModCompatManager.IsDVSignalsLoaded) return false;
+            try
+            {
+                if (junction.inBranch != null && junction.inBranch.track != null)
+                {
+                    if (IsTrackReservedByPlayerSignal(junction.inBranch.track)) return true;
+                }
+                if (junction.outBranches != null)
+                {
+                    for (int i = 0; i < junction.outBranches.Count; i++)
+                    {
+                        var b = junction.outBranches[i];
+                        if (b != null && b.track != null)
+                        {
+                            if (IsTrackReservedByPlayerSignal(b.track)) return true;
+                        }
+                    }
+                }
+            }
+            catch { }
+            return false;
         }
 
         /// <summary>
@@ -827,9 +919,10 @@ namespace AITraffic.Navigation
                 {
                     var sig = aheadSignals[i].Signal;
                     float dist = aheadSignals[i].Distance;
-
-                    if (IsMainSignal(sig))
+                    var effectiveSig = (sig != null && sig.Parent != null) ? sig.Parent : sig;
+                    if (IsGoverningSignal(effectiveSig))
                     {
+                        sig = effectiveSig;
                         if (currentBlock.BlockIndex == 1)
                         {
                             currentBlock.ExitSignal = sig;
@@ -947,9 +1040,11 @@ namespace AITraffic.Navigation
                         {
                             var sig = trackAheadSignals[i].Signal;
                             float sigDist = trackAheadSignals[i].Distance;
+                            var effectiveSig = (sig != null && sig.Parent != null) ? sig.Parent : sig;
 
-                            if (IsMainSignal(sig))
+                            if (IsGoverningSignal(effectiveSig))
                             {
+                                sig = effectiveSig;
                                 currentBlock.ExitSignal = sig;
                                 currentBlock.DistanceToExit = sigDist;
                                 currentBlock.BlockLength = sigDist - currentBlock.DistanceToEntry;
@@ -1001,17 +1096,6 @@ namespace AITraffic.Navigation
                         blk.AspectColor = GetAspectColor(blk.ExitSignal ?? blk.EntrySignal);
                     }
                 }
-
-                bool allSwitchesAligned = true;
-                for (int s = 0; s < blk.Switches.Count; s++)
-                {
-                    if (!blk.Switches[s].IsAligned)
-                    {
-                        allSwitchesAligned = false;
-                        break;
-                    }
-                }
-                blk.AreSwitchesAligned = allSwitchesAligned;
             }
 
             return results.Count > 0;

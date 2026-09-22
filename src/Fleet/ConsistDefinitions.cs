@@ -359,24 +359,18 @@ namespace AITraffic.Fleet
             int carCount;
             if (isEmptyReturn)
             {
-                carCount = rng.Next(5, 8);
+                carCount = rng.Next(3, 6);
             }
             else if (isHeavyBulk)
             {
-                carCount = rng.Next(3, 5);
+                carCount = rng.Next(2, 4);
             }
             else
             {
-                carCount = rng.Next(4, 7);
+                carCount = rng.Next(3, 5);
             }
 
             PopulateFreightWagons(result, freightPool, carCount, isHeavyBulk, isEmptyReturn, rng, isShunter: true);
-
-            // 50% chance of Caboose on rear
-            if (rng.NextDouble() > 0.5)
-            {
-                AddCar(result, TrainCarType.CabooseRed, CargoType.None);
-            }
         }
 
         private static void BuildRegionalConsist(List<ConsistCarSpec> result, string oYard, string dYard, System.Random rng)
@@ -396,21 +390,18 @@ namespace AITraffic.Fleet
             int carCount;
             if (isEmptyReturn)
             {
-                carCount = rng.Next(10, 15);
+                carCount = rng.Next(7, 11);
             }
             else if (isHeavyBulk)
             {
-                carCount = rng.Next(6, 9);
+                carCount = rng.Next(4, 7);
             }
             else
             {
-                carCount = rng.Next(8, 12);
+                carCount = rng.Next(5, 8);
             }
 
             PopulateFreightWagons(result, freightPool, carCount, isHeavyBulk, isEmptyReturn, rng);
-
-            // Rear Caboose
-            AddCar(result, TrainCarType.CabooseRed, CargoType.None);
         }
 
         private static void BuildMainlineHeavyConsist(List<ConsistCarSpec> result, string oYard, string dYard, System.Random rng)
@@ -442,26 +433,23 @@ namespace AITraffic.Fleet
             if (isDoubleHeader)
             {
                 if (isEmptyReturn)
-                    carCount = rng.Next(20, 29);
+                    carCount = rng.Next(14, 19);
                 else if (isHeavyBulk)
-                    carCount = rng.Next(16, 23);
+                    carCount = rng.Next(10, 15);
                 else
-                    carCount = rng.Next(18, 25);
+                    carCount = rng.Next(12, 17);
             }
             else
             {
                 if (isEmptyReturn)
-                    carCount = rng.Next(14, 19);
+                    carCount = rng.Next(10, 15);
                 else if (isHeavyBulk)
-                    carCount = rng.Next(10, 14);
+                    carCount = rng.Next(6, 9);
                 else
-                    carCount = rng.Next(12, 17);
+                    carCount = rng.Next(7, 11);
             }
 
             PopulateFreightWagons(result, freightPool, carCount, isHeavyBulk, isEmptyReturn, rng);
-
-            // Rear Caboose
-            AddCar(result, TrainCarType.CabooseRed, CargoType.None);
         }
 
         private static void PopulateFreightWagons(

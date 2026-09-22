@@ -59,6 +59,88 @@ namespace AITraffic.Compat
                 return true;
             }
         }
+
+        /// <summary>
+        /// Prevents stress buildup derailments on AI-controlled rolling stock.
+        /// </summary>
+        [HarmonyPatch(typeof(TrainStress), "Derail")]
+        public static class TrainStress_Derail_Patch
+        {
+            public static bool Prefix(TrainStress __instance, string msg)
+            {
+                if (__instance == null) return true;
+
+                if (Main.Settings != null && Main.Settings.AIDamageImmunity)
+                {
+                    TrainCar car = __instance.GetComponent<TrainCar>();
+                    if (car == null)
+                    {
+                        var bogie = __instance.GetComponent<Bogie>();
+                        if (bogie != null) car = bogie.Car;
+                    }
+                    if (car == null)
+                    {
+                        car = __instance.GetComponentInParent<TrainCar>();
+                    }
+                    if (car == null)
+                    {
+                        car = Traverse.Create(__instance).Field("car").GetValue<TrainCar>();
+                    }
+
+                    if (car != null && TrafficManager.IsAITrain(car))
+                    {
+                        __instance.ResetTrainStress();
+                        return false; // Suppress stress derailment
+                    }
+                }
+
+                return true;
+            }
+        }
+
+        /// <summary>
+        /// Prevents individual bogie derailment on AI-controlled rolling stock.
+        /// </summary>
+        [HarmonyPatch(typeof(Bogie), "Derail")]
+        public static class Bogie_Derail_Patch
+        {
+            public static bool Prefix(Bogie __instance)
+            {
+                if (__instance == null || __instance.Car == null) return true;
+
+                if (Main.Settings != null && Main.Settings.AIDamageImmunity)
+                {
+                    if (TrafficManager.IsAITrain(__instance.Car))
+                    {
+                        return false; // Suppress bogie derailment
+                    }
+                }
+
+                return true;
+            }
+        }
+
+        /// <summary>
+        /// Prevents full car derailment on AI-controlled rolling stock.
+        /// </summary>
+        [HarmonyPatch(typeof(TrainCar), "DerailAllBogies")]
+        public static class TrainCar_DerailAllBogies_Patch
+        {
+            public static bool Prefix(TrainCar __instance)
+            {
+                if (__instance == null) return true;
+
+                if (Main.Settings != null && Main.Settings.AIDamageImmunity)
+                {
+                    if (TrafficManager.IsAITrain(__instance))
+                    {
+                        return false; // Suppress car derailment
+                    }
+                }
+
+                return true;
+            }
+        }
     }
 }
 

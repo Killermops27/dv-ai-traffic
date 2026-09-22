@@ -31,6 +31,7 @@ namespace AITraffic.Config
         public TrafficDensity Density = TrafficDensity.Medium;
         public bool PlayerPriority = true;
         public float MaxActiveTrains = 4f;
+        public float SpawnIntervalMinutes = 3.0f;
         public float SpawnDistanceMin = 800f;
         public float SpawnDistanceMax = 2500f;
         public float DespawnDistance = 3000f;
@@ -162,6 +163,12 @@ namespace AITraffic.Config
                 GUILayout.EndHorizontal();
                 GUILayout.Space(8);
 
+                GUILayout.BeginHorizontal();
+                GUILayout.Label(string.Format("Spawn Interval: <b>{0:F1} min</b>", SpawnIntervalMinutes), GUILayout.Width(200));
+                SpawnIntervalMinutes = Mathf.Round(GUILayout.HorizontalSlider(SpawnIntervalMinutes, 1.0f, 10.0f) * 2f) / 2f;
+                GUILayout.EndHorizontal();
+                GUILayout.Space(8);
+
                 // --- SPAWN & DESPAWN DISTANCES ---
                 GUILayout.Label("Spawning & Despawning Distances", subHeaderStyle);
 
@@ -249,6 +256,23 @@ namespace AITraffic.Config
                     int purged = AITraffic.Compat.AIDebtPatches.PurgeHistoricalStagedDebts();
                     if (Main.ModEntry != null && Main.ModEntry.Logger != null)
                         Main.ModEntry.Logger.Log(string.Format("Purged {0} staged loco debts from career ledger.", purged));
+                }
+                GUILayout.EndHorizontal();
+
+                // --- WORLD AI CAR CLEANUP ---
+                GUILayout.Space(12);
+                GUILayout.Label("World AI Train Cleanup", subHeaderStyle);
+                GUILayout.Label("Removes all ambient AI trains and orphaned derailed/separated AI cars from the world. Useful before saving or loading a game.", descStyle);
+
+                GUILayout.BeginHorizontal();
+                if (GUILayout.Button("🧹 Purge All AI Cars in World", GUILayout.Width(300)))
+                {
+                    if (AITraffic.Core.TrafficManager.Instance != null)
+                    {
+                        int purged = AITraffic.Core.TrafficManager.Instance.PurgeAllWorldAICars();
+                        if (Main.ModEntry != null && Main.ModEntry.Logger != null)
+                            Main.ModEntry.Logger.Log(string.Format("Purged {0} AI cars from the world.", purged));
+                    }
                 }
                 GUILayout.EndHorizontal();
 

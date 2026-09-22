@@ -422,6 +422,44 @@ namespace AITraffic.Compat
         #region AI Train Tagging & Save Isolation
 
         /// <summary>
+        /// Tags a list of <see cref="TrainCar"/>s as dynamic AI traffic immediately upon spawning.
+        /// </summary>
+        public static void TagCarsAsAITraffic(List<TrainCar> cars)
+        {
+            if (cars == null) return;
+            try
+            {
+                lock (s_aiCarsLock)
+                {
+                    for (int i = 0; i < cars.Count; i++)
+                    {
+                        var car = cars[i];
+                        if (car == null) continue;
+                        car.playerSpawnedCar = true;
+                        car.preventDebtDisplay = true;
+                        if (car.gameObject != null && car.gameObject.GetComponent<AITrafficCarMarker>() == null)
+                        {
+                            car.gameObject.AddComponent<AITrafficCarMarker>();
+                        }
+                        if (!string.IsNullOrEmpty(car.CarGUID)) s_aiCarGuids.Add(car.CarGUID);
+                        if (!string.IsNullOrEmpty(car.ID))
+                        {
+                            s_aiCarIds.Add(car.ID);
+                            s_historicalAmbientCarIds.Add(car.ID);
+                            s_knownNonAiCarIds.Remove(car.ID);
+                        }
+                        s_aiCars.Add(car);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                if (Main.ModEntry != null && Main.ModEntry.Logger != null)
+                    Main.ModEntry.Logger.Error(string.Format("Error tagging cars as AI traffic: {0}", ex));
+            }
+        }
+
+        /// <summary>
         /// Tags an entire <see cref="Trainset"/> and its constituent <see cref="TrainCar"/>s as dynamic AI traffic.
         /// Sets playerSpawnedCar=true so PersistentJobs ignores them during procedural job generation,
         /// attaches <see cref="AITrafficCarMarker"/>, and registers them to be skipped by save serializers.
@@ -747,6 +785,31 @@ namespace AITraffic.Compat
     }
 
     /// <summary>
+    /// Purges all transient ambient AI cars and orphaned crash fragments before a save game is loaded.
+    /// Ensures that the world state is clean and zero ambient AI cars persist into the loaded savegame.
+    /// </summary>
+    [HarmonyPatch(typeof(CarsSaveManager), "Load")]
+    internal static class CarsSaveManager_Load_Patch
+    {
+        [HarmonyPrefix]
+        private static void Prefix()
+        {
+            try
+            {
+                if (AITraffic.Core.TrafficManager.Instance != null)
+                {
+                    AITraffic.Core.TrafficManager.Instance.PurgeAllWorldAICars();
+                }
+            }
+            catch (Exception ex)
+            {
+                if (Main.ModEntry != null && Main.ModEntry.Logger != null)
+                    Main.ModEntry.Logger.Error(string.Format("Error in CarsSaveManager.Load prefix patch: {0}", ex));
+            }
+        }
+    }
+
+    /// <summary>
     /// Despawns all AI trains when returning to the main menu.
     /// </summary>
     [HarmonyPatch(typeof(DV.UI.MainMenu), "GoBackToMainMenu")]
@@ -759,7 +822,7 @@ namespace AITraffic.Compat
             {
                 if (AITraffic.Core.TrafficManager.IsRunning && AITraffic.Core.TrafficManager.Instance != null)
                 {
-                    AITraffic.Core.TrafficManager.Instance.DespawnAllAITrains();
+                    AITraffic.Core.TrafficManager.Instance.PurgeAllWorldAICars();
                 }
             }
             catch (Exception ex)
@@ -783,7 +846,7 @@ namespace AITraffic.Compat
             {
                 if (AITraffic.Core.TrafficManager.IsRunning && AITraffic.Core.TrafficManager.Instance != null)
                 {
-                    AITraffic.Core.TrafficManager.Instance.DespawnAllAITrains();
+                    AITraffic.Core.TrafficManager.Instance.PurgeAllWorldAICars();
                 }
             }
             catch (Exception ex)
@@ -807,7 +870,7 @@ namespace AITraffic.Compat
             {
                 if (AITraffic.Core.TrafficManager.IsRunning && AITraffic.Core.TrafficManager.Instance != null)
                 {
-                    AITraffic.Core.TrafficManager.Instance.DespawnAllAITrains();
+                    AITraffic.Core.TrafficManager.Instance.PurgeAllWorldAICars();
                 }
             }
             catch (Exception ex)

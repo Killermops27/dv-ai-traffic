@@ -92,7 +92,7 @@ namespace AITraffic.Driver
         /// <summary>
         /// Maximum safe lateral centrifugal acceleration in Gs before derailment risk (0.5G = ~4.9 m/s^2).
         /// </summary>
-        public const float MaxCentrifugalG = 0.5f;
+        public const float MaxCentrifugalG = 0.22f;
 
         /// <summary>
         /// Default service deceleration rate (m/s^2) for comfortable, early braking initiation.
@@ -223,7 +223,9 @@ namespace AITraffic.Driver
             if (radius >= 170.0f) return 60.0f;
             if (radius >= 130.0f) return 50.0f;
             if (radius >= 95.0f) return 40.0f;
-            return 30.0f;
+            if (radius >= 60.0f) return 30.0f;
+            if (radius >= 40.0f) return 20.0f;
+            return 15.0f;
         }
 
         /// <summary>
@@ -242,7 +244,7 @@ namespace AITraffic.Driver
 
             float maxLateralAcc = maxG * Gravity; // e.g. 0.5 * 9.80665 = 4.9033 m/s^2
             float vMaxMs = Mathf.Sqrt(maxLateralAcc * radius);
-            return Mathf.Max(30.0f, vMaxMs * 3.6f);
+            return Mathf.Max(15.0f, vMaxMs * 3.6f);
         }
 
         /// <summary>
@@ -368,7 +370,7 @@ namespace AITraffic.Driver
             float signLimit = GetSignSpeedLimitForRadius(radius);
             float centrifugalLimit = GetCentrifugalSpeedLimit(radius, LateralAccG);
 
-            float trackLimit = Mathf.Max(30.0f, Mathf.Min(signLimit, centrifugalLimit));
+            float trackLimit = Mathf.Max(15.0f, Mathf.Min(signLimit, centrifugalLimit));
 
             // 2. Mainline / Station platform tracks: capped at 80 km/h max (or curve limit if lower)
             string trackName = track.name ?? string.Empty;
@@ -448,9 +450,10 @@ namespace AITraffic.Driver
                 return targetSpeedAtEndMs;
             }
 
+            float effectiveDist = Mathf.Max(0.0f, distanceRemaining - (targetSpeedAtEndMs * 1.5f));
             float safeDecel = Mathf.Max(0.01f, deceleration);
             float vEndSq = targetSpeedAtEndMs * targetSpeedAtEndMs;
-            float maxSpeedSq = vEndSq + (2.0f * safeDecel * distanceRemaining);
+            float maxSpeedSq = vEndSq + (2.0f * safeDecel * effectiveDist);
 
             return Mathf.Sqrt(maxSpeedSq);
         }
@@ -723,7 +726,7 @@ namespace AITraffic.Driver
                 result.CurvatureLimitKmh = GetCentrifugalSpeedLimit(radius, LateralAccG);
             }
 
-            float finalTargetKmh = Mathf.Max(30.0f, Mathf.Min(result.TrackLimitKmh, result.CurvatureLimitKmh));
+            float finalTargetKmh = Mathf.Max(15.0f, Mathf.Min(result.TrackLimitKmh, result.CurvatureLimitKmh));
             result.LimitingReason = (result.CurvatureLimitKmh < result.TrackLimitKmh) 
                 ? SpeedLimitReason.CurvatureRadius 
                 : SpeedLimitReason.TrackSignLimit;
@@ -746,7 +749,11 @@ namespace AITraffic.Driver
                     RailTrack uTrack = upcomingTracks[i];
                     if (uTrack == null) continue;
 
-                    float uLimit = GetTrackSpeedLimit(uTrack);
+                    float uTrackLimit = GetTrackSpeedLimit(uTrack);
+                    float uRadius = GetTrackMinimumRadius(uTrack);
+                    float uCurveLimit = GetCentrifugalSpeedLimit(uRadius, LateralAccG);
+                    float uLimit = Mathf.Min(uTrackLimit, uCurveLimit);
+
                     if (uLimit < finalTargetKmh)
                     {
                         // Calculate maximum allowable speed at current train position so it decelerates smoothly to reach uLimit right at uTrack entry

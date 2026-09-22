@@ -318,7 +318,14 @@ namespace AITraffic.Core
                 return;
 
             // Compute dynamic dispatch interval based on density
-            _dispatchIntervalSeconds = TrafficDensityExtensions.switch_density(settings.Density);
+            if (settings != null && settings.SpawnIntervalMinutes > 0.1f)
+            {
+                _dispatchIntervalSeconds = settings.SpawnIntervalMinutes * 60f;
+            }
+            else
+            {
+                _dispatchIntervalSeconds = TrafficDensityExtensions.switch_density(settings.Density);
+            }
 
             if (_isFirstSchedulerTick)
             {
@@ -448,6 +455,12 @@ namespace AITraffic.Core
 
                 // 3. Player occupancy gate
                 if (AITraffic.Navigation.SignalRegistry.IsTrackOccupiedByPlayer(trk, null)) continue;
+
+                Signals.Game.Signal _;
+                if (ModCompatManager.IsDVSignalsLoaded && Signals.Game.Railway.TrackReserver.IsTrackReserved(trk, out _))
+                {
+                    continue;
+                }
 
                 // 4. Grade & dead-end gate
                 var edge = AITraffic.Navigation.RailGraph.Instance.GetEdge(trk);
@@ -789,6 +802,18 @@ namespace AITraffic.Core
                 }
             }
 
+            if (ModCompatManager.IsDVSignalsLoaded)
+            {
+                Signals.Game.Signal _;
+                for (int i = 0; i < routePath.Tracks.Count; i++)
+                {
+                    if (Signals.Game.Railway.TrackReserver.IsTrackReserved(routePath.Tracks[i], out _))
+                    {
+                        return false;
+                    }
+                }
+            }
+
             // Rule A: Never route through the player's occupied track
             if (playerTrack != null && routePath.Tracks.Contains(playerTrack))
             {
@@ -796,9 +821,12 @@ namespace AITraffic.Core
             }
 
             // Rule B: Head-On Conflict on Single Track with moving player
-            if (playerTrack != null && playerSpeedMs > 0.6f && playerMoveDir != Vector3.zero)
+            Vector3 heading = (playerSpeedMs > 0.6f && playerMoveDir != Vector3.zero)
+                ? playerMoveDir
+                : (PlayerManager.Car != null && PlayerManager.Car.transform != null ? PlayerManager.Car.transform.forward : Vector3.zero);
+            if (playerTrack != null && heading != Vector3.zero)
             {
-                var playerProjected = ProjectTracksAhead(playerTrack, playerMoveDir, 8);
+                var playerProjected = ProjectTracksAhead(playerTrack, heading, 25);
                 for (int p = 0; p < playerProjected.Count; p++)
                 {
                     var projTrack = playerProjected[p];
@@ -859,26 +887,61 @@ namespace AITraffic.Core
                             if (!isDouble)
                             {
                                 int meetIdx = routePath.Tracks.IndexOf(eTrk);
-                                bool hasLoop = false;
-                                for (int m = 0; m < meetIdx; m++)
+
+                                // Check if active train has already reserved this single track
+                                if (AITraffic.Navigation.RailGraph.Instance != null && AITraffic.Navigation.RailGraph.Instance.IsTrackReservedByOther(eTrk, null))
                                 {
-                                    var intermediate = routePath.Tracks[m];
-                                    if (AITraffic.Navigation.Pathfinder.IsPassingOrSidingTrack(intermediate))
+                                    return false; // Track is already reserved by active traffic!
+                                }
+
+                                // Check direction of movement along eTrk
+                                bool isOpposing = false;
+                                if (i < engTracks.Count - 1 && meetIdx > 0 && routePath.Tracks[meetIdx - 1] == engTracks[i + 1])
+                                {
+                                    isOpposing = true;
+                                }
+                                else if (i > curIdx && meetIdx < routePath.Tracks.Count - 1 && routePath.Tracks[meetIdx + 1] == engTracks[i - 1])
+                                {
+                                    isOpposing = true;
+                                }
+                                else if (eTrk.curve != null)
+                                {
+                                    Vector3 engVec = (i < engTracks.Count - 1 && engTracks[i + 1].curve != null)
+                                        ? (engTracks[i + 1].curve.GetPointAt(0.5f) - eTrk.curve.GetPointAt(0.5f)).normalized
+                                        : Vector3.zero;
+                                    Vector3 candVec = (meetIdx < routePath.Tracks.Count - 1 && routePath.Tracks[meetIdx + 1].curve != null)
+                                        ? (routePath.Tracks[meetIdx + 1].curve.GetPointAt(0.5f) - eTrk.curve.GetPointAt(0.5f)).normalized
+                                        : Vector3.zero;
+                                    if (engVec != Vector3.zero && candVec != Vector3.zero && Vector3.Dot(engVec, candVec) < -0.2f)
                                     {
-                                        hasLoop = true;
-                                        break;
-                                    }
-                                    var iEdge = (AITraffic.Navigation.RailGraph.Instance != null) ? AITraffic.Navigation.RailGraph.Instance.GetEdge(intermediate) : null;
-                                    if (iEdge != null && iEdge.IsDoubleTrackMainline)
-                                    {
-                                        hasLoop = true;
-                                        break;
+                                        isOpposing = true;
                                     }
                                 }
 
-                                if (!hasLoop)
+                                if (isOpposing)
                                 {
-                                    return false; // Deadlock conflict with active AI train!
+                                    bool hasIntermediateLoop = false;
+                                    // Intermediate passing loop must be along the line between station exit (m >= 2) and meeting point
+                                    for (int m = 2; m < meetIdx - 1; m++)
+                                    {
+                                        var intermediate = routePath.Tracks[m];
+                                        if (AITraffic.Navigation.Pathfinder.IsPassingOrSidingTrack(intermediate))
+                                        {
+                                            hasIntermediateLoop = true;
+                                            break;
+                                        }
+                                        var iEdge = (AITraffic.Navigation.RailGraph.Instance != null) ? AITraffic.Navigation.RailGraph.Instance.GetEdge(intermediate) : null;
+                                        if (iEdge != null && iEdge.IsDoubleTrackMainline)
+                                        {
+                                            hasIntermediateLoop = true;
+                                            break;
+                                        }
+                                    }
+
+                                    if (!hasIntermediateLoop)
+                                    {
+                                        return false; // Deadlock conflict: Opposing active AI train on single track without passing loop!
+                                    }
                                 }
                             }
                         }
