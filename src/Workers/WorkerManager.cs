@@ -481,6 +481,11 @@ namespace AITraffic.Workers
                 {
                     TrainSpawner.ApplyAIDamageImmunity(car, true);
                 }
+
+                if (car.IsLoco)
+                {
+                    TrainSpawner.RemoveLocoZoneBlockers(car);
+                }
             }
 
             // Start up engine prime mover and electronics

@@ -428,6 +428,16 @@ namespace AITraffic.Driver
                 {
                     RegisterConsistCars(_trainCar.trainset.cars);
                 }
+
+                AITraffic.Fleet.TrainSpawner.RemoveLocoZoneBlockers(_trainCar);
+                for (int i = 0; i < _registeredConsistCars.Count; i++)
+                {
+                    var c = _registeredConsistCars[i];
+                    if (c != null && c.IsLoco)
+                    {
+                        AITraffic.Fleet.TrainSpawner.RemoveLocoZoneBlockers(c);
+                    }
+                }
             }
         }
 

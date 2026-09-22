@@ -1134,11 +1134,57 @@ namespace AITraffic.Fleet
                         controls.Starter.Set(1f);
                     }
                 }
+                // Remove career license blockers and colliders so moving AI trains never trigger position-fix lag spikes
+                RemoveLocoZoneBlockers(loco);
             }
             catch (Exception ex)
             {
                 if (Main.ModEntry != null && Main.ModEntry.Logger != null)
                     Main.ModEntry.Logger.Warning(string.Format("Warning initializing locomotive '{0}': {1}", loco.ID, ex.Message));
+            }
+        }
+
+        /// <summary>
+        /// Removes career license blockers (LocoZoneBlocker) and their colliders from AI-operated locomotives,
+        /// preventing physics invalidation, log spam, and lag spikes when running at speed.
+        /// </summary>
+        public static void RemoveLocoZoneBlockers(TrainCar loco)
+        {
+            if (loco == null) return;
+
+            try
+            {
+                var blockers = loco.GetComponentsInChildren<LocoZoneBlocker>(true);
+                if (blockers != null && blockers.Length > 0)
+                {
+                    for (int i = 0; i < blockers.Length; i++)
+                    {
+                        if (blockers[i] != null)
+                        {
+                            AITraffic.Compat.LocoZoneBlockerPatches.Unblock(blockers[i]);
+                        }
+                    }
+                }
+
+                if (loco.interior != null)
+                {
+                    var interiorBlockers = loco.interior.GetComponentsInChildren<LocoZoneBlocker>(true);
+                    if (interiorBlockers != null && interiorBlockers.Length > 0)
+                    {
+                        for (int i = 0; i < interiorBlockers.Length; i++)
+                        {
+                            if (interiorBlockers[i] != null)
+                            {
+                                AITraffic.Compat.LocoZoneBlockerPatches.Unblock(interiorBlockers[i]);
+                            }
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                if (Main.ModEntry != null && Main.ModEntry.Logger != null)
+                    Main.ModEntry.Logger.Warning(string.Format("Warning clearing LocoZoneBlockers on '{0}': {1}", loco.ID, ex.Message));
             }
         }
 
