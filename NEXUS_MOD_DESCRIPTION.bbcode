@@ -1,8 +1,8 @@
 [center][size=5][b][color=#FFB833]Derail Valley AI Traffic (AITraffic)[/color][/b][/size]
 [size=3][i]Autonomous AI Train Traffic, Timetable Dispatching & Player-Employed AI Workers[/i][/size]
-[size=2]Author: [b]Killermops27[/b] | Version: [b][color=#55DD55]0.2.5 (Alpha)[/color][/b][/size]
+[size=2]Author: [b]Killermops27[/b] | Version: [b][color=#55DD55]0.2.6 (Alpha)[/color][/b][/size]
 
-[url=https://github.com/Killermops27/dv-ai-traffic][b]GitHub Repository[/b][/url] • [url=https://github.com/Killermops27/dv-ai-traffic/releases/tag/v0.2.5][b]Latest Release[/b][/url] • [url=https://github.com/Killermops27/dv-ai-traffic/issues][b]Report a Bug[/b][/url] • [url=https://www.nexusmods.com/derailvalley/mods/1685][b]Nexus Mods #1685[/b][/url]
+[url=https://github.com/Killermops27/dv-ai-traffic][b]GitHub Repository[/b][/url] • [url=https://github.com/Killermops27/dv-ai-traffic/releases/tag/v0.2.6][b]Latest Release[/b][/url] • [url=https://github.com/Killermops27/dv-ai-traffic/issues][b]Report a Bug[/b][/url] • [url=https://www.nexusmods.com/derailvalley/mods/1685][b]Nexus Mods #1685[/b][/url]
 [/center]
 
 [hr]
@@ -16,16 +16,17 @@ If you find reproducible bugs, please report them on our [url=https://github.com
 
 [hr]
 
-[size=4][b][color=#FFB833]✦ What's New in Version 0.2.5[/color][/b][/size]
+[size=4][b][color=#FFB833]✦ What's New in Version 0.2.6[/color][/b][/size]
 
 [list]
-[*][b]Steep Grade Hillstarts & Decoupled 2-Stage Brake Release:[/b] Evaluates physical cab throttle lever precharge scaled with grade (0.40–0.65). Vents train brake pipe first while holding independent brakes at 100%, smoothly graduating independent brakes only after positive forward tractive effort is established to prevent backward runaways on steep mountain inclines.
-[*][b]True Traction Wheel-Slip Sensing & Sander Regulation:[/b] Decouples power slip from brake skidding, enforces a 0.50 minimum throttle floor on hill starts, and applies sanders dynamically on genuine traction slip or steep grades (> 1.5%).
-[*][b]Dynamic Deadlock-Breaking Yield Inversion:[/b] Physical feasibility strictly overrides nominal priority at bottlenecks and siding throats. Stationary trains blocked by obstacles yield priority, release all junction locks, and drop DVSignals reservations, allowing unblocked clearing trains to align switches to detours and vacate the line.
-[*][b]Junction Self-Occupancy Differentiation:[/b] Switches distinguish the requesting train from external trains, eliminating false self-denials during approach while keeping points locked when bogies are directly over movable blades (<= 6.5m).
-[*][b]Interactive Encounter Trains & Passing Dispatch:[/b] Dynamically dispatches trains to pass or meet the player along active valley corridors, backed by predictive single-track deadlock conflict checking ([i]PredictDeadlockConflict[/i]).
-[*][b]Instant Spline Length Pre-Checking & Smooth Spawning:[/b] Mathematical spline length pre-check ([i]CanConsistFitOnTrack[/i]) verifies clearance before spawning; capped path searches at 8 max with 1 search/frame pacing to eliminate freezes; pre-charges brake pipes before coupling to suppress base-game warnings.
-[*][b]Performance Profiler & Vector Map Exporter (Debug):[/b] Live rolling FPS and pathfinding profiler ([b][ ⚡ Perf ][/b] HUD) and standalone interactive HTML5/SVG vector map exporter ([b]Ctrl + Shift + M[/b]).
+[*][b]Player Corridor Right-of-Way & Signal Clearance:[/b] AI checks player DVSignals reservations, immediately releasing junction locks and switch alignment requests when a single-track corridor is reserved by the player.
+[*][b]Head-to-Head Encounter & Siding Deadlock Prevention:[/b] Ambient trains approaching single-track corridors evaluate opposing traffic in advance and hold safely inside passing loops with deterministic tie-breaking.
+[*][b]Station Entry Signal Lockout Fix:[/b] Mapped sub-distant repeater heads to parent governing signals and enforced strict single-signal reservation, preventing downstream exit signals from turning entry signals red.
+[*][b]Dynamic Chain-of-Switches Alignment:[/b] Facing a red signal expands switch alignment lookahead up to 64 tracks and 3500m, proactively throwing switches and waking signal controllers until aspects clear to green.
+[*][b]Refined Destination Despawning & Final Parking:[/b] Trains only shut down after reaching buffer stop or obstacle within 35m; all despawn checks strictly respect the user-configured [i]DespawnDistance[/i] setting.
+[*][b]Crash Recovery & World AI Car Purge:[/b] Derailments trigger emergency shutdowns and lock releases; added automatic despawn of crashed rakes and a manual/automatic [i]Purge All AI Cars[/i] tool to clean abandoned rolling stock.
+[*][b]In-Block Switch Protection & Player Interlock:[/b] Switches inside an active signal block or within 250m of an approaching train (≥ 1.5 km/h) remain locked against manual or Comms Radio player interference, playing native rejection audio if thrown.
+[*][b]Physics-Based Derailment Prevention & Tail Speed Clamping:[/b] Lowered curve floor clamp to 15 km/h, added 1800m centrifugal curve lookahead, and hold locomotive speed until the entire consist clears sharp curves; damage immunity now fully suppresses derailment stress.
 [/list]
 
 [hr]
@@ -55,19 +56,20 @@ If you find reproducible bugs, please report them on our [url=https://github.com
 [b][color=#55DD55]3. Signaling, Corridor Holding & Safety Interlocking[/color][/b]
 [list]
 [*][b]DVSignals Integration & Remote Keep-Alive:[/b] Evaluates physical signal aspects, block reservations, and headway control down to 0m stop lines, keeping distant signal controllers active within 1500m of AI trains.
+[*][b]Player Corridor Right-of-Way:[/b] AI respects player DVSignals reservations and yields single-track corridors immediately, releasing junction locks and switch alignment requests.
+[*][b]In-Block Switch Protection:[/b] Switches inside active signal blocks or within 250m of approaching trains remain locked against manual player interference with audio feedback.
 [*][b]Dynamic Deadlock-Breaking Yield Inversion:[/b] Physical feasibility strictly overrides nominal priority at bottlenecks. Blocked stationary trains yield priority and drop locks, allowing clearing trains to align detours and vacate bottlenecks.
 [*][b]Junction Self-Occupancy Differentiation:[/b] Switches distinguish requester train from external trains, eliminating false self-denials during approach while keeping points locked when bogies are over points.
-[*][b]Periodic Signal Wait Retry:[/b] Automatically re-requests switch alignment and wakes DVSignals controllers every 20s when halted at red signals.
+[*][b]Periodic Signal Wait Retry & Chain Alignment:[/b] Automatically re-requests switch alignment up to 64 tracks ahead and wakes DVSignals controllers when halted at red signals.
 [*][b]Double Track Crossover & Mirrored Mast Support:[/b] Automatically accounts for inverted mast scales on Double Track crossovers, correctly resolving governing signal aspects across mirrored masts.
-[*][b]False Green Rejection:[/b] AI engineers verify that upcoming switches within a signal's governing block are physically aligned before trusting a green aspect. Misaligned routes enforce an immediate 0 km/h stop line 15m before the signal.
 [*][b]Whole-Trainset Switch Straddle Interlocking:[/b] Switches are strictly locked against throwing while any car body or bogie in a consist is physically straddling switch points.
 [*][b]Single-Track Corridor Protection:[/b] Evaluates single-track corridors ahead of passing loops. Holds safely inside passing sidings outside the switch fouling envelope (45m buffer) until the corridor clears.
-[*][b]Direction-Aware Corridor Arbitration:[/b] Distinguishes opposing trains from same-direction followers, allowing consecutive trains to proceed smoothly without deadlock.
 [*][b]Ride-Along Mode:[/b] Ride along as a passenger in an AI train cab or nearby track without triggering occupancy stop sensors.
 [/list]
 
-[b][color=#55DD55]4. Ambient Fleet Simulation & Yard Persistence[/color][/b]
+[b][color=#55DD55]4. Ambient Fleet Simulation, Yard Persistence & Cleanup[/color][/b]
 [list]
+[*][b]World AI Car Purge:[/b] Wipes orphaned ambient cars from the world without touching player or worker consists, available via UMM and Debug HUD.
 [*][b]Interactive Encounter Trains & Passing Dispatch:[/b] Dynamically schedules meets and passing trains along active valley routes with predictive single-track conflict checking.
 [*][b]Strict Passing Loop Yard Exclusion:[/b] Industrial yard storage tracks ([i][Y][/i]) are strictly excluded from candidate passing loops, preventing trains from dodging into yard ladders.
 [*][b]Instant Spline Length Pre-Checking:[/b] Mathematically checks consist length against track splines (<0.05ms) before instantiation, eliminating freezes and oversized spawns.
@@ -95,6 +97,7 @@ If you find reproducible bugs, please report them on our [url=https://github.com
 [*]Toggle [b][ 3D Locos ][/b] to display overhead floating tags.
 [*]Toggle [b][ Ride-Along ][/b] when riding inside AI locomotive cabs.
 [*]Toggle [b][ ⚡ Perf ][/b] in Debug HUD to view rolling FPS and pathfinding profiler metrics.
+[*]Click [b][ 🧹 Purge AI Cars ][/b] to clean orphaned ambient rolling stock from the map.
 [/list]
 
 [hr]
@@ -118,7 +121,7 @@ If you find reproducible bugs, please report them on our [url=https://github.com
 
 [size=4][b][color=#FFB833]✦ Installation[/color][/b][/size]
 
-1. Download [b]AITraffic-v0.2.5.zip[/b] from the Files tab.
+1. Download [b]AITraffic-v0.2.6.zip[/b] from the Files tab.
 2. Drag and drop the archive directly into the Unity Mod Manager [b]Mods[/b] tab, OR extract into your [i]Derail Valley/Mods/[/i] folder so that [i]Info.json[/i] is at [i]Derail Valley/Mods/AITraffic/Info.json[/i].
 3. Start Derail Valley and verify that [b]AI Traffic[/b], [b]DVSignals[/b], and [b]CommsRadioAPI[/b] show green status lights in UMM ([b]Ctrl + F10[/b]).
 

@@ -44,6 +44,12 @@ An autonomous AI train traffic, timetable dispatching, and player-employed AI wo
 
 ### 3. 🚦 Signaling, Corridor Holding & Safety Interlocking
 - **DVSignals Integration & Remote Keep-Alive:** Interacts directly with [DVSignals](https://github.com/WhistleWiz/dv-signals) for block reservation and aspect enforcement down to the 0m stop line. Includes a Harmony patch keeping distant signal controllers actively evaluating block occupancy within 1500m of AI trains, eliminating dormant false greens.
+- **Player Corridor Right-of-Way & Signal Clearance:** AI respects player DVSignals reservations. If a single-track corridor is reserved by a player signal route, AI trains immediately release all junction locks and switch alignment requests to give the player full right-of-way.
+- **Station Entry Signal Lockout Fix:** Resolves signal hierarchy to ensure main signals equipped with distant repeater heads are correctly recognized. AI reserves strictly one governing signal at a time, preventing downstream exit signals from locking entry signals to red.
+- **Dynamic Chain-of-Switches Alignment:** Facing a red signal expands switch alignment lookahead up to 64 tracks and 3500m, proactively setting throat switches and waking signal controllers until aspects clear to green.
+- **In-Block Switch Protection & Player Interlock:** Switches inside an active signal block or within 250m of an approaching train (≥ 1.5 km/h) remain locked against manual or Comms Radio player interference, playing native rejection audio if thrown.
+- **Physics-Based Derailment Prevention & Tail Speed Clamping:** Evaluates centrifugal speed limits with 1800m lookahead, lowers curve speed floor to 15 km/h, clamps train speed until the entire consist clears curves, and includes comprehensive damage immunity derailment suppression.
+- **Crash Recovery & World AI Car Purge:** Derailments trigger emergency shutdowns and lock releases; crashed rakes despawn automatically outside clearance range, and an in-game `Purge All AI Cars` tool cleans abandoned rolling stock without touching player trains.
 - **Periodic Signal Wait Retry & Controller Wakeup:** Stopped trains at red signals run a 20s retry timer to re-request switch alignment and force DVSignals controllers to re-evaluate downstream blocks, preventing trains from being stranded indefinitely when blocks clear.
 - **Dynamic Deadlock-Breaking Yield Inversion:** Physical feasibility strictly overrides nominal priority at bottlenecks and siding throats. Stationary trains blocked by obstacles yield priority, release all junction locks, and drop DVSignals reservations, allowing unblocked clearing trains to align switches to detours and vacate the line.
 - **Junction Self-Occupancy Differentiation:** Switches distinguish the requesting train from external trains, eliminating false self-denials during approach while keeping points locked when bogies are directly over movable blades (<= 6.5m).
@@ -127,7 +133,7 @@ Built with cross-mod interoperability in mind:
 
 ## 🛠️ Installation
 
-1. Download the latest **`AITraffic-v0.2.5.zip`** from the **[Releases](https://github.com/Killermops27/dv-ai-traffic/releases)** section or **[Nexus Mods](https://www.nexusmods.com/derailvalley/mods/1685)**.
+1. Download the latest **`AITraffic-v0.2.6.zip`** from the **[Releases](https://github.com/Killermops27/dv-ai-traffic/releases)** section or **[Nexus Mods](https://www.nexusmods.com/derailvalley/mods/1685)**.
 2. Install via **Unity Mod Manager (UMM)**:
    - Drag and drop the downloaded `.zip` file directly into the UMM **Mods** tab, **OR**
    - Extract the `.zip` archive into your `Derail Valley/Mods/` folder so that `Info.json` is located at:

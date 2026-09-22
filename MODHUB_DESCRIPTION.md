@@ -5,7 +5,7 @@
 [![Requires: DVSignals](https://img.shields.io/badge/Requires-DVSignals-green.svg)](https://github.com/WhistleWiz/dv-signals)
 [![Requires: CommsRadioAPI](https://img.shields.io/badge/Requires-CommsRadioAPI-purple.svg)](https://github.com/Killermops27/dv-ai-traffic)
 [![Compatible: ZCouplers](https://img.shields.io/badge/Compatible-ZCouplers-blueviolet.svg)](https://www.nexusmods.com/derailvalley/mods/813)
-[![Latest Release: v0.2.5](https://img.shields.io/badge/Release-v0.2.5-brightgreen.svg)](https://github.com/Killermops27/dv-ai-traffic/releases/tag/v0.2.5)
+[![Latest Release: v0.2.6](https://img.shields.io/badge/Release-v0.2.6-brightgreen.svg)](https://github.com/Killermops27/dv-ai-traffic/releases/tag/v0.2.6)
 [![Nexus Mods](https://img.shields.io/badge/Nexus%20Mods-1685-orange.svg)](https://www.nexusmods.com/derailvalley/mods/1685)
 
 An autonomous AI train traffic, timetable dispatching, and player-employed AI worker system for **Derail Valley**, bringing the railway network to life with schedule-driven freight, passenger, shunting, and haulage movements.
@@ -22,15 +22,16 @@ An autonomous AI train traffic, timetable dispatching, and player-employed AI wo
 
 ---
 
-## 🌟 What's New in v0.2.5
+## 🌟 What's New in v0.2.6
 
-- ⛰️ **Steep Grade Hillstarts & Decoupled 2-Stage Brake Release:** Evaluates physical cab throttle lever precharge scaled with grade (0.40–0.65). Vents train brake pipe first while holding independent brakes at 100%, smoothly graduating independent brakes only after positive forward tractive effort is established to prevent backward runaways on steep mountain inclines.
-- 🛞 **True Traction Wheel-Slip Sensing & Sander Regulation:** Decouples power slip from brake skidding, enforces a 0.50 minimum throttle floor on hill starts, and applies sanders dynamically on genuine traction slip or steep grades (> 1.5%).
-- 🔄 **Dynamic Deadlock-Breaking Yield Inversion:** Physical feasibility strictly overrides nominal priority at bottlenecks and siding throats. Stationary trains blocked by obstacles yield priority, release all junction locks, and drop DVSignals reservations, allowing unblocked clearing trains to align switches to detours and vacate the line.
-- 🔀 **Junction Self-Occupancy Differentiation:** Switches distinguish the requesting train from external trains, eliminating false self-denials during approach while keeping points locked when bogies are directly over movable blades (<= 6.5m).
-- 🤝 **Interactive Encounter Trains & Passing Dispatch:** Dynamically dispatches trains to pass or meet the player along active valley corridors, backed by predictive single-track deadlock conflict checking (`PredictDeadlockConflict`).
-- 📏 **Instant Spline Length Pre-Checking & Smooth Spawning:** Mathematical spline length pre-check (`CanConsistFitOnTrack`) verifies clearance before spawning; capped path searches at 8 max with 1 search/frame pacing to eliminate freezes; pre-charges brake pipes before coupling to suppress base-game warnings.
-- ⚡ **Performance Profiler & Vector Map Exporter (Debug):** Live rolling FPS and pathfinding profiler (`[ ⚡ Perf ]` HUD) and standalone interactive HTML5/SVG vector map exporter (<kbd>Ctrl</kbd> + <kbd>Shift</kbd> + <kbd>M</kbd>).
+- 🚦 **Player Corridor Right-of-Way & Signal Clearance:** AI respects player DVSignals reservations, immediately releasing all junction locks and switch alignment requests when a single-track corridor is reserved by the player.
+- 🔄 **Head-to-Head Encounter & Siding Deadlock Prevention:** Ambient trains approaching single-track corridors evaluate opposing traffic in advance and hold safely inside passing loops with deterministic tie-breaking.
+- 🚉 **Station Entry Signal Lockout Fix:** Mapped sub-distant repeater heads directly to parent governing signals and enforced strict single-signal reservation, preventing downstream exit signals from turning entry signals red.
+- 🔀 **Dynamic Chain-of-Switches Alignment:** Facing a red signal expands switch alignment lookahead up to 64 tracks and 3500m, proactively throwing switches and waking signal controllers until aspects clear to green.
+- ⏱️ **Refined Destination Despawning & Final Parking:** Trains only shut down after reaching buffer stop or obstacle within 35m; all despawn checks strictly respect the user-configured `DespawnDistance` setting.
+- 🧹 **Crash Recovery & World AI Car Purge:** Derailments trigger emergency shutdowns and lock releases; added automatic despawn of crashed rakes and a manual/automatic `Purge All AI Cars` tool to clean abandoned rolling stock.
+- 🔒 **In-Block Switch Protection & Player Interlock:** Switches inside an active signal block or within 250m of an approaching train (≥ 1.5 km/h) remain locked against manual or Comms Radio player interference, playing native rejection audio if thrown.
+- ⚠️ **Physics-Based Derailment Prevention & Tail Speed Clamping:** Lowered curve floor clamp to 15 km/h, added 1800m centrifugal curve lookahead, and hold locomotive speed until the entire consist clears sharp curves; damage immunity now fully suppresses derailment stress.
 
 ---
 
@@ -126,7 +127,7 @@ Built with cross-mod interoperability in mind:
 
 ## 🛠️ Installation
 
-1. Download the latest **`AITraffic-v0.2.5.zip`** from [GitHub Releases](https://github.com/Killermops27/dv-ai-traffic/releases) or [Nexus Mods](https://www.nexusmods.com/derailvalley/mods/1685).
+1. Download the latest **`AITraffic-v0.2.6.zip`** from [GitHub Releases](https://github.com/Killermops27/dv-ai-traffic/releases) or [Nexus Mods](https://www.nexusmods.com/derailvalley/mods/1685).
 2. Install via **Unity Mod Manager (UMM)**:
    - Drag and drop the downloaded `.zip` file directly into the UMM **Mods** tab, **OR**
    - Extract the `.zip` archive into your `Derail Valley/Mods/` folder so that `Info.json` is located at:
