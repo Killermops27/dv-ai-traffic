@@ -31,7 +31,7 @@ namespace AITraffic.Compat
             {
                 try
                 {
-                    if (car != null && (TrainSpawner.IsSpawningAmbientConsist || ModCompatManager.IsAmbientAITrain(car)))
+                    if (car != null && (TrainSpawner.IsCarSpawning(car) || ModCompatManager.IsAmbientAITrain(car)))
                     {
                         if (Main.ModEntry != null && Main.ModEntry.Logger != null)
                             Main.ModEntry.Logger.Log(string.Format("[AIDebt] Suppressed debt registration for ambient AI loco '{0}'.", car.ID));
@@ -72,7 +72,7 @@ namespace AITraffic.Compat
 
                     if (existing != null)
                     {
-                        if (existing.car != null && (TrainSpawner.IsSpawningAmbientConsist || ModCompatManager.IsAmbientAITrain(existing.car) || ModCompatManager.IsAmbientAITrainId(existing.car.ID)))
+                        if (existing.car != null && (TrainSpawner.IsCarSpawning(existing.car) || ModCompatManager.IsAmbientAITrain(existing.car) || ModCompatManager.IsAmbientAITrainId(existing.car.ID)))
                         {
                             LocoDebtController.Instance.trackedLocosDebts.Remove(existing);
                             if (CareerManagerDebtController.Instance != null)
@@ -126,7 +126,7 @@ namespace AITraffic.Compat
                     if (__instance != null)
                     {
                         var trainCar = __instance.GetComponent<TrainCar>();
-                        if (trainCar != null && (TrainSpawner.IsSpawningAmbientConsist || ModCompatManager.IsAmbientAITrain(trainCar)))
+                        if (trainCar != null && (TrainSpawner.IsCarSpawning(trainCar) || ModCompatManager.IsAmbientAITrain(trainCar)))
                         {
                             __instance.SetDummyDebtTracker();
                             return false;
@@ -188,7 +188,7 @@ namespace AITraffic.Compat
             {
                 try
                 {
-                    if (car != null && (TrainSpawner.IsSpawningAmbientConsist || ModCompatManager.IsAmbientAITrainId(car.ID)))
+                    if (car != null && (TrainSpawner.IsCarSpawning(car.ID) || ModCompatManager.IsAmbientAITrainId(car.ID)))
                     {
                         return false; // Suppress tracking ambient AI rolling stock as jobless cars
                     }
@@ -293,7 +293,7 @@ namespace AITraffic.Compat
                 var locoDebt = debt as ExistingLocoDebt;
                 if (locoDebt != null)
                 {
-                    if (locoDebt.car != null && (TrainSpawner.IsSpawningAmbientConsist || ModCompatManager.IsAmbientAITrain(locoDebt.car)))
+                    if (locoDebt.car != null && (TrainSpawner.IsCarSpawning(locoDebt.car) || ModCompatManager.IsAmbientAITrain(locoDebt.car)))
                         return true;
                     if (!string.IsNullOrEmpty(locoDebt.ID) && ModCompatManager.IsAmbientAITrainId(locoDebt.ID))
                         return true;
@@ -302,7 +302,7 @@ namespace AITraffic.Compat
                 var ownedDebt = debt as ExistingOwnedCarDebt;
                 if (ownedDebt != null)
                 {
-                    if (ownedDebt.car != null && (TrainSpawner.IsSpawningAmbientConsist || ModCompatManager.IsAmbientAITrain(ownedDebt.car)))
+                    if (ownedDebt.car != null && (TrainSpawner.IsCarSpawning(ownedDebt.car) || ModCompatManager.IsAmbientAITrain(ownedDebt.car)))
                         return true;
                     if (!string.IsNullOrEmpty(ownedDebt.ID) && ModCompatManager.IsAmbientAITrainId(ownedDebt.ID))
                         return true;
@@ -385,7 +385,7 @@ namespace AITraffic.Compat
                         if (debt == null) continue;
 
                         TrainCar loco = debt.car;
-                        if ((loco != null && (TrainSpawner.IsSpawningAmbientConsist || ModCompatManager.IsAmbientAITrain(loco))) ||
+                        if ((loco != null && (TrainSpawner.IsCarSpawning(loco) || ModCompatManager.IsAmbientAITrain(loco))) ||
                             (!string.IsNullOrEmpty(debt.ID) && ModCompatManager.IsAmbientAITrainId(debt.ID)))
                         {
                             if (CareerManagerDebtController.Instance != null)

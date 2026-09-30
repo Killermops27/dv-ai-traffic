@@ -96,6 +96,12 @@ namespace AITraffic.Navigation
         public float MaxSearchDistance { get; set; }
 
         /// <summary>
+        /// When true, allows heavily penalized emergency detours through empty yard shunting/storage tracks
+        /// when the main through-tracks are completely blocked.
+        /// </summary>
+        public bool AllowShuntingDetour { get; set; }
+
+        /// <summary>
         /// Optional Trainset belonging to the requester. Cars belonging to this trainset are ignored during occupancy checks.
         /// </summary>
         public Trainset RequesterTrainset { get; set; }
@@ -110,6 +116,11 @@ namespace AITraffic.Navigation
         /// </summary>
         public HashSet<RailTrack> OccupiedTracksSnapshot { get; set; }
 
+        /// <summary>
+        /// Total physical length of the consist in meters. Used to prune loops too short for the train to fit.
+        /// </summary>
+        public float ConsistLength { get; set; }
+
         public PathfinderOptions()
         {
             AllowWrongDirection = true;
@@ -122,6 +133,8 @@ namespace AITraffic.Navigation
             ReservedTrackPenalty = 25000f;
             StrictlyAvoidReserved = false;
             PreventPlayerOvertake = true;
+            AllowShuntingDetour = false;
+            ConsistLength = 0f;
             Requester = null;
             RequesterTrainset = null;
             ExcludedTracks = null;
@@ -147,6 +160,8 @@ namespace AITraffic.Navigation
                 ReservedTrackPenalty = this.ReservedTrackPenalty,
                 StrictlyAvoidReserved = this.StrictlyAvoidReserved,
                 PreventPlayerOvertake = this.PreventPlayerOvertake,
+                AllowShuntingDetour = this.AllowShuntingDetour,
+                ConsistLength = this.ConsistLength,
                 Requester = this.Requester,
                 RequesterTrainset = this.RequesterTrainset,
                 ExcludedTracks = this.ExcludedTracks != null ? new HashSet<RailTrack>(this.ExcludedTracks) : null,
@@ -681,6 +696,28 @@ namespace AITraffic.Navigation
                 }
             }
 
+            // Auto-detect consist length if not explicitly specified
+            float effectiveConsistLength = options.ConsistLength;
+            if (effectiveConsistLength <= 0f)
+            {
+                var aiEng = options.Requester as AITraffic.Driver.AIEngineer;
+                if (aiEng != null)
+                {
+                    effectiveConsistLength = aiEng.ConsistLengthMeters;
+                }
+                else if (options.RequesterTrainset != null && options.RequesterTrainset.cars != null)
+                {
+                    float totalLen = 0f;
+                    for (int c = 0; c < options.RequesterTrainset.cars.Count; c++)
+                    {
+                        var car = options.RequesterTrainset.cars[c];
+                        if (car == null) continue;
+                        totalLen += (car.InterCouplerDistance > 0f) ? car.InterCouplerDistance : 15.0f;
+                    }
+                    effectiveConsistLength = totalLen;
+                }
+            }
+
             // Ensure occupied tracks snapshot is available for O(1) checks during A*
             HashSet<RailTrack> occupiedSnapshot = options.OccupiedTracksSnapshot ?? RailGraph.BuildOccupiedTracksSnapshot(options.RequesterTrainset);
 
@@ -758,6 +795,37 @@ namespace AITraffic.Navigation
                     if (!EvaluateEdgeCost(edge, current.Node, nextNode, current.IncomingEdge, initialEdge, destEdge, options, occupiedSnapshot, requesterTracks, out traversalCost, out requiredBranch))
                     {
                         continue;
+                    }
+
+                    // Turning Loop / Cycle Detection:
+                    // Check if nextNode or edge is already present in the ancestor search path of 'current'.
+                    SearchNode ancestor = current;
+                    float loopCircumference = edge.Length;
+                    bool isLoop = false;
+                    while (ancestor != null)
+                    {
+                        if (ancestor.Node == nextNode || (ancestor.IncomingEdge != null && ancestor.IncomingEdge == edge))
+                        {
+                            isLoop = true;
+                            break;
+                        }
+                        if (ancestor.IncomingEdge != null)
+                        {
+                            loopCircumference += ancestor.IncomingEdge.Length;
+                        }
+                        ancestor = ancestor.Parent;
+                    }
+
+                    if (isLoop)
+                    {
+                        // 1. Loop Clearance Deficit: If loop circumference is too short for the consist to fit cleanly without self-fouling, prune it!
+                        if (effectiveConsistLength > 0f && loopCircumference < effectiveConsistLength + 100.0f)
+                        {
+                            continue;
+                        }
+
+                        // 2. Turning Loop Penalty: Strongly discourage balloon loops over direct through-routes
+                        traversalCost += 10000.0f;
                     }
 
                     float tentativeGScore = current.GScore + traversalCost;
@@ -951,26 +1019,48 @@ namespace AITraffic.Navigation
             // Apply a modest preference penalty (+350m) when not approaching origin/destination,
             // so through-trains prefer the mainline [#] when clear, but will seamlessly take
             // the passing siding if the mainline is occupied, reserved, or blocked.
-            bool isPassingLoop = IsPassingOrSidingTrack(edge.Track);
+            bool isPassingLoop = (edge != null && edge.IsPassingLoopOrSiding) || IsPassingOrSidingTrack(edge.Track);
             if (isPassingLoop && !isStartOrDest && !isImmediateLadder)
             {
                 cost += 350f;
             }
 
-            // Industrial Yard & Storage Track Avoidance for Through-Trains:
-            // Through-trains must NEVER cut through intermediate storage [Y], loading [L], caboose [C],
-            // engine [E], turntable [T], or transfer [I]/[O] tracks.
-            bool isIndustrialYard = IsIndustrialYardOrStorageTrack(edge.Track);
-            if (isIndustrialYard && !isStartOrDest)
+            // Intermediate Loading, Transfer, Turntable, and Yard Storage/Shunting Track Avoidance:
+            // Through-trains must NEVER cut through intermediate loading [L], transfer [I]/[O],
+            // turntable [T], caboose [C], or yard storage/shunting [Y] tracks by default.
+            bool isStrictlyAvoided = (edge != null && edge.IsStrictlyAvoidedThroughTrack) || IsStrictlyAvoidedThroughTrack(edge.Track);
+            if (isStrictlyAvoided && !isStartOrDest)
             {
-                if (!isImmediateLadder)
+                if (options.AllowShuntingDetour && IsShuntingOrStorageTrack(edge))
+                {
+                    // Allow heavily penalized emergency detour through empty yard shunting/storage tracks
+                    cost += 5000f + (baseDistance * 2f);
+                }
+                else
                 {
                     // Massive through-transit penalty to strictly force through-trains onto mainline bypasses
                     cost += 500000f + (baseDistance * 20f);
                 }
-                else
+            }
+            else
+            {
+                // Industrial Yard & Storage Track Avoidance for Through-Trains:
+                // General yard storage tracks [Y] are heavily penalized for valley through-transit,
+                // but permitted with a modest per-meter penalty when actively entering or leaving a station ladder.
+                bool isIndustrialYard = (edge != null && edge.IsYardTrack) || IsIndustrialYardOrStorageTrack(edge.Track);
+                if (isIndustrialYard && !isStartOrDest)
                 {
-                    cost += baseDistance * options.YardTrackPenaltyPerMeter;
+                    if (!isImmediateLadder)
+                    {
+                        // Massive through-transit penalty to strictly force through-trains onto mainline bypasses
+                        cost += 500000f + (baseDistance * 20f);
+                    }
+                    else
+                    {
+                        // Preference penalty to decisively favor dedicated through-tracks over yard tracks,
+                        // while keeping input/yard tracks available as secondary routes when mainline is blocked.
+                        cost += 2500f + (baseDistance * options.YardTrackPenaltyPerMeter);
+                    }
                 }
             }
 
@@ -1058,12 +1148,17 @@ namespace AITraffic.Navigation
                 float candidateLateral = Vector3.Dot(candidateDir, rightNormal);
 
                 // Find lateral spread of alternative outgoing edges from this node
+                // Exclude yard tracks, sidings, and strictly avoided tracks from acting as preferred right-hand options!
                 float maxLateral = float.MinValue;
                 float minLateral = float.MaxValue;
                 for (int b = 0; b < fromNode.IncidentEdges.Count; b++)
                 {
                     var altEdge = fromNode.IncidentEdges[b];
                     if (altEdge == null || altEdge == incomingEdge) continue;
+
+                    // Exclude yard tracks, sidings, and avoided tracks from forcing a mainline track to be penalized
+                    if (altEdge.IsYardTrack || altEdge.IsStrictlyAvoidedThroughTrack || IsIndustrialYardOrStorageTrack(altEdge.Track) || IsStrictlyAvoidedThroughTrack(altEdge.Track))
+                        continue;
 
                     Vector3 altDir = altEdge.GetDirection(fromNode);
                     float altLat = Vector3.Dot(altDir, rightNormal);
@@ -1196,6 +1291,70 @@ namespace AITraffic.Navigation
         }
 
         /// <summary>
+        /// Determines whether a track is an industrial or station yard storage/shunting track (e.g. [Y]_[OWN]_[A-01-S]).
+        /// </summary>
+        public static bool IsShuntingOrStorageTrack(RailTrack track)
+        {
+            if (track == null) return false;
+            string tName = track.name ?? string.Empty;
+
+            // Mainline tracks and passenger platforms are never shunting/storage tracks
+            if (tName.Contains("[#]") ||
+                tName.IndexOf("DT-", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                tName.IndexOf("Main", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                tName.IndexOf("ML", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                tName.StartsWith("[P]", StringComparison.OrdinalIgnoreCase) ||
+                tName.IndexOf("Platform", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                tName.IndexOf("Pax", StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                return false;
+            }
+
+            // Check game LogicTrack ID classification
+            var logicTrack = AITraffic.Compat.ModCompatManager.GetLogicTrack(track);
+            if (logicTrack != null && logicTrack.ID != null)
+            {
+                string part = logicTrack.ID.TrackPartOnly ?? string.Empty;
+                string signPart = logicTrack.ID.SignIDTrackPart ?? string.Empty;
+                string display = logicTrack.ID.FullDisplayID ?? string.Empty;
+
+                if (part == DV.Logic.Job.TrackID.MAIN_LINE_TYPE || display.Contains("[#]"))
+                    return false;
+
+                if (signPart.EndsWith(DV.Logic.Job.TrackID.STORAGE_TYPE, StringComparison.OrdinalIgnoreCase) ||
+                    signPart.EndsWith(DV.Logic.Job.TrackID.PARKING_TYPE, StringComparison.OrdinalIgnoreCase) ||
+                    part.EndsWith(DV.Logic.Job.TrackID.STORAGE_TYPE, StringComparison.OrdinalIgnoreCase) ||
+                    part.EndsWith(DV.Logic.Job.TrackID.PARKING_TYPE, StringComparison.OrdinalIgnoreCase))
+                {
+                    return true;
+                }
+            }
+
+            // Yard & siding prefix and keyword heuristics
+            if (tName.StartsWith("[Y]", StringComparison.OrdinalIgnoreCase) ||
+                tName.StartsWith("[yard", StringComparison.OrdinalIgnoreCase) ||
+                tName.IndexOf("_[Y]", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                tName.IndexOf("_Y_", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                tName.EndsWith("-S]", StringComparison.OrdinalIgnoreCase) ||
+                tName.IndexOf("Shunt", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                tName.IndexOf("Storage", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                tName.IndexOf("Stub", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                tName.IndexOf("Spur", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                GetStationYardGONames().Contains(tName))
+            {
+                return true;
+            }
+
+            return false;
+        }
+
+        public static bool IsShuntingOrStorageTrack(RailEdge edge)
+        {
+            if (edge == null || edge.Track == null) return false;
+            return edge.IsShuntingOrStorageTrack || IsShuntingOrStorageTrack(edge.Track);
+        }
+
+        /// <summary>
         /// Determines whether a given track is a passing loop, station siding, or bypass track
         /// designed for through-trains to meet or pass around traffic.
         /// </summary>
@@ -1216,30 +1375,132 @@ namespace AITraffic.Navigation
                 return false;
             }
 
+            // Yard storage, shunting, loading, and transfer tracks are NEVER passing sidings
+            if (IsShuntingOrStorageTrack(track))
+            {
+                return false;
+            }
+
+            var logicTrack = AITraffic.Compat.ModCompatManager.GetLogicTrack(track);
+            if (logicTrack != null && logicTrack.ID != null)
+            {
+                string part = logicTrack.ID.TrackPartOnly ?? string.Empty;
+                string signPart = logicTrack.ID.SignIDTrackPart ?? string.Empty;
+
+                if (signPart.EndsWith(DV.Logic.Job.TrackID.LOADING_TYPE, StringComparison.OrdinalIgnoreCase) ||
+                    signPart.EndsWith(DV.Logic.Job.TrackID.REGULAR_IN_TYPE, StringComparison.OrdinalIgnoreCase) ||
+                    signPart.EndsWith(DV.Logic.Job.TrackID.REGULAR_OUT_TYPE, StringComparison.OrdinalIgnoreCase) ||
+                    signPart.EndsWith(DV.Logic.Job.TrackID.PARKING_TYPE, StringComparison.OrdinalIgnoreCase) ||
+                    signPart.EndsWith(DV.Logic.Job.TrackID.STORAGE_TYPE, StringComparison.OrdinalIgnoreCase) ||
+                    part.EndsWith(DV.Logic.Job.TrackID.LOADING_TYPE, StringComparison.OrdinalIgnoreCase) ||
+                    part.EndsWith(DV.Logic.Job.TrackID.REGULAR_IN_TYPE, StringComparison.OrdinalIgnoreCase) ||
+                    part.EndsWith(DV.Logic.Job.TrackID.REGULAR_OUT_TYPE, StringComparison.OrdinalIgnoreCase) ||
+                    part.EndsWith(DV.Logic.Job.TrackID.PARKING_TYPE, StringComparison.OrdinalIgnoreCase) ||
+                    part.EndsWith(DV.Logic.Job.TrackID.STORAGE_TYPE, StringComparison.OrdinalIgnoreCase))
+                {
+                    return false;
+                }
+            }
+
             // Siding / passing loop keywords
             if (tName.StartsWith("[S]", StringComparison.OrdinalIgnoreCase) ||
                 tName.IndexOf("_[S]", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                tName.EndsWith("-S]", StringComparison.OrdinalIgnoreCase) ||
                 tName.IndexOf("_S_", StringComparison.OrdinalIgnoreCase) >= 0 ||
                 tName.IndexOf("Siding", StringComparison.OrdinalIgnoreCase) >= 0 ||
                 tName.IndexOf("Loop", StringComparison.OrdinalIgnoreCase) >= 0 ||
                 tName.IndexOf("Pass", StringComparison.OrdinalIgnoreCase) >= 0)
             {
-                // Ensure it's not actually an industrial loading [L], caboose [C], or transfer track [I]/[O],
-                // but ALLOW station passing sidings (e.g. [Y]_[GF]_[B-01-S] or [Y]_[HB]_[D-01-S])
                 if (!tName.StartsWith("[L]", StringComparison.OrdinalIgnoreCase) &&
                     !tName.StartsWith("[I]", StringComparison.OrdinalIgnoreCase) &&
                     !tName.StartsWith("[O]", StringComparison.OrdinalIgnoreCase) &&
+                    !tName.StartsWith("[Y]", StringComparison.OrdinalIgnoreCase) &&
                     !tName.EndsWith("-L]", StringComparison.OrdinalIgnoreCase) &&
                     !tName.EndsWith("-I]", StringComparison.OrdinalIgnoreCase) &&
                     !tName.EndsWith("-O]", StringComparison.OrdinalIgnoreCase) &&
-                    !tName.EndsWith("-C]", StringComparison.OrdinalIgnoreCase))
+                    !tName.EndsWith("-C]", StringComparison.OrdinalIgnoreCase) &&
+                    !tName.EndsWith("-S]", StringComparison.OrdinalIgnoreCase))
                 {
                     return true;
                 }
             }
 
             return false;
+        }
+
+        public static bool IsPassingOrSidingTrack(RailEdge edge)
+        {
+            if (edge == null || edge.Track == null) return false;
+            return edge.IsPassingLoopOrSiding || IsPassingOrSidingTrack(edge.Track);
+        }
+
+        /// <summary>
+        /// Determines whether a track is an intermediate loading, transfer, turntable, caboose,
+        /// or service track that through-trains must strictly avoid traversing at all costs,
+        /// even when departing from or arriving at a nearby yard ladder.
+        /// </summary>
+        public static bool IsStrictlyAvoidedThroughTrack(RailTrack track)
+        {
+            if (track == null) return false;
+            string tName = track.name ?? string.Empty;
+
+            // Mainline through tracks and passenger platforms are never strictly avoided
+            if (tName.Contains("[#]") ||
+                tName.IndexOf("DT-", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                tName.IndexOf("Main", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                tName.IndexOf("ML", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                tName.StartsWith("[P]", StringComparison.OrdinalIgnoreCase) ||
+                tName.IndexOf("Platform", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                tName.IndexOf("Pax", StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                return false;
+            }
+
+            // Passing loops and station sidings are valid through-tracks, NOT avoided tracks
+            if (IsPassingOrSidingTrack(track))
+            {
+                return false;
+            }
+
+            // 1. Check game LogicTrack ID classification (strictly Loading tracks)
+            var logicTrack = AITraffic.Compat.ModCompatManager.GetLogicTrack(track);
+            if (logicTrack != null && logicTrack.ID != null)
+            {
+                string part = logicTrack.ID.TrackPartOnly ?? string.Empty;
+                string signPart = logicTrack.ID.SignIDTrackPart ?? string.Empty;
+                string display = logicTrack.ID.FullDisplayID ?? string.Empty;
+
+                if (part == DV.Logic.Job.TrackID.MAIN_LINE_TYPE || display.Contains("[#]"))
+                    return false;
+
+                if (signPart.EndsWith(DV.Logic.Job.TrackID.LOADING_TYPE, StringComparison.OrdinalIgnoreCase) ||
+                    part.EndsWith(DV.Logic.Job.TrackID.LOADING_TYPE, StringComparison.OrdinalIgnoreCase))
+                {
+                    return true;
+                }
+            }
+
+            // 2. Track name keyword heuristics:
+            // Strict avoidance applies specifically to Loading ([L], -L]) and Turntable ([T], -T]) tracks
+            // as they lack proper governing main signals and cannot show an Hp 1 clear aspect.
+            if (tName.StartsWith("[L]", StringComparison.OrdinalIgnoreCase) ||
+                tName.StartsWith("[T]", StringComparison.OrdinalIgnoreCase) ||
+                tName.IndexOf("_[L]", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                tName.IndexOf("_[T]", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                tName.EndsWith("-L]", StringComparison.OrdinalIgnoreCase) ||
+                tName.EndsWith("-T]", StringComparison.OrdinalIgnoreCase) ||
+                tName.IndexOf("_L_", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                tName.IndexOf("Turntable", StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                return true;
+            }
+
+            return false;
+        }
+
+        public static bool IsStrictlyAvoidedThroughTrack(RailEdge edge)
+        {
+            if (edge == null || edge.Track == null) return false;
+            return edge.IsStrictlyAvoidedThroughTrack || IsStrictlyAvoidedThroughTrack(edge.Track);
         }
 
         /// <summary>
@@ -1267,6 +1528,11 @@ namespace AITraffic.Navigation
             if (IsPassingOrSidingTrack(track))
             {
                 return false;
+            }
+
+            if (IsShuntingOrStorageTrack(track))
+            {
+                return true;
             }
 
             // Check game LogicTrack ID classification
@@ -1335,7 +1601,7 @@ namespace AITraffic.Navigation
         /// </summary>
         public static bool IsYardOrShuntingTrack(RailTrack track)
         {
-            return IsPassingOrSidingTrack(track) || IsIndustrialYardOrStorageTrack(track);
+            return IsPassingOrSidingTrack(track) || IsIndustrialYardOrStorageTrack(track) || IsShuntingOrStorageTrack(track);
         }
 
         /// <summary>

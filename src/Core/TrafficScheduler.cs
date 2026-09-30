@@ -8,6 +8,7 @@ using AITraffic.Driver;
 using AITraffic.Compat;
 using AITraffic.Navigation;
 using DV.ThingTypes;
+using DVSignal = Signals.Game.Signal;
 
 namespace AITraffic.Core
 {
@@ -531,7 +532,8 @@ namespace AITraffic.Core
             {
                 StrictlyAvoidOccupied = true,
                 OccupiedTracksSnapshot = occupiedSnapshot,
-                RequesterTrainset = (PlayerManager.Car != null) ? PlayerManager.Car.trainset : null
+                RequesterTrainset = (PlayerManager.Car != null) ? PlayerManager.Car.trainset : null,
+                ConsistLength = 100.0f
             };
 
             int maxTracksToCheck = Math.Min(4, candidateTracks.Count);
@@ -1122,6 +1124,7 @@ namespace AITraffic.Core
 
                     double startSpan = 15.0;
                     bool flipConsist = false;
+                    bool isForwardDeparture = true;
 
                     if (routePath.Tracks != null && routePath.Tracks.Count > 1)
                     {
@@ -1134,18 +1137,8 @@ namespace AITraffic.Core
                             Vector3 nextMid = track1.curve.GetPointAt(0.5f);
 
                             bool forward = Vector3.Distance(curEnd, nextMid) <= Vector3.Distance(curStart, nextMid);
-                            float trackLen = track0.curve.length;
-
-                            if (forward)
-                            {
-                                startSpan = 15.0;
-                                flipConsist = false;
-                            }
-                            else
-                            {
-                                startSpan = 15.0;
-                                flipConsist = true;
-                            }
+                            isForwardDeparture = forward;
+                            flipConsist = !forward;
                         }
                     }
                     else if (routePath.Edges != null && routePath.Edges.Count > 0 && routePath.Nodes != null && routePath.Nodes.Count > 1)
@@ -1153,10 +1146,39 @@ namespace AITraffic.Core
                         var firstEdge = routePath.Edges[0];
                         var firstNode = routePath.Nodes[0];
                         bool forward = (firstNode == firstEdge.FromNode);
-                        if (!forward)
+                        isForwardDeparture = forward;
+                        flipConsist = !forward;
+                    }
+
+                    // Query if candidate spawn track has a governing main signal facing departure
+                    DVSignal govSig;
+                    double sigSpan;
+                    bool hasMainSig = AITraffic.Navigation.SignalRegistry.TryGetGoverningMainSignal(spawnTrack, isForwardDeparture, out govSig, out sigSpan);
+                    bool startInShuntingMode = !hasMainSig;
+                    float trackLen = (spawnTrack.curve != null) ? spawnTrack.curve.length : 0f;
+
+                    if (hasMainSig && trackLen > 0f)
+                    {
+                        // Place consist safely behind the governing main signal mast (>= 20-25m buffer)
+                        if (isForwardDeparture)
+                        {
+                            startSpan = Math.Max(15.0, sigSpan - consistLen - 25.0);
+                        }
+                        else
+                        {
+                            startSpan = Math.Min(trackLen - 15.0, sigSpan + consistLen + 25.0);
+                        }
+                    }
+                    else
+                    {
+                        // Default siding placement
+                        if (trackLen >= consistLen + 30f)
+                        {
+                            startSpan = Math.Max(15.0, (trackLen - consistLen) * 0.5);
+                        }
+                        else
                         {
                             startSpan = 15.0;
-                            flipConsist = true;
                         }
                     }
 
@@ -1182,7 +1204,8 @@ namespace AITraffic.Core
                             engineer = eng;
                             spawnComplete = true;
                         },
-                        consistType: corridor.PreferredConsist));
+                        consistType: corridor.PreferredConsist,
+                        startInShuntingMode: startInShuntingMode));
 
                     while (!spawnComplete)
                     {
@@ -1331,6 +1354,7 @@ namespace AITraffic.Core
 
                             double startSpan = 15.0;
                             bool flipConsist = false;
+                            bool isForwardDeparture = true;
 
                             if (fallbackPath.Tracks != null && fallbackPath.Tracks.Count > 1)
                             {
@@ -1343,18 +1367,8 @@ namespace AITraffic.Core
                                     Vector3 nextMid = track1.curve.GetPointAt(0.5f);
 
                                     bool forward = Vector3.Distance(curEnd, nextMid) <= Vector3.Distance(curStart, nextMid);
-                                    float trackLen = track0.curve.length;
-
-                                    if (forward)
-                                    {
-                                        startSpan = 15.0;
-                                        flipConsist = false;
-                                    }
-                                    else
-                                    {
-                                        startSpan = 15.0;
-                                        flipConsist = true;
-                                    }
+                                    isForwardDeparture = forward;
+                                    flipConsist = !forward;
                                 }
                             }
                             else if (fallbackPath.Edges != null && fallbackPath.Edges.Count > 0 && fallbackPath.Nodes != null && fallbackPath.Nodes.Count > 1)
@@ -1362,10 +1376,39 @@ namespace AITraffic.Core
                                 var firstEdge = fallbackPath.Edges[0];
                                 var firstNode = fallbackPath.Nodes[0];
                                 bool forward = (firstNode == firstEdge.FromNode);
-                                if (!forward)
+                                isForwardDeparture = forward;
+                                flipConsist = !forward;
+                            }
+
+                            // Query if candidate spawn track has a governing main signal facing departure
+                            DVSignal govSig;
+                            double sigSpan;
+                            bool hasMainSig = AITraffic.Navigation.SignalRegistry.TryGetGoverningMainSignal(spawnTrack, isForwardDeparture, out govSig, out sigSpan);
+                            bool startInShuntingMode = !hasMainSig;
+                            float trackLen = (spawnTrack.curve != null) ? spawnTrack.curve.length : 0f;
+
+                            if (hasMainSig && trackLen > 0f)
+                            {
+                                // Place consist safely behind the governing main signal mast (>= 20-25m buffer)
+                                if (isForwardDeparture)
+                                {
+                                    startSpan = Math.Max(15.0, sigSpan - fallbackConsistLen - 25.0);
+                                }
+                                else
+                                {
+                                    startSpan = Math.Min(trackLen - 15.0, sigSpan + fallbackConsistLen + 25.0);
+                                }
+                            }
+                            else
+                            {
+                                // Default siding placement
+                                if (trackLen >= fallbackConsistLen + 30f)
+                                {
+                                    startSpan = Math.Max(15.0, (trackLen - fallbackConsistLen) * 0.5);
+                                }
+                                else
                                 {
                                     startSpan = 15.0;
-                                    flipConsist = true;
                                 }
                             }
 
@@ -1391,7 +1434,8 @@ namespace AITraffic.Core
                                     engineer = eng;
                                     spawnComplete = true;
                                 },
-                                consistType: inferredConsist));
+                                consistType: inferredConsist,
+                                startInShuntingMode: startInShuntingMode));
 
                             while (!spawnComplete)
                             {
@@ -1576,6 +1620,13 @@ namespace AITraffic.Core
 
             // 2. Name heuristics
             string name = track.name ?? "";
+
+            // Exclude short internal yard neck tracks (like "[#] Road 77" at Farm, 128m) trapped between yard switches
+            if (track.curve != null && track.curve.length < 150f && name.IndexOf("Road", StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                return false;
+            }
+
             if (name.Contains("[#]") || name.IndexOf("Main", StringComparison.OrdinalIgnoreCase) >= 0)
             {
                 return true;
@@ -2280,7 +2331,8 @@ namespace AITraffic.Core
             var pathOptions = new AITraffic.Navigation.PathfinderOptions
             {
                 StrictlyAvoidOccupied = true,
-                OccupiedTracksSnapshot = occupiedSnapshot
+                OccupiedTracksSnapshot = occupiedSnapshot,
+                ConsistLength = minLength
             };
 
             // Evaluate up to top 3 departure tracks and top 2 destination tracks to eliminate lag spikes while giving rich track variety
@@ -2300,6 +2352,26 @@ namespace AITraffic.Core
                     var path = pathfinder.FindPath(depTrack, dt, pathOptions);
                     if (path != null && path.IsValid && path.Tracks.Count > 0 && path.TotalDistance >= minCorridorDist)
                     {
+                        // Check if candidate route traverses any strictly avoided loading tracks ([L]) or turntables ([T])
+                        bool traversesStrictlyAvoided = false;
+                        for (int t = 0; t < path.Tracks.Count; t++)
+                        {
+                            if (AITraffic.Navigation.Pathfinder.IsStrictlyAvoidedThroughTrack(path.Tracks[t]))
+                            {
+                                traversesStrictlyAvoided = true;
+                                break;
+                            }
+                        }
+                        if (traversesStrictlyAvoided || path.TotalDistance >= 500000f)
+                        {
+                            if (Main.ModEntry != null && Main.ModEntry.Logger != null)
+                            {
+                                Main.ModEntry.Logger.Log(string.Format("Skipping spawn track '{0}' to '{1}': Route traverses strictly avoided loading track or has excessive penalty distance ({2:F0}m).",
+                                    depTrack.name, dt.name, path.TotalDistance));
+                            }
+                            continue;
+                        }
+
                         // Check departure incline: Declines and flat tracks are okay, but NO steep inclines!
                         float depGrade = CalculateDepartureGrade(path);
                         if (depGrade > MaxSpawnInclineGrade)
@@ -2379,7 +2451,8 @@ namespace AITraffic.Core
             var pathOptions = new AITraffic.Navigation.PathfinderOptions
             {
                 StrictlyAvoidOccupied = true,
-                OccupiedTracksSnapshot = occupiedSnapshot
+                OccupiedTracksSnapshot = occupiedSnapshot,
+                ConsistLength = minLength
             };
 
             // Evaluate up to top 3 departure tracks and top 2 destination tracks, yielding a frame between searches
@@ -2403,6 +2476,26 @@ namespace AITraffic.Core
                     var path = pathfinder.FindPath(depTrack, dt, pathOptions);
                     if (path != null && path.IsValid && path.Tracks.Count > 0 && path.TotalDistance >= minCorridorDist)
                     {
+                        // Check if candidate route traverses any strictly avoided loading tracks ([L]) or turntables ([T])
+                        bool traversesStrictlyAvoided = false;
+                        for (int t = 0; t < path.Tracks.Count; t++)
+                        {
+                            if (AITraffic.Navigation.Pathfinder.IsStrictlyAvoidedThroughTrack(path.Tracks[t]))
+                            {
+                                traversesStrictlyAvoided = true;
+                                break;
+                            }
+                        }
+                        if (traversesStrictlyAvoided || path.TotalDistance >= 500000f)
+                        {
+                            if (Main.ModEntry != null && Main.ModEntry.Logger != null)
+                            {
+                                Main.ModEntry.Logger.Log(string.Format("Skipping spawn track '{0}' to '{1}': Route traverses strictly avoided loading track or has excessive penalty distance ({2:F0}m).",
+                                    depTrack.name, dt.name, path.TotalDistance));
+                            }
+                            continue;
+                        }
+
                         // Check departure incline: Declines and flat tracks are okay, but NO steep inclines!
                         float depGrade = CalculateDepartureGrade(path);
                         if (depGrade > MaxSpawnInclineGrade)

@@ -39,6 +39,13 @@ namespace AITraffic.Navigation
     /// </summary>
     public class JunctionController : MonoBehaviour
     {
+        /// <summary>
+        /// Physical movable switch blade / point zone in meters.
+        /// Movable points in Derail Valley span 0..6.5m from junction.position.
+        /// Wheels within this threshold are directly over movable switch blades.
+        /// </summary>
+        public const float SwitchBladeZoneMeters = 7.0f;
+
         private static JunctionController _instance;
         public static JunctionController Instance
         {
@@ -115,7 +122,7 @@ namespace AITraffic.Navigation
         /// <summary>
         /// Requests switching a junction to a desired branch safely if not locked by another entity.
         /// </summary>
-        public bool RequestJunctionAlignment(Junction junction, byte desiredBranch, object requester)
+        public bool RequestJunctionAlignment(Junction junction, byte desiredBranch, object requester, bool lockAfterSwitch = true)
         {
             if (junction == null)
             {
@@ -149,17 +156,21 @@ namespace AITraffic.Navigation
                     bool protectLock = eng.ShouldProtectJunctionLock(junction);
                     if (!rideAlong && !protectLock)
                     {
-                        if (SignalRegistry.IsJunctionOccupiedByPlayer(junction, requesterTrainset))
+                        Trainset pSet;
+                        Vector3 pPos;
+                        float pSpeed;
+                        bool isPlayerMoving = SignalRegistry.TryGetPlayerTrainInfo(out pSet, out pPos, out pSpeed) && pSpeed >= 1.0f;
+                        if (isPlayerMoving && SignalRegistry.IsJunctionOccupiedByPlayer(junction, requesterTrainset))
                         {
-                            Log(string.Format("[JunctionController] Junction '{0}' is occupied by the player; AI alignment denied.", junction.name));
+                            Log(string.Format("[JunctionController] Junction '{0}' is occupied by moving player traffic; AI alignment denied.", junction.name));
                             return false;
                         }
-                    }
 
-                    if (!protectLock && SignalRegistry.IsJunctionReservedByPlayerSignal(junction))
-                    {
-                        Log(string.Format("[JunctionController] Junction '{0}' is reserved by player signal; AI alignment denied.", junction.name));
-                        return false;
+                        if (SignalRegistry.IsJunctionReservedByPlayerSignal(junction))
+                        {
+                            Log(string.Format("[JunctionController] Junction '{0}' is reserved by player signal; AI alignment denied.", junction.name));
+                            return false;
+                        }
                     }
                 }
 
@@ -182,8 +193,11 @@ namespace AITraffic.Navigation
                     junction.Switch(Junction.SwitchMode.FORCED, desiredBranch);
                     Log(string.Format("[JunctionController] Junction '{0}' switched to branch {1} for requester '{2}'.", junction.name, desiredBranch, requester));
 
-                    // Immediately lock switch to protect newly aligned route
-                    TryLockJunction(junction, requester, 60f);
+                    if (lockAfterSwitch)
+                    {
+                        // Immediately lock switch to protect newly aligned route
+                        TryLockJunction(junction, requester, 60f);
+                    }
 
                     if (OnJunctionSwitched != null)
                     {
@@ -344,10 +358,16 @@ namespace AITraffic.Navigation
                     var eng = lockInfo.Requester as AITraffic.Driver.AIEngineer;
                     if (eng != null)
                     {
-                        // AI engineer holds lock: protected against player intervention if moving at speed (>= 1.5 km/h) or protecting entered block
-                        if (eng.CurrentSpeedKmh >= 1.5f || eng.ShouldProtectJunctionLock(junction))
+                        // AI engineer holds lock: protected against player intervention only if engineer actively protects it
+                        if (eng.ShouldProtectJunctionLock(junction))
                         {
                             return true;
+                        }
+                        else
+                        {
+                            // Lock is no longer protected (e.g. passed behind train or covered by red signal / player reserved); release it immediately
+                            ReleaseJunctionInternal(junction, lockInfo.Requester);
+                            return false;
                         }
                     }
                     else if (lockInfo.Requester != null)
@@ -402,6 +422,27 @@ namespace AITraffic.Navigation
                         _monitoredTrainPassings.RemoveAt(i);
                     }
                 }
+            }
+        }
+
+        /// <summary>
+        /// Gets all junctions currently locked by the specified requester.
+        /// </summary>
+        public List<Junction> GetLockedJunctionsFor(object requester)
+        {
+            if (requester == null) return new List<Junction>();
+
+            lock (_lock)
+            {
+                var result = new List<Junction>();
+                foreach (var kvp in _activeLocks)
+                {
+                    if (kvp.Value != null && kvp.Value.Requester == requester && !kvp.Value.IsExpired)
+                    {
+                        result.Add(kvp.Key);
+                    }
+                }
+                return result;
             }
         }
 
@@ -815,7 +856,6 @@ namespace AITraffic.Navigation
             occupyingCar = null;
             if (junction == null) return false;
 
-            float clearanceMargin = CalculateClearanceMargin(junction);
             var connectedTracks = GetConnectedTracks(junction);
             if (connectedTracks.Count == 0) return false;
 
@@ -854,30 +894,21 @@ namespace AITraffic.Navigation
 
                 bool isRequester = (requesterTrainset != null && car.trainset == requesterTrainset);
 
-                // 1. Check bogie 3D distance to switch points
+                // 1. Check bogie 3D distance to movable switch points / blades (7.0m physical blade zone)
+                // Wheels within this distance are directly on the movable switch rails.
+                // Parked yard stock further down siding tracks (> 7m) does not foul the movable blades.
                 float bogieDist = Vector3.Distance(bogie.transform.position, junction.position);
-                if (bogieDist <= clearanceMargin)
+                if (bogieDist <= SwitchBladeZoneMeters)
                 {
                     if (detectedCar == null) detectedCar = car;
                     if (!isRequester)
                     {
                         if (externalCar == null) externalCar = car;
                     }
-                    else if (bogieDist <= 6.5f)
+                    else
                     {
                         // Requester's wheels are directly over movable switch blades/points
                         if (requesterBladeCar == null) requesterBladeCar = car;
-                    }
-                }
-
-                // 2. Check car center 3D distance to switch points
-                float carDist = Vector3.Distance(car.transform.position, junction.position);
-                if (carDist <= clearanceMargin)
-                {
-                    if (detectedCar == null) detectedCar = car;
-                    if (!isRequester)
-                    {
-                        if (externalCar == null) externalCar = car;
                     }
                 }
 

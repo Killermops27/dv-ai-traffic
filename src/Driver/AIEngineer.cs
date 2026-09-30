@@ -97,6 +97,7 @@ namespace AITraffic.Driver
         public bool IsStationDestination { get; set; }
         public bool IsTerminusDestination { get; set; }
         public float TerminusArrivalTime { get; private set; }
+        public bool IsShuntingMode { get { return _isShuntingMode; } }
         public List<AITraffic.Navigation.SignalBlockInfo> UpcomingSignalBlocks
         {
             get { return _upcomingSignalBlocks; }
@@ -129,6 +130,26 @@ namespace AITraffic.Driver
                         _registeredConsistCars.Add(c);
                     }
                 }
+            }
+        }
+
+        /// <summary>
+        /// Total physical length of the consist in meters (derived from registered cars or trainset).
+        /// </summary>
+        public float ConsistLengthMeters
+        {
+            get
+            {
+                var carsList = _registeredConsistCars.Count > 0 ? _registeredConsistCars : (_trainCar != null && _trainCar.trainset != null ? _trainCar.trainset.cars : null);
+                if (carsList == null || carsList.Count == 0) return 20.0f;
+                float total = 0f;
+                for (int i = 0; i < carsList.Count; i++)
+                {
+                    var car = carsList[i];
+                    if (car == null) continue;
+                    total += (car.InterCouplerDistance > 0f) ? car.InterCouplerDistance : 15.0f;
+                }
+                return total;
             }
         }
 
@@ -193,15 +214,71 @@ namespace AITraffic.Driver
         }
 
         /// <summary>
+        /// Calculates the train's dynamic stopping distance based on current speed,
+        /// full service brake deceleration (0.50 m/s^2), pneumatic brake propagation delay (2.5s),
+        /// and a 20m safety buffer.
+        /// </summary>
+        public float CalculateStoppingDistance()
+        {
+            float v = CurrentSpeedMs;
+            if (v <= 0.5f) return 20.0f; // Minimal safety buffer when stopped or crawling
+            float decel = 0.50f;
+            float brakeLagSeconds = 2.5f;
+            return (v * v) / (2.0f * decel) + (v * brakeLagSeconds) + 20.0f;
+        }
+
+        /// <summary>
         /// Determines whether a junction should remain locked against the player because this AI train
-        /// has entered the governing signal block or is approaching the switch at speed.
-        /// Yields only when the train has stopped or is crawling (< 1.5 km/h).
+        /// is actively moving through the entered signal block or has passed the stopping distance (Point of No Return)
+        /// of an upcoming green governing signal.
+        /// Yields when the train has stopped/crawling (< 1.5 km/h), the junction is behind the train,
+        /// or the junction is covered by an unpassed signal and the player has reserved the block.
         /// </summary>
         public bool ShouldProtectJunctionLock(Junction junction)
         {
             if (junction == null) return false;
-            if (CurrentSpeedKmh < 1.5f) return false;
 
+            // 1. Check if the junction is behind the locomotive / entire train
+            if (_trainCar != null)
+            {
+                // If any car in the consist is physically occupying the junction, it MUST be protected against throwing under wheels,
+                // even when completely stopped!
+                TrainCar occupyingCar;
+                if (AITraffic.Navigation.JunctionController.IsJunctionPhysicallyOccupied(junction, out occupyingCar, _trainCar.trainset))
+                {
+                    return true;
+                }
+
+                // If not physically occupied: check if junction is strictly behind the locomotive
+                Vector3 toJunction = junction.position - _trainCar.transform.position;
+                Vector3 locoHeading = _trainCar.transform.forward * (TargetDirection >= 0f ? 1f : -1f);
+                if (Vector3.Dot(locoHeading, toJunction) < -15.0f)
+                {
+                    // Junction is behind locomotive and not physically occupied by any train car -> strictly not protected!
+                    return false;
+                }
+            }
+
+            // Determine if governing signal facing train is Red
+            bool isGoverningRed = false;
+            if (ApproachingSignal != null && DistanceToSignal < 2000f)
+            {
+                var sig = ApproachingSignal.Parent != null ? ApproachingSignal.Parent : ApproachingSignal;
+                if (sig != null && sig.IsOn && sig.CurrentAspect != null)
+                {
+                    isGoverningRed = sig.CurrentAspect.DisallowPassing;
+                }
+            }
+
+            // While stopped (< 1.5 km/h) at a Red signal, station hold, or terminus:
+            // Do NOT hold locks on upcoming switches ahead! Leave them unlocked so the player can switch freely.
+            if (CurrentSpeedKmh < 1.5f && (isGoverningRed || State == EngineState.StationHold || State == EngineState.TerminusStop))
+            {
+                return false;
+            }
+
+            // 2. Check if the junction is in the CURRENT entered signal block (ahead of locomotive)
+            bool isJunctionInCurrentBlock = false;
             if (_upcomingSignalBlocks != null && _upcomingSignalBlocks.Count > 0)
             {
                 var curBlock = _upcomingSignalBlocks[0];
@@ -211,18 +288,89 @@ namespace AITraffic.Driver
                     {
                         if (curBlock.Switches[s].Junction == junction)
                         {
+                            isJunctionInCurrentBlock = true;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if (isJunctionInCurrentBlock)
+            {
+                // Switch is inside the block the AI has already entered and is traversing
+                return true;
+            }
+
+            // 3. Fallback for close approach (< 200m) ahead of locomotive along upcoming route
+            // Must protect the immediate departure switch directly in front of the locomotive (even when stopped at station/signal)
+            if (_upcomingTracks != null && _upcomingTracks.Count > 1)
+            {
+                int scanLimit = Math.Min(_upcomingTracks.Count, 6);
+                for (int t = 1; t < scanLimit; t++)
+                {
+                    Junction j;
+                    byte b;
+                    if (AITraffic.Navigation.SignalRegistry.TryGetJunctionBetweenTracks(_upcomingTracks[t - 1], _upcomingTracks[t], out j, out b))
+                    {
+                        if (j == junction)
+                        {
+                            // If player signal reserved this junction, yield immediately!
+                            if (AITraffic.Navigation.SignalRegistry.IsJunctionReservedByPlayerSignal(junction))
+                            {
+                                return false;
+                            }
                             return true;
                         }
                     }
                 }
             }
 
-            if (_trainCar != null)
+            // For distant switches beyond the immediate block/departure switch:
+            // Stopped or crawling trains (< 1.5 km/h) do not hold locks on distant switches
+            if (CurrentSpeedKmh < 1.5f) return false;
+
+            // 4. Approach Locking (Point of No Return) for switches in the NEXT block beyond governing signal:
+            if (_upcomingSignalBlocks != null && _upcomingSignalBlocks.Count > 1)
             {
-                float dist = Vector3.Distance(_trainCar.transform.position, junction.position);
-                if (dist < 250f)
+                var curBlock = _upcomingSignalBlocks[0];
+                var nextBlock = _upcomingSignalBlocks[1];
+
+                bool isJunctionInNextBlock = false;
+                if (nextBlock != null && nextBlock.Switches != null)
                 {
-                    return true;
+                    for (int s = 0; s < nextBlock.Switches.Count; s++)
+                    {
+                        if (nextBlock.Switches[s].Junction == junction)
+                        {
+                            isJunctionInNextBlock = true;
+                            break;
+                        }
+                    }
+                }
+
+                if (isJunctionInNextBlock)
+                {
+                    DVSignal governingSig = curBlock != null ? curBlock.ExitSignal : ApproachingSignal;
+                    if (governingSig != null && governingSig.Parent != null) governingSig = governingSig.Parent;
+
+                    bool isGoverningSigGreen = (governingSig != null && governingSig.IsOn && governingSig.CurrentAspect != null && !governingSig.CurrentAspect.DisallowPassing);
+
+                    if (isGoverningSigGreen)
+                    {
+                        float distToSignal = curBlock != null && curBlock.DistanceToExit > 0f ? curBlock.DistanceToExit : DistanceToSignal;
+                        float stoppingDist = CalculateStoppingDistance();
+
+                        // If train has passed the Stopping Distance threshold, it CANNOT stop before the signal.
+                        // Approach Locking protects the switch to prevent signal dropping to Hp 0 in front of train!
+                        if (distToSignal <= stoppingDist)
+                        {
+                            return true;
+                        }
+                    }
+
+                    // Otherwise (signal is Red or train is outside stopping distance):
+                    // If reserved by player or occupied by player, yield immediately!
+                    return false;
                 }
             }
 
@@ -297,10 +445,12 @@ namespace AITraffic.Driver
         private bool _isOverheated;
         private bool _isRollbackDetected;
         private bool _isHoldingForCorridor;
+        private bool _isHoldingInMultiTrack;
         private string _corridorHoldReason;
         private float _corridorCheckCooldown;
         private float _corridorHoldDistance = float.PositiveInfinity; // Separate from DistanceToObstacle; not cleared by obstacle sensor
         private float _switchHoldDistance = float.PositiveInfinity; // Facing switch stop buffer; not cleared by obstacle sensor
+        private float _stoppedSwitchAlignCooldown = 0.0f; // 30s cadence for alignment pulses when stopped at red signal/station
         private bool _portsInitialized;
 
         private readonly List<Port> _temperaturePorts = new List<Port>();
@@ -344,6 +494,13 @@ namespace AITraffic.Driver
         private float _stoppedAtRedTimer;
         private float _stuckRecoveryCooldown = 10.0f;
 
+        // Shunting Detour & Slow Shunting Mode
+        private bool _isShuntingMode;
+        private bool _isSelfBlockedShunting;
+        private DVSignal _shuntingBypassedSignal;
+        private DVSignal _shuntingTargetSignal;
+        private readonly HashSet<Junction> _seenJunctionsThisPass = new HashSet<Junction>();
+
         #endregion
 
         #region Unity Lifecycle
@@ -364,6 +521,10 @@ namespace AITraffic.Driver
             _thermalThrottleLimit = 1.0f;
             _overcurrentThrottleLimit = 1.0f;
             _rampThrottle = 0.0f;
+            _isShuntingMode = false;
+            _isSelfBlockedShunting = false;
+            _shuntingBypassedSignal = null;
+            _shuntingTargetSignal = null;
             SpawnTime = Time.time;
             StationaryTimer = 0.0f;
             _heavySensorUpdateCooldown = UnityEngine.Random.Range(0.25f, 0.50f);
@@ -394,6 +555,10 @@ namespace AITraffic.Driver
 
             _reservedTracks.Clear();
             ReleaseAllSignalReservations();
+            _isShuntingMode = false;
+            _isSelfBlockedShunting = false;
+            _shuntingBypassedSignal = null;
+            _shuntingTargetSignal = null;
 
             if (AITraffic.Core.TrafficManager.IsRunning && AITraffic.Core.TrafficManager.Instance != null)
             {
@@ -731,6 +896,15 @@ namespace AITraffic.Driver
         {
             if (CurrentPath == null || !CurrentPath.IsValid) return;
 
+            if (_stoppedSwitchAlignCooldown > 0f)
+            {
+                _stoppedSwitchAlignCooldown -= dt;
+            }
+            if (CurrentSpeedKmh >= 1.5f)
+            {
+                _stoppedSwitchAlignCooldown = 0f;
+            }
+
             _pathUpdateCooldown -= dt;
             if (_pathUpdateCooldown > 0.0f) return;
             _pathUpdateCooldown = 0.4f; // Check twice per second
@@ -845,15 +1019,62 @@ namespace AITraffic.Driver
             {
                 bool isSignalRed = (ApproachingSignal.CurrentAspect != null && ApproachingSignal.CurrentAspect.DisallowPassing);
 
+                var effApproaching = ApproachingSignal.Parent != null ? ApproachingSignal.Parent : ApproachingSignal;
+                var effBypassed = (_shuntingBypassedSignal != null && _shuntingBypassedSignal.Parent != null) ? _shuntingBypassedSignal.Parent : _shuntingBypassedSignal;
+                if (_isShuntingMode && effApproaching != null && effApproaching == effBypassed)
+                {
+                    isSignalRed = false;
+                }
+
                 if (isSignalRed && CurrentSpeedKmh < 1.0f)
                 {
                     _stoppedAtRedTimer += dt;
+
+                    // Self-blocked signal override:
+                    // If halted at an Hp 0 (Red) signal for 12 seconds, check if the block is red purely due to the train's own cars / loop reservation.
+                    // Transition into Slow Shunting Mode past this signal without recalculating route.
+                    if (_stoppedAtRedTimer >= 12.0f && !_isSelfBlockedShunting)
+                    {
+                        if (IsSignalBlockedOnlyBySelf(ApproachingSignal))
+                        {
+                            _isShuntingMode = true;
+                            _isSelfBlockedShunting = true;
+                            _shuntingBypassedSignal = ApproachingSignal;
+                            _shuntingTargetSignal = FindNextGoverningMainSignal(ApproachingSignal);
+                            _stoppedAtRedTimer = 0f;
+
+                            if (Main.ModEntry != null && Main.ModEntry.Logger != null)
+                            {
+                                Main.ModEntry.Logger.Log(string.Format(
+                                    "[AITraffic] Train '{0}' stopped at self-blocked signal '{1}' for 12s. Entering Slow Shunting Mode (<= 15 km/h) to clear loop without route recalculation. Next governing signal: '{2}'.",
+                                    _trainCar != null ? _trainCar.ID : "Loco",
+                                    AITraffic.Navigation.SignalRegistry.GetSignalName(ApproachingSignal),
+                                    _shuntingTargetSignal != null ? AITraffic.Navigation.SignalRegistry.GetSignalName(_shuntingTargetSignal) : "None (Line Clear)"));
+                            }
+                        }
+                    }
+
                     if (_stoppedAtRedTimer >= 30.0f)
                     {
                         _signalRerouteCooldown -= dt;
                         if (_signalRerouteCooldown <= 0.0f)
                         {
-                            bool rerouted = TryDynamicRedSignalReroute(curTrack);
+                            bool isAtEntry = AITraffic.Navigation.SignalRegistry.IsEntrySignal(ApproachingSignal);
+                            bool rerouted = false;
+
+                            // 1. First, attempt standard mainline/passing siding dynamic reroute (if not at entry holding for station destination)
+                            if (!isAtEntry || !IsStationDestination)
+                            {
+                                rerouted = TryDynamicRedSignalReroute(curTrack);
+                            }
+
+                            // 2. If standard reroute failed or was ineligible (e.g. holding at Entry Signal for a blocked station through-track):
+                            // Attempt an emergency detour through an empty yard shunting/storage track in Slow Shunting Mode!
+                            if (!rerouted)
+                            {
+                                rerouted = TryDynamicShuntingDetour(curTrack);
+                            }
+
                             _signalRerouteCooldown = rerouted ? 8.0f : 15.0f;
                         }
                     }
@@ -879,32 +1100,6 @@ namespace AITraffic.Driver
 
                             if (!isBlockedByObstacle)
                             {
-                                // Re-request alignment for clear upcoming switches along planned route
-                                if (_upcomingTracks != null && _upcomingTracks.Count > 1 && AITraffic.Navigation.JunctionController.Instance != null)
-                                {
-                                    int scanLimit = Math.Min(_upcomingTracks.Count, 64);
-                                    for (int sIdx = 1; sIdx < scanLimit; sIdx++)
-                                    {
-                                        var tA = _upcomingTracks[sIdx - 1];
-                                        var tB = _upcomingTracks[sIdx];
-                                        if (tA != null && tB != null && tA != tB)
-                                        {
-                                            Junction junc;
-                                            byte reqBr;
-                                            if (AITraffic.Navigation.SignalRegistry.TryGetJunctionBetweenTracks(tA, tB, out junc, out reqBr))
-                                            {
-                                                if (junc.selectedBranch != reqBr)
-                                                {
-                                                    if (!AITraffic.Navigation.SignalRegistry.IsJunctionReservedByPlayerSignal(junc))
-                                                    {
-                                                        AITraffic.Navigation.JunctionController.Instance.RequestJunctionAlignment(junc, reqBr, this);
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-
                                 // Awaken DVSignals to re-evaluate block clearance and clear signal aspect
                                 AITraffic.Navigation.SignalRegistry.WakeAndForceUpdateSignal(ApproachingSignal);
                                 if (AITraffic.Navigation.SignalRegistry.TryReserveDVSignal(ApproachingSignal))
@@ -1214,6 +1409,9 @@ namespace AITraffic.Driver
                     AITraffic.Navigation.JunctionController.Instance.ReleaseAllLocksFor(this);
                 }
 
+                // Proactively release switches passed behind the train or covered by red signal / player reserved block
+                ReleasePassedAndConflictingJunctions();
+
                 bool isRideAlong = (Main.Settings != null && Main.Settings.RideAlongMode);
 
                 // Determine if a governing signal directly facing the train is currently restricted (Hp 0 / Red)
@@ -1225,15 +1423,42 @@ namespace AITraffic.Driver
                     if (governingSig != null && governingSig.IsOn && governingSig.CurrentAspect != null)
                     {
                         isGoverningSignalRed = governingSig.CurrentAspect.DisallowPassing;
+                        if (!isGoverningSignalRed && CurrentSpeedKmh >= 1.5f)
+                        {
+                            _stoppedSwitchAlignCooldown = 0f;
+                        }
+                    }
+                }
+                if (governingSig == null && _upcomingSignalBlocks != null && _upcomingSignalBlocks.Count > 0 && _upcomingSignalBlocks[0].ExitSignal != null)
+                {
+                    if (_upcomingSignalBlocks[0].DistanceToExit < 2000f)
+                    {
+                        governingSig = _upcomingSignalBlocks[0].ExitSignal;
+                        if (governingSig != null && governingSig.IsOn && governingSig.CurrentAspect != null)
+                        {
+                            isGoverningSignalRed = governingSig.CurrentAspect.DisallowPassing;
+                            if (!isGoverningSignalRed && CurrentSpeedKmh >= 1.5f)
+                            {
+                                _stoppedSwitchAlignCooldown = 0f;
+                            }
+                        }
                     }
                 }
 
-                // Dynamic lookahead horizon:
-                // If governing signal is restricted (Hp 0), expand horizon up to 64 tracks or 3500m until it clears.
-                // Once signal is green or if line is open, maintain standard advance alignment (~1500m / 30 tracks).
-                int maxTracksToScan = isGoverningSignalRed ? Math.Min(_upcomingTracks.Count, 64) : Math.Min(_upcomingTracks.Count, 30);
-                float maxDistToScan = isGoverningSignalRed ? 3500f : 1500f;
+                var effBypassed = (_shuntingBypassedSignal != null && _shuntingBypassedSignal.Parent != null) ? _shuntingBypassedSignal.Parent : _shuntingBypassedSignal;
+                if (_isShuntingMode && governingSig != null && governingSig == effBypassed)
+                {
+                    isGoverningSignalRed = false;
+                }
 
+                // Dynamic lookahead horizon:
+                // Scan through the interlocking block up to the governing main signal (up to 40 tracks or 2500m)
+                // even in shunting mode, so siding exit turnouts and station throat switches are aligned advance-style.
+                int maxTracksToScan = isGoverningSignalRed ? Math.Min(_upcomingTracks.Count, 40) : Math.Min(_upcomingTracks.Count, 30);
+                float maxDistToScan = isGoverningSignalRed ? 2500f : 1500f;
+                bool isStoppedWaitingRed = (CurrentSpeedKmh < 1.5f && (isGoverningSignalRed || isParked));
+
+                _seenJunctionsThisPass.Clear();
                 for (int i = 1; i < _upcomingTracks.Count; i++)
                 {
                     if (i >= maxTracksToScan || accumulatedSwitchDist > maxDistToScan)
@@ -1250,6 +1475,14 @@ namespace AITraffic.Driver
                         byte requiredBranch;
                         if (AITraffic.Navigation.SignalRegistry.TryGetJunctionBetweenTracks(trackA, trackB, out junction, out requiredBranch))
                         {
+                            if (!_seenJunctionsThisPass.Add(junction))
+                            {
+                                // Junction was already encountered earlier along the route!
+                                // The closest (first) occurrence has absolute priority to prevent loop/throat switch thrashing.
+                                if (trackB != null && trackB.curve != null) accumulatedSwitchDist += trackB.curve.length;
+                                continue;
+                            }
+
                             float dist = Vector3.Distance(trainPos, junction.position);
                             float routeDist = accumulatedSwitchDist;
 
@@ -1276,6 +1509,13 @@ namespace AITraffic.Driver
                                     for (int b = 1; b < _upcomingSignalBlocks.Count; b++)
                                     {
                                         var block = _upcomingSignalBlocks[b];
+                                        // Station yard blocks entered past an Entry Signal are not single-track corridors;
+                                        // throat switches are individually protected by isPlayerNearJunction and isJunctionReservedByPlayer
+                                        if (block != null && block.EntrySignal != null && AITraffic.Navigation.SignalRegistry.IsEntrySignal(block.EntrySignal))
+                                        {
+                                            continue;
+                                        }
+
                                         if (block != null && block.IsPlayerOccupied && block.Switches != null)
                                         {
                                             for (int s = 0; s < block.Switches.Count; s++)
@@ -1299,7 +1539,12 @@ namespace AITraffic.Driver
                             // junctions in that block MUST be locked against the player unless the AI has stopped or is crawling (< 1.5 km/h).
                             bool protectInBlockSwitch = ShouldProtectJunctionLock(junction);
 
-                            if (!isRideAlong && !protectInBlockSwitch && (isJunctionInDownstreamPlayerBlock || isJunctionReservedByPlayer || isPlayerNearJunction))
+                            Trainset pSet;
+                            Vector3 pPos;
+                            float pSpeed;
+                            bool isPlayerMoving = AITraffic.Navigation.SignalRegistry.TryGetPlayerTrainInfo(out pSet, out pPos, out pSpeed) && pSpeed >= 1.0f;
+
+                            if (!isRideAlong && !protectInBlockSwitch && (isJunctionInDownstreamPlayerBlock || isJunctionReservedByPlayer || (isPlayerNearJunction && isPlayerMoving)))
                             {
                                 // Do not throw or lock switches for downstream blocks occupied by player or when stopped/crawling near player
                                 AITraffic.Navigation.JunctionController.Instance.ReleaseJunction(junction, this);
@@ -1313,27 +1558,63 @@ namespace AITraffic.Driver
 
                             bool isBlockedByObstacle = (CurrentSpeedKmh < 1.5f && DistanceToObstacle < 150f);
 
+                            isStoppedWaitingRed = (CurrentSpeedKmh < 1.5f && (isGoverningSignalRed || isParked));
+
                             // Advance Alignment: set switch immediately so station exit/entry route is aligned
                             // Proactively sets switches even while waiting for corridor/departure so exit signals clear to Green
                             bool switchAligned = (junction.selectedBranch == requiredBranch);
                             bool canAlignSwitches = !isBlockedByObstacle && (State != EngineState.TerminusStop) && (State != EngineState.StationHold || DwellTimeRemaining <= 10.0f);
+
+                            // 30s Alignment Cadence for stopped trains waiting at a red signal / station:
+                            // If stopped waiting for a red signal or dwelling, only pulse alignment every 30 seconds.
+                            // If the 30s timer is still running, leave the switch alone so player can freely use it!
+                            if (isStoppedWaitingRed && _stoppedSwitchAlignCooldown > 0f)
+                            {
+                                canAlignSwitches = false;
+                            }
+
+                            if (isStoppedWaitingRed && !switchAligned && canAlignSwitches)
+                            {
+                                // Check if switch directly interferes with player cars:
+                                // 1. Player rolling stock in 7m blade zone or straddling branches
+                                TrainCar foulingCar;
+                                bool isBladeFouled = AITraffic.Navigation.JunctionController.IsJunctionPhysicallyOccupied(junction, out foulingCar, _trainCar != null ? _trainCar.trainset : null);
+                                // 2. Moving player cars on any connected branch
+                                bool isMovingPlayerOnBranch = (isPlayerNearJunction && isPlayerMoving);
+                                bool isPlayerReserved = isJunctionReservedByPlayer;
+
+                                if (isBladeFouled || isMovingPlayerOnBranch || isPlayerReserved)
+                                {
+                                    // Player cars are directly interfering! Abort alignment pulse and back off for 30s.
+                                    _stoppedSwitchAlignCooldown = 30.0f;
+                                    canAlignSwitches = false;
+                                }
+                            }
+
                             if (!switchAligned && canAlignSwitches)
                             {
-                                switchAligned = AITraffic.Navigation.JunctionController.Instance.RequestJunctionAlignment(junction, requiredBranch, this);
-                                if (switchAligned && isGoverningSignalRed && governingSig != null)
+                                // Align switch to route without locking while stopped or waiting for signal!
+                                switchAligned = AITraffic.Navigation.JunctionController.Instance.RequestJunctionAlignment(junction, requiredBranch, this, lockAfterSwitch: false);
+                            }
+
+                            // Re-evaluate governing signal aspect whenever switches are aligned to the route
+                            // (whether aligned by the AI in this pass, or already aligned by player / previous pass!)
+                            if (switchAligned && isGoverningSignalRed && governingSig != null)
+                            {
+                                // As we align switches down the chain, synchronously re-evaluate the governing signal aspect
+                                AITraffic.Navigation.SignalRegistry.WakeAndForceUpdateSignal(governingSig);
+                                if (governingSig.IsOn && governingSig.CurrentAspect != null)
                                 {
-                                    // As we align switches down the chain, synchronously re-evaluate the governing signal aspect
-                                    AITraffic.Navigation.SignalRegistry.WakeAndForceUpdateSignal(governingSig);
-                                    if (governingSig.IsOn && governingSig.CurrentAspect != null)
+                                    isGoverningSignalRed = governingSig.CurrentAspect.DisallowPassing;
+                                    if (!isGoverningSignalRed)
                                     {
-                                        isGoverningSignalRed = governingSig.CurrentAspect.DisallowPassing;
-                                        if (!isGoverningSignalRed)
-                                        {
-                                            // The governing signal has turned GREEN! Interlocking path is complete.
-                                            // Tighten remaining lookahead horizon to avoid needlessly throwing distant switches
-                                            maxTracksToScan = Math.Min(maxTracksToScan, Math.Max(i + 3, 20));
-                                            maxDistToScan = Mathf.Min(maxDistToScan, Mathf.Max(accumulatedSwitchDist + 300f, 1200f));
-                                        }
+                                        // The governing signal has turned GREEN! Interlocking path is complete.
+                                        _stoppedSwitchAlignCooldown = 0f;
+                                        _switchHoldDistance = float.PositiveInfinity;
+
+                                        // Tighten remaining lookahead horizon to avoid needlessly throwing distant switches
+                                        maxTracksToScan = Math.Min(maxTracksToScan, Math.Max(i + 3, 20));
+                                        maxDistToScan = Mathf.Min(maxDistToScan, Mathf.Max(accumulatedSwitchDist + 300f, 1200f));
                                     }
                                 }
                             }
@@ -1347,8 +1628,48 @@ namespace AITraffic.Driver
                                 _switchHoldDistance = Mathf.Min(_switchHoldDistance, routeDist);
                             }
 
-                            // Critical Approach Lock: within 250m ahead of train along route (or immediate proximity or in entered block)
-                            if (routeDist < 250f || dist < 200f || isJunctionInCurrentBlock)
+                            // Shunting Siding Exit - 50m Virtual Stop Line:
+                            // When moving in shunting mode approaching an exit switch onto the mainline or connecting route:
+                            // If the switch cannot be aligned/locked, or the connecting track/block is occupied or reserved by another train:
+                            // Enforce a strict 50m Virtual Stop Line before the switch blade tip!
+                            if (_isShuntingMode && routeDist < 300f)
+                            {
+                                bool isSwitchOrExitBlocked = !switchAligned;
+                                if (!isSwitchOrExitBlocked && trackB != null)
+                                {
+                                    if (AITraffic.Navigation.RailGraph.Instance.IsTrackOccupied(trackB, null, _trainCar.trainset) ||
+                                        AITraffic.Navigation.SignalRegistry.IsTrackOccupiedByPlayer(trackB, _trainCar.trainset) ||
+                                        AITraffic.Navigation.SignalRegistry.IsTrackReservedByPlayerSignal(trackB))
+                                    {
+                                        isSwitchOrExitBlocked = true;
+                                    }
+                                    else
+                                    {
+                                        object holder;
+                                        if (AITraffic.Navigation.RailGraph.Instance.TryGetTrackReservationHolder(trackB, this, out holder) && !object.ReferenceEquals(holder, this))
+                                        {
+                                            isSwitchOrExitBlocked = true;
+                                        }
+                                    }
+                                }
+
+                                if (isSwitchOrExitBlocked)
+                                {
+                                    float virtualStopDist = Mathf.Max(0.0f, routeDist - 50.0f);
+                                    if (CurrentSpeedKmh < 1.5f && routeDist <= 60.0f)
+                                    {
+                                        virtualStopDist = 0.0f; // Firmly hold with full service brakes applied
+                                    }
+                                    _switchHoldDistance = Mathf.Min(_switchHoldDistance, virtualStopDist);
+                                }
+                            }
+
+                            // Critical Approach Lock:
+                            // Lock switches ONLY once Hp 1 is achieved AND the train starts moving (>= 1.5 km/h)!
+                            // While stopped (< 1.5 km/h) or while facing a red signal, leave switches 100% UNLOCKED.
+                            bool isMovingWithGreen = (CurrentSpeedKmh >= 1.5f && !isGoverningSignalRed && !isParked);
+                            bool shouldLockApproach = isMovingWithGreen && (isJunctionInCurrentBlock || protectInBlockSwitch);
+                            if (shouldLockApproach && (routeDist < 250f || dist < 200f || isJunctionInCurrentBlock))
                             {
                                 if (!isBlockedByObstacle)
                                 {
@@ -1376,6 +1697,140 @@ namespace AITraffic.Driver
                     if (accumulatedSwitchDist > maxDistToScan || i >= maxTracksToScan)
                     {
                         break;
+                    }
+                }
+
+                // If stopped waiting for a red signal and the signal remains red after completing this alignment pass:
+                if (isStoppedWaitingRed && isGoverningSignalRed && _stoppedSwitchAlignCooldown <= 0f)
+                {
+                    // Fallback Retry: If halted at an Entry Signal that remains Red (Hp 0) after the initial pass,
+                    // downstream reservations inside the station yard often cause DVSignals to reject Entry Signal reservation
+                    // ("block was null or overlapped reservation").
+                    // Purge downstream route reservations and immediately retry reserving the Entry Signal!
+                    if (governingSig != null && AITraffic.Navigation.SignalRegistry.IsEntrySignal(governingSig))
+                    {
+                        var clearedSignals = new HashSet<DVSignal>();
+
+                        // 1. Purge any downstream signals held in this AI's own reservation set
+                        List<DVSignal> ownDownstreamToRelease = null;
+                        foreach (var sig in _reservedDVSignals)
+                        {
+                            var effSig = (sig != null && sig.Parent != null) ? sig.Parent : sig;
+                            var effGov = (governingSig != null && governingSig.Parent != null) ? governingSig.Parent : governingSig;
+                            if (effSig != null && effSig != effGov)
+                            {
+                                if (ownDownstreamToRelease == null) ownDownstreamToRelease = new List<DVSignal>();
+                                ownDownstreamToRelease.Add(effSig);
+                            }
+                        }
+                        if (ownDownstreamToRelease != null)
+                        {
+                            for (int s = 0; s < ownDownstreamToRelease.Count; s++)
+                            {
+                                var sSig = ownDownstreamToRelease[s];
+                                AITraffic.Navigation.SignalRegistry.ClearDVSignalReservation(sSig);
+                                _reservedDVSignals.Remove(sSig);
+                                clearedSignals.Add(sSig);
+                            }
+                        }
+
+                        // 2. Query upcoming station tracks past the Entry Signal in TrackReserver
+                        var stationTracks = new List<RailTrack>();
+                        if (_upcomingSignalBlocks != null && _upcomingSignalBlocks.Count > 1)
+                        {
+                            for (int b = 1; b < _upcomingSignalBlocks.Count; b++)
+                            {
+                                var blk = _upcomingSignalBlocks[b];
+                                if (blk != null && blk.Tracks != null)
+                                {
+                                    for (int t = 0; t < blk.Tracks.Count; t++)
+                                    {
+                                        var trk = blk.Tracks[t];
+                                        if (trk != null && !stationTracks.Contains(trk))
+                                        {
+                                            stationTracks.Add(trk);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if (_upcomingTracks != null)
+                        {
+                            int startIdx = Math.Min(1, _upcomingTracks.Count);
+                            int endIdx = Math.Min(_upcomingTracks.Count, 40);
+                            for (int t = startIdx; t < endIdx; t++)
+                            {
+                                var trk = _upcomingTracks[t];
+                                if (trk != null && !stationTracks.Contains(trk))
+                                {
+                                    stationTracks.Add(trk);
+                                }
+                            }
+                        }
+
+                        int purgedTracks = AITraffic.Navigation.SignalRegistry.PurgeDownstreamRouteReservations(stationTracks, governingSig, this, clearedSignals);
+
+                        if (clearedSignals.Count > 0 || purgedTracks > 0)
+                        {
+                            if (Main.ModEntry != null && Main.ModEntry.Logger != null)
+                            {
+                                Main.ModEntry.Logger.Log(string.Format(
+                                    "[AITraffic] Train '{0}' held at Entry Signal '{1}' with Hp 0. Purged downstream reservations ({2} signals). Retrying Entry Signal...",
+                                    _trainCar != null ? _trainCar.ID : "Loco",
+                                    AITraffic.Navigation.SignalRegistry.GetSignalName(governingSig),
+                                    clearedSignals.Count + purgedTracks));
+                            }
+                        }
+
+                        // Re-awaken and re-attempt reservation on the Entry Signal now that switches are aligned and downstream conflicts purged
+                        AITraffic.Navigation.SignalRegistry.WakeAndForceUpdateSignal(governingSig);
+                        if (AITraffic.Navigation.SignalRegistry.TryReserveDVSignal(governingSig))
+                        {
+                            var effGov = (governingSig != null && governingSig.Parent != null) ? governingSig.Parent : governingSig;
+                            if (effGov != null && !_reservedDVSignals.Contains(effGov))
+                            {
+                                _reservedDVSignals.Add(effGov);
+                            }
+                        }
+
+                        if (governingSig.IsOn && governingSig.CurrentAspect != null)
+                        {
+                            isGoverningSignalRed = governingSig.CurrentAspect.DisallowPassing;
+                            if (!isGoverningSignalRed)
+                            {
+                                // Entry Signal cleared to GREEN! Interlocking complete, cancel cooldown & depart.
+                                _stoppedSwitchAlignCooldown = 0f;
+                                _switchHoldDistance = float.PositiveInfinity;
+                            }
+                        }
+                    }
+                    else if (governingSig != null)
+                    {
+                        // General Main/Spacing/Junction Signal Retry:
+                        AITraffic.Navigation.SignalRegistry.WakeAndForceUpdateSignal(governingSig);
+                        if (AITraffic.Navigation.SignalRegistry.TryReserveDVSignal(governingSig))
+                        {
+                            var effGov = (governingSig != null && governingSig.Parent != null) ? governingSig.Parent : governingSig;
+                            if (effGov != null && !_reservedDVSignals.Contains(effGov))
+                            {
+                                _reservedDVSignals.Add(effGov);
+                            }
+                        }
+
+                        if (governingSig.IsOn && governingSig.CurrentAspect != null)
+                        {
+                            isGoverningSignalRed = governingSig.CurrentAspect.DisallowPassing;
+                            if (!isGoverningSignalRed)
+                            {
+                                _stoppedSwitchAlignCooldown = 0f;
+                                _switchHoldDistance = float.PositiveInfinity;
+                            }
+                        }
+                    }
+
+                    if (isGoverningSignalRed)
+                    {
+                        _stoppedSwitchAlignCooldown = 30.0f;
                     }
                 }
 
@@ -1426,33 +1881,59 @@ namespace AITraffic.Driver
                     DVSignal immediateSig = null;
                     if (ApproachingSignal != null && DistanceToSignal < 2000f)
                     {
-                        immediateSig = ApproachingSignal.Parent != null ? ApproachingSignal.Parent : ApproachingSignal;
+                        var rawSig = ApproachingSignal.Parent != null ? ApproachingSignal.Parent : ApproachingSignal;
+                        if (AITraffic.Navigation.SignalRegistry.IsGoverningSignal(rawSig))
+                        {
+                            immediateSig = rawSig;
+                        }
                     }
 
-                    if (immediateSig != null)
+                    // Fallback: If approaching a distant warning signal (Vorsignal) or open track, target the upcoming governing signal directly
+                    if (immediateSig == null && _upcomingSignalBlocks.Count > 0 && _upcomingSignalBlocks[0].ExitSignal != null)
                     {
-                        if (AITraffic.Navigation.SignalRegistry.IsGoverningSignal(immediateSig))
+                        if (_upcomingSignalBlocks[0].DistanceToExit < 2000f)
                         {
-                            bool routeToSigClear = true;
-                            bool downstreamReady = true;
+                            immediateSig = _upcomingSignalBlocks[0].ExitSignal;
+                        }
+                    }
 
-                            if (_upcomingSignalBlocks.Count > 0)
+                    if (_isShuntingMode && immediateSig != null && immediateSig == effBypassed)
+                    {
+                        immediateSig = null;
+                    }
+
+                    if (immediateSig != null && AITraffic.Navigation.SignalRegistry.IsGoverningSignal(immediateSig))
+                    {
+                        bool isEntrySig = AITraffic.Navigation.SignalRegistry.IsEntrySignal(immediateSig);
+                        bool routeToSigClear = true;
+                        bool downstreamReady = true;
+
+                        if (_upcomingSignalBlocks.Count > 0)
+                        {
+                            var block1 = _upcomingSignalBlocks[0];
+                            routeToSigClear = block1.AreSwitchesAligned && block1.IsClear;
+
+                            // If block1 ends at immediateSig, verify that block2 (the block entered past immediateSig) is ready
+                            if (block1.ExitSignal == immediateSig && _upcomingSignalBlocks.Count > 1)
                             {
-                                var block1 = _upcomingSignalBlocks[0];
-                                routeToSigClear = block1.AreSwitchesAligned && block1.IsClear;
-
-                                // If block1 ends at immediateSig, verify that block2 (the block entered past immediateSig) is ready
-                                if (block1.ExitSignal == immediateSig && _upcomingSignalBlocks.Count > 1)
+                                var block2 = _upcomingSignalBlocks[1];
+                                if (isEntrySig)
                                 {
-                                    var block2 = _upcomingSignalBlocks[1];
+                                    // Station Entry Signal (E-Sig): throat switches must be aligned for our route,
+                                    // but station yard tracks naturally contain cars/jobs, so block2.IsClear is exempted.
+                                    downstreamReady = block2.AreSwitchesAligned;
+                                }
+                                else
+                                {
+                                    // Mainline Block Signal: strict absolute block required
                                     downstreamReady = block2.AreSwitchesAligned && block2.IsClear;
                                 }
                             }
+                        }
 
-                            if (routeToSigClear && downstreamReady)
-                            {
-                                targetSignalToReserve = immediateSig;
-                            }
+                        if (routeToSigClear && downstreamReady)
+                        {
+                            targetSignalToReserve = immediateSig;
                         }
                         // CRITICAL: When an unpassed governing signal stands directly in front of the train,
                         // DO NOT fall through to reserve downstream signals beyond it under ANY circumstance!
@@ -1468,13 +1949,21 @@ namespace AITraffic.Driver
                         if (distToMainSignal < 2000f && block1.AreSwitchesAligned && block1.IsClear)
                         {
                             var candidateSig = block1.ExitSignal;
+                            bool isEntrySig = AITraffic.Navigation.SignalRegistry.IsEntrySignal(candidateSig);
 
                             // Check downstream block governed by candidateSig (e.g. station track)
                             bool downstreamReady = true;
                             if (_upcomingSignalBlocks.Count > 1 && _upcomingSignalBlocks[1].EntrySignal == candidateSig)
                             {
                                 var block2 = _upcomingSignalBlocks[1];
-                                downstreamReady = block2.AreSwitchesAligned && block2.IsClear;
+                                if (isEntrySig)
+                                {
+                                    downstreamReady = block2.AreSwitchesAligned;
+                                }
+                                else
+                                {
+                                    downstreamReady = block2.AreSwitchesAligned && block2.IsClear;
+                                }
                             }
 
                             if (downstreamReady)
@@ -1544,6 +2033,89 @@ namespace AITraffic.Driver
                             AITraffic.Navigation.RailGraph.Instance.ReleaseTrackReservation(toRelease[r], this);
                         }
                         _reservedTracks.Remove(toRelease[r]);
+                    }
+                }
+            }
+        }
+
+        /// <summary>
+        /// Proactively releases switch locks for:
+        /// 1. Switches behind the train that the consist has already completely traversed and cleared.
+        /// 2. Switches covered by an upcoming governing signal where the player has reserved the block or is approaching,
+        ///    unless the AI train has entered the Approach Locking window (Point of No Return) of a Green signal.
+        /// </summary>
+        private void ReleasePassedAndConflictingJunctions()
+        {
+            if (AITraffic.Navigation.JunctionController.Instance == null) return;
+            var lockedJunctions = AITraffic.Navigation.JunctionController.Instance.GetLockedJunctionsFor(this);
+            if (lockedJunctions == null || lockedJunctions.Count == 0) return;
+
+            for (int j = 0; j < lockedJunctions.Count; j++)
+            {
+                var junction = lockedJunctions[j];
+                if (junction == null) continue;
+
+                // Physical safety: NEVER release a switch while any car in our consist is rolling over it!
+                TrainCar occupyingCar;
+                if (AITraffic.Navigation.JunctionController.IsJunctionPhysicallyOccupied(junction, out occupyingCar, _trainCar != null ? _trainCar.trainset : null))
+                {
+                    continue;
+                }
+
+                // Check 1: Has the train already passed the junction?
+                // A junction is passed if it is NOT ahead of the locomotive along _upcomingTracks
+                bool isAheadOnRoute = false;
+                if (_upcomingTracks != null && _upcomingTracks.Count > 1)
+                {
+                    int scanLimit = Math.Min(_upcomingTracks.Count, 64);
+                    for (int t = 1; t < scanLimit; t++)
+                    {
+                        Junction fwdJunc;
+                        byte branch;
+                        if (AITraffic.Navigation.SignalRegistry.TryGetJunctionBetweenTracks(_upcomingTracks[t - 1], _upcomingTracks[t], out fwdJunc, out branch))
+                        {
+                            if (fwdJunc == junction)
+                            {
+                                isAheadOnRoute = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                if (!isAheadOnRoute)
+                {
+                    // The junction is completely behind the train and not on upcoming route!
+                    AITraffic.Navigation.JunctionController.Instance.ReleaseJunction(junction, this);
+                    continue;
+                }
+
+                // Check 2: Is the junction covered by an upcoming signal and should be released?
+                // If ShouldProtectJunctionLock returns false, check if player has reserved it or player is nearby
+                if (!ShouldProtectJunctionLock(junction))
+                {
+                    bool isReservedByPlayer = AITraffic.Navigation.SignalRegistry.IsJunctionReservedByPlayerSignal(junction);
+                    bool isPlayerNear = AITraffic.Navigation.SignalRegistry.IsJunctionOccupiedByPlayer(junction, _trainCar != null ? _trainCar.trainset : null);
+
+                    Trainset pSet;
+                    Vector3 pPos;
+                    float pSpeed;
+                    bool isPlayerMoving = AITraffic.Navigation.SignalRegistry.TryGetPlayerTrainInfo(out pSet, out pPos, out pSpeed) && pSpeed >= 1.0f;
+
+                    bool isGoverningRed = false;
+                    if (ApproachingSignal != null && DistanceToSignal < 2000f)
+                    {
+                        var sig = ApproachingSignal.Parent != null ? ApproachingSignal.Parent : ApproachingSignal;
+                        if (sig != null && sig.IsOn && sig.CurrentAspect != null)
+                        {
+                            isGoverningRed = sig.CurrentAspect.DisallowPassing;
+                        }
+                    }
+                    bool isStoppedWaitingRed = (CurrentSpeedKmh < 1.5f && (isGoverningRed || State == EngineState.StationHold || State == EngineState.TerminusStop));
+
+                    if (isStoppedWaitingRed || isReservedByPlayer || (isPlayerNear && isPlayerMoving))
+                    {
+                        AITraffic.Navigation.JunctionController.Instance.ReleaseJunction(junction, this);
                     }
                 }
             }
@@ -1963,6 +2535,444 @@ namespace AITraffic.Driver
         }
 
         /// <summary>
+        /// When stopped at an Hp 0 (Red) signal with no clear mainline bypass,
+        /// attempts an emergency detour through an empty yard shunting/storage track in Slow Shunting Mode.
+        /// Verifies that all intermediate tracks up to the next governing signal are 100% physically clear.
+        /// </summary>
+        private bool TryDynamicShuntingDetour(RailTrack curTrack)
+        {
+            if (curTrack == null || CurrentPath == null || CurrentPath.Tracks == null || CurrentPath.Tracks.Count <= 1)
+                return false;
+
+            if (_trainCar == null) return false;
+
+            RailTrack destTrack = CurrentPath.Tracks[CurrentPath.Tracks.Count - 1];
+            if (destTrack == null) return false;
+
+            int curIdx = CurrentPathTrackIndex;
+            int maxLookahead = Mathf.Min(CurrentPath.Tracks.Count - 1, curIdx + 6);
+
+            for (int i = curIdx; i < maxLookahead; i++)
+            {
+                var trackA = CurrentPath.Tracks[i];
+                var trackB = CurrentPath.Tracks[i + 1];
+                if (trackA == null || trackB == null) continue;
+
+                Junction junction;
+                byte reqBranch;
+                if (!AITraffic.Navigation.SignalRegistry.TryGetJunctionBetweenTracks(trackA, trackB, out junction, out reqBranch))
+                    continue;
+
+                if (junction == null || junction.outBranches == null || junction.outBranches.Count <= 1)
+                    continue;
+
+                var pathOptions = new AITraffic.Navigation.PathfinderOptions
+                {
+                    Requester = this,
+                    RequesterTrainset = _trainCar.trainset,
+                    PreferSpeedOverDistance = true,
+                    AvoidOccupiedTracks = true,
+                    StrictlyAvoidOccupied = true,
+                    AvoidReservedTracks = true,
+                    StrictlyAvoidReserved = false,
+                    PreventPlayerOvertake = false,
+                    AllowShuntingDetour = true,
+                    MaxSearchDistance = 5000000f,
+                    ExcludedTracks = new HashSet<RailTrack> { trackB }
+                };
+
+                bool forwardOnTrack = (TargetDirection >= 0f);
+                if (_trainCar.FrontBogie != null && _trainCar.RearBogie != null &&
+                    _trainCar.FrontBogie.traveller != null && _trainCar.RearBogie.traveller != null &&
+                    _trainCar.FrontBogie.track == _trainCar.RearBogie.track)
+                {
+                    forwardOnTrack = (_trainCar.FrontBogie.traveller.Span >= _trainCar.RearBogie.traveller.Span);
+                }
+
+                var pathfinder = new AITraffic.Navigation.Pathfinder(AITraffic.Navigation.RailGraph.Instance);
+                var alternativePath = pathfinder.FindPath(curTrack, destTrack, forwardOnTrack, pathOptions);
+
+                if (alternativePath == null || !alternativePath.IsValid || alternativePath.Tracks == null || alternativePath.Tracks.Count < 2)
+                    continue;
+
+                if (alternativePath.Tracks.Contains(trackB))
+                    continue;
+
+                // Verify alternativePath actually uses an empty shunting/storage track
+                bool usesShunting = false;
+                for (int t = 0; t < alternativePath.Tracks.Count; t++)
+                {
+                    if (AITraffic.Navigation.Pathfinder.IsShuntingOrStorageTrack(alternativePath.Tracks[t]))
+                    {
+                        usesShunting = true;
+                        break;
+                    }
+                }
+                if (!usesShunting)
+                    continue;
+
+                // Splice alternative path with current path up to curIdx
+                var combinedTracks = new List<RailTrack>();
+                for (int c = 0; c <= curIdx; c++)
+                {
+                    combinedTracks.Add(CurrentPath.Tracks[c]);
+                }
+                for (int c = 1; c < alternativePath.Tracks.Count; c++)
+                {
+                    var trk = alternativePath.Tracks[c];
+                    if (!combinedTracks.Contains(trk))
+                    {
+                        combinedTracks.Add(trk);
+                    }
+                }
+
+                var fullPathfinder = new AITraffic.Navigation.Pathfinder(AITraffic.Navigation.RailGraph.Instance);
+                var newFullPath = fullPathfinder.BuildPathFromTracks(combinedTracks);
+                if (newFullPath == null || !newFullPath.IsValid)
+                    continue;
+
+                // Verify no sharp hairpin kinks in the spliced detour
+                bool hasHairpin = false;
+                for (int k = 0; k < newFullPath.Tracks.Count - 1; k++)
+                {
+                    var tA = newFullPath.Tracks[k];
+                    var tB = newFullPath.Tracks[k + 1];
+                    if (tA != null && tA.curve != null && tB != null && tB.curve != null)
+                    {
+                        var edgeA = AITraffic.Navigation.RailGraph.Instance.GetEdge(tA);
+                        var edgeB = AITraffic.Navigation.RailGraph.Instance.GetEdge(tB);
+                        if (edgeA != null && edgeB != null)
+                        {
+                            var sharedNode = AITraffic.Navigation.RailGraph.Instance.GetConnectingNode(edgeA, edgeB);
+                            if (sharedNode != null)
+                            {
+                                Vector3 vIn = AITraffic.Navigation.RailGraph.GetIncomingVector(sharedNode, edgeA);
+                                Vector3 vOut = AITraffic.Navigation.RailGraph.GetDepartingVector(sharedNode, edgeB);
+                                if (Vector3.Dot(vIn, vOut) < -0.30f)
+                                {
+                                    hasHairpin = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                if (hasHairpin)
+                    continue;
+
+                // Look up upcoming signals along detour route and verify physical clearance requirement:
+                // Track between the train and the next governing signal must be 100% physically clear!
+                double curSpan = 0.0;
+                if (_trainCar.FrontBogie != null && _trainCar.FrontBogie.traveller != null)
+                    curSpan = _trainCar.FrontBogie.traveller.Span;
+                else if (_trainCar.RearBogie != null && _trainCar.RearBogie.traveller != null)
+                    curSpan = _trainCar.RearBogie.traveller.Span;
+
+                var detourUpcomingTracks = new List<RailTrack>();
+                int newCurIdx = newFullPath.Tracks.IndexOf(curTrack);
+                if (newCurIdx < 0) newCurIdx = 0;
+                for (int t = newCurIdx; t < newFullPath.Tracks.Count; t++)
+                {
+                    detourUpcomingTracks.Add(newFullPath.Tracks[t]);
+                }
+
+                var detourSignals = new List<AITraffic.Navigation.SignalRegistry.UpcomingSignal>();
+                AITraffic.Navigation.SignalRegistry.TryFindUpcomingSignals(curTrack, curSpan, TargetDirection, detourUpcomingTracks, detourSignals);
+
+                DVSignal bypassedSig = ApproachingSignal;
+                DVSignal nextGovSig = null;
+                float nextGovDist = float.PositiveInfinity;
+
+                for (int s = 0; s < detourSignals.Count; s++)
+                {
+                    var sig = detourSignals[s].Signal;
+                    if (sig == null) continue;
+                    var effSig = sig.Parent != null ? sig.Parent : sig;
+                    var effBypassed = bypassedSig != null && bypassedSig.Parent != null ? bypassedSig.Parent : bypassedSig;
+
+                    if (effSig != effBypassed && detourSignals[s].Distance > 10.0f)
+                    {
+                        if (AITraffic.Navigation.SignalRegistry.IsGoverningSignal(sig))
+                        {
+                            nextGovSig = sig;
+                            nextGovDist = detourSignals[s].Distance;
+                            break;
+                        }
+                    }
+                }
+
+                // Verify that all tracks along detour up to nextGovSig (or entire detour if no signal) are 100% physically clear!
+                bool isPathPhysicallyClear = true;
+                float accumulatedTrackDist = 0f;
+
+                for (int t = 0; t < detourUpcomingTracks.Count; t++)
+                {
+                    var trk = detourUpcomingTracks[t];
+                    if (trk == null) continue;
+                    if (trk == curTrack) continue;
+
+                    if (AITraffic.Navigation.RailGraph.Instance.IsTrackOccupied(trk, null, _trainCar.trainset) ||
+                        AITraffic.Navigation.SignalRegistry.IsTrackOccupiedByPlayer(trk, _trainCar.trainset))
+                    {
+                        isPathPhysicallyClear = false;
+                        break;
+                    }
+
+                    if (trk.curve != null)
+                    {
+                        accumulatedTrackDist += trk.curve.length;
+                    }
+                    if (nextGovSig != null && accumulatedTrackDist >= nextGovDist + 10.0f)
+                    {
+                        break;
+                    }
+                }
+
+                if (!isPathPhysicallyClear)
+                    continue;
+
+                // Detour is valid, clear, and verified! Adopt it!
+                CurrentPath = newFullPath;
+                CurrentPathTrackIndex = newCurIdx;
+                _upcomingTracks.Clear();
+                for (int t = CurrentPathTrackIndex; t < CurrentPath.Tracks.Count; t++)
+                {
+                    _upcomingTracks.Add(CurrentPath.Tracks[t]);
+                }
+
+                _obstacleTrack = null;
+                DistanceToObstacle = float.PositiveInfinity;
+                _stoppedAtRedTimer = 0f;
+
+                // Enter Slow Shunting Mode
+                _isShuntingMode = true;
+                _shuntingBypassedSignal = bypassedSig;
+                _shuntingTargetSignal = nextGovSig;
+
+                if (Main.ModEntry != null && Main.ModEntry.Logger != null)
+                {
+                    Main.ModEntry.Logger.Log(string.Format(
+                        "[AITraffic] Shunting Detour Adopted: Train '{0}' bypassing red signal '{1}' via yard shunting detour ({2} tracks). Next governing signal: '{3}'. Speed capped to 15 km/h.",
+                        _trainCar != null ? _trainCar.ID : "Loco",
+                        AITraffic.Navigation.SignalRegistry.GetSignalName(bypassedSig),
+                        newFullPath.Tracks.Count,
+                        nextGovSig != null ? AITraffic.Navigation.SignalRegistry.GetSignalName(nextGovSig) : "None (Destination Siding)"));
+                }
+
+                return true;
+            }
+
+            return false;
+        }
+
+        /// <summary>
+        /// Initializes the AI Engineer in Slow Shunting Mode (capped at 15 km/h) upon spawning on an unsignaled siding
+        /// or dwarf-signaled track. Follows shunting signals and transitions to line speed upon passing an Hp 1/Hp 2 main signal.
+        /// </summary>
+        public void StartInShuntingMode(DVSignal nextGoverningSignal = null)
+        {
+            _isShuntingMode = true;
+            _shuntingBypassedSignal = null;
+            _shuntingTargetSignal = nextGoverningSignal;
+            if (Main.ModEntry != null && Main.ModEntry.Logger != null)
+            {
+                Main.ModEntry.Logger.Log(string.Format(
+                    "[AITraffic] Train '{0}' starting in Slow Shunting Mode on siding. Speed capped to 15 km/h until governing main signal clear.",
+                    _trainCar != null ? _trainCar.ID : "Loco"));
+            }
+        }
+
+        /// <summary>
+        /// Checks whether the governing signal is held at Hp 0 (Red) exclusively by this train's
+        /// own consist (e.g. consist tail fouling loop switch or train looping back onto its own block),
+        /// with no player presence and no foreign trains or conflicting reservations blocking the path.
+        /// </summary>
+        public bool IsSignalBlockedOnlyBySelf(DVSignal signal)
+        {
+            if (signal == null) return false;
+
+            // 1. Never override if player is nearby or on the tracks
+            Trainset pTrainset;
+            Vector3 pPos;
+            float pSpd;
+            if (AITraffic.Navigation.SignalRegistry.TryGetPlayerTrainInfo(out pTrainset, out pPos, out pSpd))
+            {
+                if (Vector3.Distance(AITraffic.Navigation.SignalRegistry.GetSignalPosition(signal), pPos) < 150f)
+                {
+                    return false;
+                }
+            }
+
+            // 2. Identify the signal block governed by this signal
+            AITraffic.Navigation.SignalBlockInfo targetBlock = null;
+            if (_upcomingSignalBlocks != null && _upcomingSignalBlocks.Count > 0)
+            {
+                for (int b = 0; b < _upcomingSignalBlocks.Count; b++)
+                {
+                    var blk = _upcomingSignalBlocks[b];
+                    if (blk != null && blk.EntrySignal == signal)
+                    {
+                        targetBlock = blk;
+                        break;
+                    }
+                }
+
+                if (targetBlock == null && _upcomingSignalBlocks.Count > 1 && _upcomingSignalBlocks[0].ExitSignal == signal)
+                {
+                    targetBlock = _upcomingSignalBlocks[1];
+                }
+            }
+
+            var tracksToCheck = new HashSet<RailTrack>();
+            bool isDVSignalSelfLoop = false;
+
+            // Query native DVSignals block if available
+            var effSigForBlock = (signal.Parent != null) ? signal.Parent : signal;
+            var dvBlock = effSigForBlock.Block ?? signal.Block;
+            if (dvBlock != null)
+            {
+                if (dvBlock.IsSelfLoop) isDVSignalSelfLoop = true;
+                if (dvBlock.Tracks != null)
+                {
+                    for (int i = 0; i < dvBlock.Tracks.Length; i++)
+                    {
+                        var t = dvBlock.Tracks[i].Track;
+                        if (t != null) tracksToCheck.Add(t);
+                    }
+                }
+                if (dvBlock.ExtraTracks != null)
+                {
+                    for (int i = 0; i < dvBlock.ExtraTracks.Length; i++)
+                    {
+                        var t = dvBlock.ExtraTracks[i];
+                        if (t != null) tracksToCheck.Add(t);
+                    }
+                }
+            }
+
+            if (targetBlock != null && targetBlock.Tracks != null && targetBlock.Tracks.Count > 0)
+            {
+                // Switches inside targetBlock must be aligned for our route
+                if (!targetBlock.AreSwitchesAligned) return false;
+                if (targetBlock.IsPlayerOccupied) return false;
+                for (int t = 0; t < targetBlock.Tracks.Count; t++)
+                {
+                    var trk = targetBlock.Tracks[t];
+                    if (trk != null) tracksToCheck.Add(trk);
+                }
+            }
+            else if (tracksToCheck.Count == 0)
+            {
+                // Fallback: collect upcoming tracks up to the next governing signal or 500m
+                float dist = 0f;
+                for (int t = 0; t < _upcomingTracks.Count; t++)
+                {
+                    var trk = _upcomingTracks[t];
+                    if (trk == null) continue;
+                    tracksToCheck.Add(trk);
+                    if (trk.curve != null) dist += trk.curve.length;
+                    if (dist > 500f) break;
+                }
+            }
+
+            if (tracksToCheck.Count == 0) return false;
+
+            Trainset myTrainset = (_trainCar != null) ? _trainCar.trainset : null;
+            bool foundOwnCar = false;
+
+            foreach (var trk in tracksToCheck)
+            {
+                if (trk == null) continue;
+
+                // Check for player occupancy
+                if (AITraffic.Navigation.SignalRegistry.IsTrackOccupiedByPlayer(trk, myTrainset))
+                {
+                    return false;
+                }
+
+                // Check for foreign train cars vs own cars
+                var bogies = trk.BogiesOnTrack();
+                if (bogies != null && bogies.Count > 0)
+                {
+                    foreach (var bogie in bogies)
+                    {
+                        if (bogie == null || bogie.Car == null) continue;
+
+                        bool isOwnCar = (myTrainset != null && (bogie.Car.trainset == myTrainset || (myTrainset.cars != null && myTrainset.cars.Contains(bogie.Car)))) ||
+                                        (_registeredConsistCars != null && _registeredConsistCars.Contains(bogie.Car));
+
+                        if (!isOwnCar)
+                        {
+                            // Block is legitimately occupied by another train!
+                            return false;
+                        }
+                        else
+                        {
+                            foundOwnCar = true;
+                        }
+                    }
+                }
+
+                // Check external reservations
+                Signals.Game.Signal resBySig;
+                if (Signals.Game.Railway.TrackReserver.IsTrackReserved(trk, out resBySig) && resBySig != null)
+                {
+                    var effResSig = (resBySig.Parent != null) ? resBySig.Parent : resBySig;
+                    var effSig = (signal.Parent != null) ? signal.Parent : signal;
+                    if (effResSig != effSig)
+                    {
+                        // Reserved by a foreign signal!
+                        return false;
+                    }
+                }
+            }
+
+            return foundOwnCar || isDVSignalSelfLoop;
+        }
+
+        private DVSignal FindNextGoverningMainSignal(DVSignal currentSignal)
+        {
+            var effCurrent = (currentSignal != null && currentSignal.Parent != null) ? currentSignal.Parent : currentSignal;
+            if (_upcomingSignals != null)
+            {
+                for (int s = 0; s < _upcomingSignals.Count; s++)
+                {
+                    var sig = _upcomingSignals[s].Signal;
+                    if (sig == null) continue;
+                    var effSig = (sig.Parent != null) ? sig.Parent : sig;
+                    if (effSig != effCurrent && _upcomingSignals[s].Distance > 10.0f)
+                    {
+                        if (AITraffic.Navigation.SignalRegistry.IsGoverningSignal(sig))
+                        {
+                            return sig;
+                        }
+                    }
+                }
+            }
+
+            if (_upcomingSignalBlocks != null && _upcomingSignalBlocks.Count > 1)
+            {
+                for (int b = 0; b < _upcomingSignalBlocks.Count; b++)
+                {
+                    var blk = _upcomingSignalBlocks[b];
+                    if (blk == null) continue;
+                    var sig = blk.ExitSignal ?? blk.EntrySignal;
+                    if (sig == null) continue;
+                    var effSig = (sig.Parent != null) ? sig.Parent : sig;
+                    if (effSig != effCurrent && blk.DistanceToExit > 10.0f)
+                    {
+                        if (AITraffic.Navigation.SignalRegistry.IsGoverningSignal(sig))
+                        {
+                            return sig;
+                        }
+                    }
+                }
+            }
+
+            return null;
+        }
+
+        /// <summary>
         /// Relative priority of train consist for single-track passing loop negotiation.
         /// Passenger and heavy freight have mainline priority over regional and shunter freight.
         /// Player train has absolute top priority.
@@ -2139,6 +3149,7 @@ namespace AITraffic.Driver
 
             if (corridorTracks.Count == 0)
             {
+                _isHoldingInMultiTrack = false;
                 _isHoldingForCorridor = false;
                 _corridorHoldReason = null;
                 _corridorHoldDistance = float.PositiveInfinity;
@@ -2147,6 +3158,7 @@ namespace AITraffic.Driver
 
             // 2. Check for Conflicts in the upcoming single-track corridor
             bool isPlayerInCorridor = false;
+            bool isWorkerInCorridor = false;
             bool isReservedByOther = false;
             AIEngineer opposingAIEngineer = null;
             string conflictDetails = null;
@@ -2162,7 +3174,7 @@ namespace AITraffic.Driver
                                    AITraffic.Navigation.SignalRegistry.IsTrackReservedByPlayerSignal(cTrk)))
                 {
                     isPlayerInCorridor = true;
-                    conflictDetails = "Player train or signal route in corridor ahead";
+                    conflictDetails = "Player train on single track corridor";
                     break;
                 }
 
@@ -2171,6 +3183,14 @@ namespace AITraffic.Driver
                 if (AITraffic.Navigation.RailGraph.Instance.TryGetTrackReservationHolder(cTrk, this, out holderObj))
                 {
                     var holderEng = holderObj as AIEngineer;
+                    if (holderEng != null && holderEng.IsWorkerDriven)
+                    {
+                        isWorkerInCorridor = true;
+                        opposingAIEngineer = holderEng;
+                        conflictDetails = "Player worker train in corridor ahead";
+                        break;
+                    }
+
                     if (holderEng == null)
                     {
                         // Non-AIEngineer holder — treat as blocking to be safe
@@ -2195,21 +3215,61 @@ namespace AITraffic.Driver
                 }
             }
 
-            // 3. Resolve Conflict: Passing Loop Coordination or Hold
-            if (isPlayerInCorridor || isReservedByOther)
+            // Also check if any active worker train is physically occupying a corridor track
+            if (!isPlayerInCorridor && !isWorkerInCorridor && Core.TrafficManager.Instance != null && Core.TrafficManager.Instance.ActiveEngineers != null)
             {
-                // Determine if WE should yield:
-                // Rule 1: Always yield to Player train
-                // Rule 2: Dynamic Deadlock-Breaking Yield Inversion:
-                //         If a train is stopped (< 1.5 km/h) and blocked by an obstacle (< 150m),
-                //         it CANNOT physically proceed. The opposing train (which has rerouted/clearing path)
-                //         MUST move first to break the lock!
-                // Rule 3: In-Block Invariant:
-                //         A train already inside the single-track corridor NEVER yields to a train outside!
-                // Rule 4: If AI vs AI under normal running outside the block, lower priority train yields
-                // Rule 5: If equal priority outside the block, train farther from corridor start yields (closer train enters)
-                // Rule 6: Deterministic consist ID comparison breaks exact distance ties
-                bool weShouldYield = isPlayerInCorridor;
+                var activeEngs = Core.TrafficManager.Instance.ActiveEngineers;
+                for (int e = 0; e < activeEngs.Count; e++)
+                {
+                    var eng = activeEngs[e];
+                    if (eng != null && eng != this && eng.IsWorkerDriven && eng.CurrentTrack != null && corridorTracks.Contains(eng.CurrentTrack))
+                    {
+                        isWorkerInCorridor = true;
+                        opposingAIEngineer = eng;
+                        conflictDetails = "Player worker train on corridor track";
+                        break;
+                    }
+                }
+            }
+
+            // 2c. Multi-Track Interlocking "Yellow-Box" Protection (with DVSignals)
+            // If in a true multi-track section (double track or passing siding), check if any signal protecting
+            // the entrance/exit into the single-track bottleneck is RED. If so, hold firmly in multi-track!
+            bool hasRedJunctionExitSignal = false;
+            bool inMultiTrackSection = isCurDouble || isCurPassingSiding;
+            if (inMultiTrackSection && _upcomingSignals != null && _upcomingSignals.Count > 0)
+            {
+                for (int s = 0; s < _upcomingSignals.Count; s++)
+                {
+                    var upcomingSig = _upcomingSignals[s];
+                    if (upcomingSig.Signal == null) continue;
+                    if (upcomingSig.Distance > 1200.0f) break;
+
+                    bool isSigRed = upcomingSig.Signal.CurrentAspect != null && upcomingSig.Signal.CurrentAspect.DisallowPassing;
+                    if (isSigRed && upcomingSig.Distance >= Mathf.Max(0.0f, distToCorridorStart - 10.0f))
+                    {
+                        bool isBlockOccupied = (upcomingSig.Signal.Block != null && upcomingSig.Signal.Block.IsOccupied(Signals.Common.CrossingCheckMode.WholeTrack));
+                        bool isBlockReservedByOther = Signals.Game.Railway.TrackReserver.IsSignalReservedByAnother(upcomingSig.Signal);
+                        if (isBlockOccupied || isBlockReservedByOther || isPlayerInCorridor || isWorkerInCorridor || isReservedByOther || opposingAIEngineer != null)
+                        {
+                            hasRedJunctionExitSignal = true;
+                            if (string.IsNullOrEmpty(conflictDetails))
+                            {
+                                conflictDetails = "Junction exit signal is RED (Hp 0) and bottleneck occupied";
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+
+            // 3. Resolve Conflict: Passing Loop Coordination or Hold
+            if (isPlayerInCorridor || isWorkerInCorridor || isReservedByOther || hasRedJunctionExitSignal)
+            {
+                // Rule 1: Always yield to Player train, Worker AI train, or Red Junction Exit Signal
+                // Rule 2: Dynamic Deadlock-Breaking Yield Inversion for AI vs AI
+                // Rule 3: In-Block Invariant: train inside single track never yields to train outside
+                bool weShouldYield = isPlayerInCorridor || isWorkerInCorridor || hasRedJunctionExitSignal;
                 if (!weShouldYield && opposingAIEngineer != null)
                 {
                     bool thisBlocked = (CurrentSpeedKmh < 1.5f && DistanceToObstacle < 150f);
@@ -2309,24 +3369,39 @@ namespace AITraffic.Driver
                         return;
                     }
 
-                    // If we have NOT yet entered the single-track corridor (holding in passing loop / siding / station):
-                    // We MUST HOLD at the passing point before entering the single track!
-                    if (!isCurrentTrackSingle || distToCorridorStart > 10.0f)
+                    // Multi-Track Section Hold ("Yellow-Box" Protection)
+                    // If currently in a multi-track section (double track or passing siding), or hold was already initiated here:
+                    // Firmly hold at the passing point outside the switch clearance margin!
+                    bool inMultiTrack = isCurDouble || isCurPassingSiding || distToCorridorStart > 10.0f;
+                    if (inMultiTrack || _isHoldingInMultiTrack)
                     {
-                        _isHoldingForCorridor = true;
-                        _corridorHoldReason = conflictDetails;
+                        if (!_isHoldingInMultiTrack && Main.ModEntry != null && Main.ModEntry.Logger != null)
+                        {
+                            Main.ModEntry.Logger.Log(string.Format("[AITraffic] Train '{0}' holding in multi-track section before junction bottleneck. Reason: {1}", _trainCar != null ? _trainCar.ID : "Loco", conflictDetails));
+                        }
 
-                        // Stop safely before the start of the single-track section outside the 45m switch clearance margin
-                        float holdStopDist = Mathf.Max(5.0f, distToCorridorStart - 45.0f);
+                        _isHoldingInMultiTrack = true;
+                        _isHoldingForCorridor = true;
+                        _corridorHoldReason = conflictDetails ?? "Holding in multi-track section";
+
+                        // Stop safely before the start of the single-track section outside the switch clearance margin
+                        float holdStopDist = Mathf.Max(0.0f, distToCorridorStart - 40.0f);
+
+                        // If train has already reached the holding stop line or is stopped (< 1.5 km/h), firmly clamp distance to 0 so brakes remain fully engaged!
+                        if (CurrentSpeedKmh < 1.5f && (distToCorridorStart <= 50.0f || _isHoldingInMultiTrack))
+                        {
+                            holdStopDist = 0.0f;
+                        }
+
                         _corridorHoldDistance = Mathf.Min(_corridorHoldDistance, holdStopDist);
                         return;
                     }
                     else
                     {
-                        // We are already inside the single track:
-                        // Hold safely before collision with a safe buffer
+                        // Train was ALREADY fully committed past the multi-track section into single track BEFORE conflict occurred.
+                        // Cannot safely back up; proceed to safe stop buffer before obstacle/signal.
                         _isHoldingForCorridor = true;
-                        _corridorHoldReason = conflictDetails;
+                        _corridorHoldReason = conflictDetails ?? "Holding in single track";
                         float safeStopDist = Mathf.Max(15.0f, DistanceToObstacle - 50.0f);
                         _corridorHoldDistance = Mathf.Min(_corridorHoldDistance, safeStopDist);
                         return;
@@ -2344,31 +3419,51 @@ namespace AITraffic.Driver
                         // OR if its current track is in our upcoming corridorTracks!
                         opposingAlreadyInCorridor = (opposingAIEngineer.DistToCorridorStart <= 5.0f || (oppTrack != null && corridorTracks.Contains(oppTrack)));
                     }
-                    else if (isPlayerInCorridor)
+                    else if (isPlayerInCorridor || isWorkerInCorridor)
                     {
                         opposingAlreadyInCorridor = true;
                     }
 
                     if (opposingAlreadyInCorridor)
                     {
-                        _isHoldingForCorridor = true;
-                        _corridorHoldReason = conflictDetails;
-                        float holdDist = (!isCurrentTrackSingle || distToCorridorStart > 10.0f)
-                            ? Mathf.Max(5.0f, distToCorridorStart - 45.0f)
-                            : Mathf.Max(15.0f, DistanceToObstacle - 50.0f);
-                        _corridorHoldDistance = Mathf.Min(_corridorHoldDistance, holdDist);
-                        return;
+                        bool inMultiTrack = isCurDouble || isCurPassingSiding || distToCorridorStart > 10.0f;
+                        if (inMultiTrack || _isHoldingInMultiTrack)
+                        {
+                            _isHoldingInMultiTrack = true;
+                            _isHoldingForCorridor = true;
+                            _corridorHoldReason = conflictDetails ?? "Holding in multi-track section";
+                            float holdStopDist = Mathf.Max(0.0f, distToCorridorStart - 40.0f);
+                            if (CurrentSpeedKmh < 1.5f && (distToCorridorStart <= 50.0f || _isHoldingInMultiTrack))
+                            {
+                                holdStopDist = 0.0f;
+                            }
+                            _corridorHoldDistance = Mathf.Min(_corridorHoldDistance, holdStopDist);
+                            return;
+                        }
+                        else
+                        {
+                            _isHoldingForCorridor = true;
+                            _corridorHoldReason = conflictDetails ?? "Holding in single track";
+                            float safeStopDist = Mathf.Max(15.0f, DistanceToObstacle - 50.0f);
+                            _corridorHoldDistance = Mathf.Min(_corridorHoldDistance, safeStopDist);
+                            return;
+                        }
                     }
                     else
                     {
                         // Opposing train is waiting/holding outside or in its passing siding.
                         // We have the clear right-of-way! DO NOT HOLD!
-                        bool wasHolding = _isHoldingForCorridor;
+                        bool wasHolding = _isHoldingForCorridor || _isHoldingInMultiTrack;
+                        _isHoldingInMultiTrack = false;
                         _isHoldingForCorridor = false;
                         _corridorHoldReason = null;
                         _corridorHoldDistance = float.PositiveInfinity;
                         if (wasHolding)
                         {
+                            if (Main.ModEntry != null && Main.ModEntry.Logger != null)
+                            {
+                                Main.ModEntry.Logger.Log(string.Format("[AITraffic] Train '{0}' cleared corridor hold. Resuming mainline transit.", _trainCar != null ? _trainCar.ID : "Loco"));
+                            }
                             _pathUpdateCooldown = 0.0f;
                             _speedProfileUpdateCooldown = 0.0f;
                             for (int b = 0; b < _upcomingSignalBlocks.Count; b++)
@@ -2386,12 +3481,17 @@ namespace AITraffic.Driver
             else
             {
                 // Corridor is completely clear!
-                bool wasHolding = _isHoldingForCorridor;
+                bool wasHolding = _isHoldingForCorridor || _isHoldingInMultiTrack;
+                _isHoldingInMultiTrack = false;
                 _isHoldingForCorridor = false;
                 _corridorHoldReason = null;
                 _corridorHoldDistance = float.PositiveInfinity;
                 if (wasHolding)
                 {
+                    if (Main.ModEntry != null && Main.ModEntry.Logger != null)
+                    {
+                        Main.ModEntry.Logger.Log(string.Format("[AITraffic] Train '{0}' cleared corridor hold. Resuming mainline transit.", _trainCar != null ? _trainCar.ID : "Loco"));
+                    }
                     _pathUpdateCooldown = 0.0f;
                     _speedProfileUpdateCooldown = 0.0f;
                     for (int b = 0; b < _upcomingSignalBlocks.Count; b++)
@@ -2481,6 +3581,42 @@ namespace AITraffic.Driver
                 for (int i = 0; i < _upcomingSignals.Count; i++)
                 {
                     var sigEntry = _upcomingSignals[i];
+
+                    // If in Slow Shunting Mode:
+                    if (_isShuntingMode)
+                    {
+                        var effSig = (sigEntry.Signal != null && sigEntry.Signal.Parent != null) ? sigEntry.Signal.Parent : sigEntry.Signal;
+                        var effBypassed = (_shuntingBypassedSignal != null && _shuntingBypassedSignal.Parent != null) ? _shuntingBypassedSignal.Parent : _shuntingBypassedSignal;
+
+                        // 1. Disregard bypassed signal's Hp 0
+                        if (effSig != null && effSig == effBypassed)
+                        {
+                            continue;
+                        }
+
+                        // 2. Check next governing signal for handover
+                        var effTarget = (_shuntingTargetSignal != null && _shuntingTargetSignal.Parent != null) ? _shuntingTargetSignal.Parent : _shuntingTargetSignal;
+                        if ((effTarget != null && effSig == effTarget) || (effTarget == null && AITraffic.Navigation.SignalRegistry.IsMainSignal(effSig)))
+                        {
+                            bool isTargetRed = (sigEntry.Signal.CurrentAspect != null && sigEntry.Signal.CurrentAspect.DisallowPassing);
+                            if (!isTargetRed)
+                            {
+                                // Next governing signal shows Hp 1 or Hp 2 (Clear)! Handover complete.
+                                _isShuntingMode = false;
+                                _isSelfBlockedShunting = false;
+                                _shuntingBypassedSignal = null;
+                                _shuntingTargetSignal = null;
+                                if (Main.ModEntry != null && Main.ModEntry.Logger != null)
+                                {
+                                    Main.ModEntry.Logger.Log(string.Format("[AITraffic] Train '{0}' cleared shunting detour into signal '{1}' ({2}). Resuming normal line speed.",
+                                        _trainCar != null ? _trainCar.ID : "Loco",
+                                        AITraffic.Navigation.SignalRegistry.GetSignalName(sigEntry.Signal),
+                                        AITraffic.Navigation.SignalRegistry.GetAspectDisplayName(sigEntry.Signal)));
+                                }
+                            }
+                        }
+                    }
+
                     bool isUntrustworthy = false;
 
                     // Only check switch alignment for the immediate governing signal block facing the train
@@ -2550,6 +3686,16 @@ namespace AITraffic.Driver
                 profile.TargetSpeedKmh = consistTailSpeedLimit;
                 profile.TargetSpeedMs = SpeedProfileGenerator.KmHToMs(consistTailSpeedLimit);
                 profile.LimitingReason = SpeedLimitReason.CurvatureRadius;
+            }
+
+            if (_isShuntingMode)
+            {
+                if (profile.TargetSpeedKmh > 15.0f)
+                {
+                    profile.TargetSpeedKmh = 15.0f;
+                    profile.TargetSpeedMs = SpeedProfileGenerator.KmHToMs(15.0f);
+                    profile.LimitingReason = SpeedLimitReason.YardRestriction;
+                }
             }
 
             CurrentSpeedProfile = profile;
@@ -3834,6 +4980,10 @@ namespace AITraffic.Driver
                 AITraffic.Navigation.JunctionController.Instance.ReleaseAllLocksFor(this);
             }
             ReleaseAllSignalReservations();
+            _isHoldingForCorridor = false;
+            _isHoldingInMultiTrack = false;
+            _corridorHoldReason = null;
+            _corridorHoldDistance = float.PositiveInfinity;
 
             if (IsWorkerDriven && _controlsOverrider != null && _controlsOverrider.Handbrake != null)
             {

@@ -93,7 +93,17 @@ if (Test-Path $zipFilePath) {
     Remove-Item $zipFilePath -Force
 }
 
-Compress-Archive -Path $modStagingDir -DestinationPath $zipFilePath -Force
+# Use tar.exe (built-in on Windows 10/11) or Python to ensure POSIX '/' path separators in ZIP entries.
+# Standard Windows Compress-Archive uses '\' which breaks UMM updater and Linux/Steam Deck extractions.
+$tarCmd = Get-Command "tar.exe" -ErrorAction SilentlyContinue
+if ($tarCmd) {
+    & $tarCmd.Source -a -c -f $zipFilePath -C $stagingDir $modId
+    if ($LASTEXITCODE -ne 0) {
+        Write-Error "tar.exe failed with exit code $LASTEXITCODE"
+    }
+} else {
+    py -c "import zipfile, os, sys; staging, mod, out = sys.argv[1], sys.argv[2], sys.argv[3]; zf = zipfile.ZipFile(out, 'w', zipfile.ZIP_DEFLATED); [zf.write(os.path.join(r, f), os.path.relpath(os.path.join(r, f), staging).replace('\\', '/')) for r, _, fs in os.walk(os.path.join(staging, mod)) for f in fs]; zf.close()" "$stagingDir" "$modId" "$zipFilePath"
+}
 
 # Clean up staging directory
 Remove-Item $stagingDir -Recurse -Force

@@ -44,7 +44,12 @@ namespace AITraffic.Compat
 
                 try
                 {
-                    if (StationWakeUpManager.Instance.ShouldInhibitJobDestroy(__instance))
+                    // Strict Mutex Invariant: A station that is actively waking up, has an active inhibition,
+                    // or is already within the job generation zone can NEVER be considered out of the job destroy zone.
+                    // This permanently eliminates the 2-frame infinite start/stop flip-flop loop.
+                    if (StationWakeUpManager.Instance.ShouldWakeStation(__instance) ||
+                        StationWakeUpManager.Instance.ShouldInhibitJobDestroy(__instance) ||
+                        __instance.IsPlayerInJobGenerationZone(__instance.PlayerSqrDistanceFromStationCenter))
                     {
                         __result = false;
                     }

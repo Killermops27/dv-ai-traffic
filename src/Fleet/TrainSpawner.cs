@@ -17,10 +17,82 @@ namespace AITraffic.Fleet
     public static class TrainSpawner
     {
         /// <summary>
-        /// True while an ambient AI consist is being instantiated by CarSpawner.
-        /// Checked by debt and penalty patches to suppress registration during spawning.
+        /// True while an ambient AI consist is being instantiated and configured by CarSpawner.
+        /// Checked by debt, penalty, and orphan-cleanup routines to suppress operations during spawning.
         /// </summary>
         public static bool IsSpawningAmbientConsist { get; private set; }
+
+        private static readonly HashSet<TrainCar> s_spawningCars = new HashSet<TrainCar>();
+        private static readonly HashSet<string> s_spawningCarIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        private static readonly object s_spawningCarsLock = new object();
+
+        /// <summary>
+        /// Checks whether a specific car is currently being spawned, configured, or coupled into an AI consist.
+        /// </summary>
+        public static bool IsCarSpawning(TrainCar car)
+        {
+            if (car == null) return false;
+            lock (s_spawningCarsLock)
+            {
+                return s_spawningCars.Contains(car);
+            }
+        }
+
+        public static bool IsCarSpawning(string carId)
+        {
+            if (string.IsNullOrEmpty(carId)) return false;
+            lock (s_spawningCarsLock)
+            {
+                return s_spawningCarIds.Contains(carId);
+            }
+        }
+
+        public static void RegisterSpawningCar(TrainCar car)
+        {
+            if (car == null) return;
+            lock (s_spawningCarsLock)
+            {
+                s_spawningCars.Add(car);
+                if (!string.IsNullOrEmpty(car.ID))
+                {
+                    s_spawningCarIds.Add(car.ID);
+                }
+            }
+        }
+
+        public static void UnregisterSpawningCars(IEnumerable<TrainCar> cars)
+        {
+            if (cars == null) return;
+            lock (s_spawningCarsLock)
+            {
+                foreach (var c in cars)
+                {
+                    if (c != null)
+                    {
+                        s_spawningCars.Remove(c);
+                        if (!string.IsNullOrEmpty(c.ID))
+                        {
+                            s_spawningCarIds.Remove(c.ID);
+                        }
+                    }
+                }
+            }
+        }
+
+        public static void ClearSpawningRegistries()
+        {
+            lock (s_spawningCarsLock)
+            {
+                s_spawningCars.Clear();
+                s_spawningCarIds.Clear();
+            }
+        }
+
+        public static void ResetSpawningState()
+        {
+            IsSpawningAmbientConsist = false;
+            ClearSpawningRegistries();
+        }
 
         private static Type s_couplerBreakerType;
         private static Type GetCouplerBreakerType()
@@ -83,8 +155,8 @@ namespace AITraffic.Fleet
             if (track.curve.length < totalLength + 20f)
                 return false;
 
-            double checkSpan = 15.0;
-            if (track.curve.length >= totalLength + 30f)
+            double checkSpan = startSpan > 0.0 ? startSpan : 15.0;
+            if (startSpan <= 0.0 && track.curve.length >= totalLength + 30f)
             {
                 checkSpan = Math.Max(15.0, (track.curve.length - totalLength) * 0.5);
             }
@@ -214,7 +286,8 @@ namespace AITraffic.Fleet
             double startSpan = 15.0,
             bool flipTrainConsist = false,
             Action<AIEngineer> onComplete = null,
-            ConsistType consistType = ConsistType.RegionalFreight)
+            ConsistType consistType = ConsistType.RegionalFreight,
+            bool startInShuntingMode = false)
         {
             if (track == null || specs == null || specs.Count == 0)
             {
@@ -236,12 +309,16 @@ namespace AITraffic.Fleet
             if (Core.TrafficManager.Instance != null)
             {
                 yield return Core.TrafficManager.Instance.StartCoroutine(
-                    SpawnAITrainInternalCoroutine(track, liveries, specs, startSpan, flipTrainConsist, onComplete, consistType));
+                    SpawnAITrainInternalCoroutine(track, liveries, specs, startSpan, flipTrainConsist, onComplete, consistType, startInShuntingMode));
             }
             else
             {
                 var eng = SpawnAITrainInternal(track, liveries, specs, startSpan, flipTrainConsist);
-                if (eng != null) eng.ConsistType = consistType;
+                if (eng != null)
+                {
+                    eng.ConsistType = consistType;
+                    if (startInShuntingMode) eng.StartInShuntingMode();
+                }
                 if (onComplete != null) onComplete(eng);
             }
         }
@@ -316,7 +393,8 @@ namespace AITraffic.Fleet
             double startSpan,
             bool flipTrainConsist,
             Action<AIEngineer> onComplete,
-            ConsistType consistType = ConsistType.RegionalFreight)
+            ConsistType consistType = ConsistType.RegionalFreight,
+            bool startInShuntingMode = false)
         {
             if (track == null || liveries == null || liveries.Count == 0)
             {
@@ -338,7 +416,7 @@ namespace AITraffic.Fleet
             float totalConsistLength = CarSpawner.Instance.GetTotalCarLiveriesLength(liveries);
             float trackLength = track.curve != null ? track.curve.length : 0f;
 
-            if (trackLength > 0f)
+            if (trackLength > 0f && startSpan <= 0.0)
             {
                 if (totalConsistLength + 30f <= trackLength)
                 {
@@ -390,68 +468,98 @@ namespace AITraffic.Fleet
             float spawnStartTime = Time.realtimeSinceStartup;
             AITraffic.Diagnostics.PerformanceProfiler.RecordSpawnStart(track.name, spawnData.carData.Length);
 
-            try
+            bool spawnFailed = false;
+            for (int i = 0; i < spawnData.carData.Length; i++)
             {
-                for (int i = 0; i < spawnData.carData.Length; i++)
+                // Safety check: if scene is unloading or world tracks are destroyed, abort immediately
+                if (!WorldStreamingInit.IsLoaded || track == null || spawnData.track == null || CarSpawner.Instance == null)
                 {
-                    var cData = spawnData.carData[i];
-                    if (cData.prefab == null) continue;
-
-                    TrainCar car = null;
-                    try
-                    {
-                        car = CarSpawner.Instance.SpawnCar(
-                            cData.prefab,
-                            spawnData.track,
-                            cData.position,
-                            cData.forward,
-                            playerSpawnedCar: true,
-                            uniqueCar: false
-                        );
-                    }
-                    catch (Exception spawnEx)
-                    {
-                        if (Main.ModEntry != null && Main.ModEntry.Logger != null)
-                            Main.ModEntry.Logger.Error(string.Format("Error spawning car {0} in consist: {1}", i, spawnEx));
-                    }
-
-                    if (car != null)
-                    {
-                        spawnedCars.Add(car);
-                        AITraffic.Diagnostics.PerformanceProfiler.RecordSpawnCar(spawnedCars.Count, spawnData.carData.Length);
-
-                        // Clamp handbrake immediately so newly spawned car stays rock-solid stationary on grades while consist assembles
-                        if (car.brakeSystem != null)
-                        {
-                            car.brakeSystem.SetHandbrakePosition(1.0f, true);
-                        }
-
-                        car.playerSpawnedCar = true;
-                        car.preventDebtDisplay = true;
-                        car.preventAutoCouple = true;
-
-                        var cdc = car.GetComponent<DV.ServicePenalty.CarDebtController>();
-                        if (cdc != null) cdc.SetDummyDebtTracker();
-
-                        if (Main.Settings != null && Main.Settings.AIDamageImmunity)
-                        {
-                            ApplyAIDamageImmunity(car, true);
-                        }
-                    }
-
-                    // Time-slice: yield 0.18s (~11 frames at 60 FPS) between car instantiations to guarantee smooth rendering headroom
-                    yield return new WaitForSeconds(0.18f);
+                    if (Main.ModEntry != null && Main.ModEntry.Logger != null)
+                        Main.ModEntry.Logger.Warning(string.Format("TrainSpawner: Aborting spawn loop at car {0}/{1} due to world unload or invalid track.", i, spawnData.carData.Length));
+                    spawnFailed = true;
+                    break;
                 }
-            }
-            finally
-            {
-                IsSpawningAmbientConsist = false;
+
+                var cData = spawnData.carData[i];
+                if (cData.prefab == null) continue;
+
+                TrainCar car = null;
+                try
+                {
+                    car = CarSpawner.Instance.SpawnCar(
+                        cData.prefab,
+                        spawnData.track,
+                        cData.position,
+                        cData.forward,
+                        playerSpawnedCar: true,
+                        uniqueCar: false
+                    );
+                }
+                catch (Exception spawnEx)
+                {
+                    if (Main.ModEntry != null && Main.ModEntry.Logger != null)
+                        Main.ModEntry.Logger.Error(string.Format("Error spawning car {0} in consist: {1}", i, spawnEx));
+                    spawnFailed = true;
+                    break;
+                }
+
+                if (car == null)
+                {
+                    if (Main.ModEntry != null && Main.ModEntry.Logger != null)
+                        Main.ModEntry.Logger.Error(string.Format("TrainSpawner: CarSpawner returned null for car {0} on track '{1}'.", i, track.name));
+                    spawnFailed = true;
+                    break;
+                }
+
+                // Tag IMMEDIATELY so car is registered in AI collections and never left as an untracked ghost
+                ModCompatManager.TagCarAsAITraffic(car);
+                RegisterSpawningCar(car);
+                spawnedCars.Add(car);
+                AITraffic.Diagnostics.PerformanceProfiler.RecordSpawnCar(spawnedCars.Count, spawnData.carData.Length);
+
+                // Clamp handbrake immediately so newly spawned car stays rock-solid stationary on grades while consist assembles
+                if (car.brakeSystem != null)
+                {
+                    car.brakeSystem.SetHandbrakePosition(1.0f, true);
+                }
+
+                car.playerSpawnedCar = true;
+                car.preventDebtDisplay = true;
+                car.preventAutoCouple = true;
+
+                var cdc = car.GetComponent<DV.ServicePenalty.CarDebtController>();
+                if (cdc != null) cdc.SetDummyDebtTracker();
+
+                if (Main.Settings != null && Main.Settings.AIDamageImmunity)
+                {
+                    ApplyAIDamageImmunity(car, true);
+                }
+
+                // Time-slice: yield 0.18s (~11 frames at 60 FPS) between car instantiations to guarantee smooth rendering headroom
+                yield return new WaitForSeconds(0.18f);
             }
 
-            if (spawnedCars.Count == 0)
+            // Atomic consist validation: if any car failed or consist is incomplete, roll back and clean up immediately
+            if (spawnFailed || spawnedCars.Count == 0 || spawnedCars.Count != spawnData.carData.Length)
             {
                 if (Main.ModEntry != null && Main.ModEntry.Logger != null)
-                    Main.ModEntry.Logger.Error(string.Format("TrainSpawner: No cars spawned successfully on track '{0}'.", track.name));
+                    Main.ModEntry.Logger.Error(string.Format("TrainSpawner: Consist spawn failed or incomplete ({0}/{1} cars spawned) on track '{2}'. Rolling back and cleaning up partial consist.",
+                        spawnedCars.Count, spawnData.carData.Length, track != null ? track.name : "null"));
+
+                UnregisterSpawningCars(spawnedCars);
+                if (CarSpawner.Instance != null && spawnedCars.Count > 0)
+                {
+                    try
+                    {
+                        CarSpawner.Instance.DeleteTrainCars(spawnedCars, forceInstantDestroy: true);
+                    }
+                    catch (Exception delEx)
+                    {
+                        if (Main.ModEntry != null && Main.ModEntry.Logger != null)
+                            Main.ModEntry.Logger.Error(string.Format("Error rolling back failed consist: {0}", delEx));
+                    }
+                }
+                IsSpawningAmbientConsist = false;
                 if (onComplete != null) onComplete(null);
                 yield break;
             }
@@ -514,7 +622,12 @@ namespace AITraffic.Fleet
             // Connect couplers, air hoses, open angle cocks, tighten chains, time-sliced across frames (1 car pair per frame)
             for (int i = 0; i < spawnedCars.Count - 1; i++)
             {
-                CoupleAdjacentCars(spawnedCars[i], spawnedCars[i + 1]);
+                var cA = spawnedCars[i];
+                var cB = spawnedCars[i + 1];
+                if (cA != null && cB != null && cA != cB)
+                {
+                    CoupleAdjacentCars(cA, cB);
+                }
                 yield return null;
             }
 
@@ -618,7 +731,15 @@ namespace AITraffic.Fleet
             {
                 engineer.ConsistType = consistType;
                 engineer.RegisterConsistCars(spawnedCars);
+                if (startInShuntingMode)
+                {
+                    engineer.StartInShuntingMode();
+                }
             }
+
+            // Consist setup complete and registered with active AIEngineer: release from spawning registry
+            UnregisterSpawningCars(spawnedCars);
+            IsSpawningAmbientConsist = false;
 
             // Stagger cargo loading across frames in background
             if (engineer != null && specs != null && specs.Count > 0)
@@ -665,13 +786,14 @@ namespace AITraffic.Fleet
                 return null;
             }
 
+            List<TrainCar> spawnedCars = null;
             try
             {
                 // Validate consist and track lengths for forward vs reverse span
                 float totalConsistLength = CarSpawner.Instance.GetTotalCarLiveriesLength(liveries);
                 float trackLength = track.curve != null ? track.curve.length : 0f;
 
-                if (trackLength > 0f)
+                if (trackLength > 0f && startSpan <= 0.0)
                 {
                     if (totalConsistLength + 30f <= trackLength)
                     {
@@ -692,28 +814,21 @@ namespace AITraffic.Fleet
                 }
 
                 // 1. Spawn cars on track with playerSpawnedCars = true so SimController natively skips debt tracking
-                List<TrainCar> spawnedCars;
-                try
-                {
-                    IsSpawningAmbientConsist = true;
-                    spawnedCars = CarSpawner.Instance.SpawnCarTypesOnTrack(
-                        trainCarTypes: liveries,
-                        carsOrientationReversed: orientationList,
-                        railTrack: track,
-                        preventAutoCoupleOnLastCars: false,
-                        applyHandbrakeOnLastCars: false,
-                        startSpan: startSpan,
-                        flipTrainConsist: flipTrainConsist,
-                        playerSpawnedCars: true
-                    );
-                }
-                finally
-                {
-                    IsSpawningAmbientConsist = false;
-                }
+                IsSpawningAmbientConsist = true;
+                spawnedCars = CarSpawner.Instance.SpawnCarTypesOnTrack(
+                    trainCarTypes: liveries,
+                    carsOrientationReversed: orientationList,
+                    railTrack: track,
+                    preventAutoCoupleOnLastCars: false,
+                    applyHandbrakeOnLastCars: false,
+                    startSpan: startSpan,
+                    flipTrainConsist: flipTrainConsist,
+                    playerSpawnedCars: true
+                );
 
                 if (spawnedCars == null || spawnedCars.Count == 0)
                 {
+                    IsSpawningAmbientConsist = false;
                     if (Main.ModEntry != null && Main.ModEntry.Logger != null)
                         Main.ModEntry.Logger.Error(string.Format("TrainSpawner: CarSpawner returned null or empty car list on track '{0}'.", track.name));
                     return null;
@@ -724,6 +839,7 @@ namespace AITraffic.Fleet
                     var c = spawnedCars[i];
                     if (c != null)
                     {
+                        RegisterSpawningCar(c);
                         c.playerSpawnedCar = true;
                         c.preventDebtDisplay = true;
                     }
@@ -836,6 +952,10 @@ namespace AITraffic.Fleet
                     engineer.RegisterConsistCars(spawnedCars);
                 }
 
+                // Consist setup complete and registered with active AIEngineer: release from spawning registry
+                UnregisterSpawningCars(spawnedCars);
+                IsSpawningAmbientConsist = false;
+
                 // 8. Time-slice procedural cargo loading across frames to eliminate spawn stutter while maintaining 100% visual/weight fidelity
                 if (engineer != null && specs != null && specs.Count > 0)
                 {
@@ -852,6 +972,8 @@ namespace AITraffic.Fleet
             }
             catch (Exception ex)
             {
+                UnregisterSpawningCars(spawnedCars);
+                IsSpawningAmbientConsist = false;
                 if (Main.ModEntry != null && Main.ModEntry.Logger != null)
                     Main.ModEntry.Logger.Error(string.Format("Error in TrainSpawner.SpawnAITrain on track '{0}': {1}", track.name, ex));
                 return null;
@@ -908,12 +1030,17 @@ namespace AITraffic.Fleet
         /// </summary>
         public static void ConfigureConsistCouplers(List<TrainCar> cars)
         {
-            if (cars == null || cars.Count == 0) return;
+            if (cars == null || cars.Count < 2) return;
 
             // Connect adjacent cars in sequence
             for (int i = 0; i < cars.Count - 1; i++)
             {
-                CoupleAdjacentCars(cars[i], cars[i + 1]);
+                var cA = cars[i];
+                var cB = cars[i + 1];
+                if (cA != null && cB != null && cA != cB)
+                {
+                    CoupleAdjacentCars(cA, cB);
+                }
             }
 
             // Ensure outer end-most couplers have closed angle cocks so brake pipe holds air
@@ -936,7 +1063,8 @@ namespace AITraffic.Fleet
 
         private static void CoupleAdjacentCars(TrainCar carA, TrainCar carB)
         {
-            if (carA == null || carB == null) return;
+            if (carA == null || carB == null || carA == carB) return;
+            if (carA.gameObject == null || carB.gameObject == null) return;
 
             Coupler[] couplersA = new Coupler[] { carA.frontCoupler, carA.rearCoupler };
             Coupler[] couplersB = new Coupler[] { carB.frontCoupler, carB.rearCoupler };
@@ -948,12 +1076,15 @@ namespace AITraffic.Fleet
             for (int i = 0; i < couplersA.Length; i++)
             {
                 var cA = couplersA[i];
-                if (cA == null) continue;
+                if (cA == null || cA.gameObject == null || !cA.gameObject.activeInHierarchy) continue;
 
                 for (int j = 0; j < couplersB.Length; j++)
                 {
                     var cB = couplersB[j];
-                    if (cB == null) continue;
+                    if (cB == null || cB.gameObject == null || !cB.gameObject.activeInHierarchy) continue;
+
+                    // Strictly skip if both couplers belong to the same train car
+                    if (cA == cB || cA.train == cB.train) continue;
 
                     float distSq = (cA.transform.position - cB.transform.position).sqrMagnitude;
                     if (distSq < bestDistSq)
@@ -965,7 +1096,7 @@ namespace AITraffic.Fleet
                 }
             }
 
-            if (bestA != null && bestB != null && bestDistSq < 25.0f) // 5m squared
+            if (bestA != null && bestB != null && bestA != bestB && bestA.train != bestB.train && bestDistSq < 25.0f) // 5m squared
             {
                 try
                 {

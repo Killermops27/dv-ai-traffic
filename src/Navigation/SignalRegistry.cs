@@ -531,6 +531,96 @@ namespace AITraffic.Navigation
         }
 
         /// <summary>
+        /// Checks whether a DVSignal acts as a Station Entry Signal (E-Sig / Einfahrsignal)
+        /// or explicitly requires route reservation to display a clear aspect into a station/yard.
+        /// </summary>
+        public static bool IsEntrySignal(DVSignal signal)
+        {
+            if (signal == null) return false;
+            if (signal.Parent != null) signal = signal.Parent;
+
+            // 1. DVSignals controller Type & PrefabType classification
+            if (signal.Controller != null)
+            {
+                if (signal.Controller.Type == Signals.Game.SignalType.Entry ||
+                    signal.Controller.PrefabType == Signals.Game.PrefabType.Entry)
+                {
+                    return true;
+                }
+            }
+
+            // 2. Definition name inspection
+            if (signal.Definition != null && signal.Definition.gameObject != null)
+            {
+                string defName = signal.Definition.gameObject.name;
+                if (defName.IndexOf("Entry", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                    defName.IndexOf("Esig", StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    return true;
+                }
+            }
+
+            // 3. Signal name / prefix inspection (covers German signal pack Esig naming)
+            string name = GetSignalName(signal);
+            if (!string.IsNullOrEmpty(name))
+            {
+                if (name.IndexOf("Esig", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                    name.IndexOf("E-Sig", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                    name.IndexOf("Entry", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                    name.IndexOf("Einfahr", StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    return true;
+                }
+            }
+
+            // 4. Aspect inspection: signal implements SpecialRequireReservationAspect
+            if (signal.AllAspects != null)
+            {
+                for (int i = 0; i < signal.AllAspects.Length; i++)
+                {
+                    var aspect = signal.AllAspects[i];
+                    if (aspect is Signals.Game.Aspects.SpecialRequireReservationAspect)
+                    {
+                        return true;
+                    }
+                }
+            }
+
+            return false;
+        }
+
+        /// <summary>
+        /// Checks whether a DVSignal requires an explicit route reservation via TrackReserver
+        /// before it can show a non-Hp0 (clear) aspect.
+        /// Includes station Entry signals and Exit signals configured with SpecialRequireReservationAspect.
+        /// </summary>
+        public static bool RequiresRouteReservation(DVSignal signal)
+        {
+            if (signal == null) return false;
+            if (signal.Parent != null) signal = signal.Parent;
+
+            if (IsEntrySignal(signal)) return true;
+
+            if (signal.Controller != null && signal.Controller.Type == Signals.Game.SignalType.Exit)
+            {
+                return true;
+            }
+
+            if (signal.AllAspects != null)
+            {
+                for (int i = 0; i < signal.AllAspects.Length; i++)
+                {
+                    if (signal.AllAspects[i] is Signals.Game.Aspects.SpecialRequireReservationAspect)
+                    {
+                        return true;
+                    }
+                }
+            }
+
+            return false;
+        }
+
+        /// <summary>
         /// Gets a clean display string for a signal's current aspect (e.g. "Hp 1 (Green)", "Hp 0 (Red)", "Hp 2 (Yellow)").
         /// </summary>
         public static string GetAspectDisplayName(DVSignal signal)
@@ -638,15 +728,16 @@ namespace AITraffic.Navigation
             if (signal.Parent != null) signal = signal.Parent;
             try
             {
-                if (!Signals.Game.Railway.TrackReserver.HasReservation(signal))
+                bool reserved = Signals.Game.Railway.TrackReserver.HasReservation(signal);
+                if (!reserved)
                 {
-                    Signals.Game.Railway.TrackReserver.ReserveForSignal(signal);
+                    reserved = Signals.Game.Railway.TrackReserver.ReserveForSignal(signal);
                 }
-                if (signal.Controller != null)
+                if (reserved && signal.Controller != null)
                 {
                     signal.Controller.RequestUpdate(1);
                 }
-                return true;
+                return reserved;
             }
             catch (Exception ex)
             {
@@ -676,6 +767,121 @@ namespace AITraffic.Navigation
                 if (Main.ModEntry != null && Main.ModEntry.Logger != null)
                     Main.ModEntry.Logger.Warning(string.Format("[SignalRegistry] Error clearing DVSignal reservation '{0}': {1}", GetSignalName(signal), ex.Message));
             }
+        }
+
+        /// <summary>
+        /// Purges self-owned and orphaned DVSignal route reservations holding tracks downstream along the specified station route.
+        /// Strictly skips reservations held by other active AI trains or the player to prevent ping-pong oscillation.
+        /// </summary>
+        public static int PurgeDownstreamRouteReservations(
+            IList<RailTrack> downstreamTracks,
+            DVSignal entrySignal,
+            AITraffic.Driver.AIEngineer requestingEngineer,
+            HashSet<DVSignal> outClearedSignals = null)
+        {
+            if (!ModCompatManager.IsDVSignalsLoaded || downstreamTracks == null || downstreamTracks.Count == 0) return 0;
+            int clearedCount = 0;
+            try
+            {
+                var effectiveEntrySig = (entrySignal != null && entrySignal.Parent != null) ? entrySignal.Parent : entrySignal;
+                for (int i = 0; i < downstreamTracks.Count; i++)
+                {
+                    var trk = downstreamTracks[i];
+                    if (trk == null) continue;
+
+                    DVSignal bySig;
+                    if (Signals.Game.Railway.TrackReserver.IsTrackReserved(trk, out bySig))
+                    {
+                        if (bySig != null)
+                        {
+                            var effectiveBySig = bySig.Parent != null ? bySig.Parent : bySig;
+                            if (effectiveBySig != effectiveEntrySig)
+                            {
+                                // 1. Do not purge player-reserved signal routes!
+                                if (IsTrackReservedByPlayerSignal(trk))
+                                {
+                                    continue;
+                                }
+
+                                // 2. Check if reserved by another active AI train
+                                var holdingEng = GetEngineerHoldingSignalReservation(effectiveBySig);
+                                if (holdingEng != null && holdingEng != requestingEngineer)
+                                {
+                                    // Strictly NEVER steal or purge a reservation held by another active AI train!
+                                    continue;
+                                }
+
+                                // 3. Either held by requestingEngineer itself (stale pass) or orphaned/ghost reservation
+                                if (outClearedSignals == null || outClearedSignals.Add(effectiveBySig))
+                                {
+                                    ClearDVSignalReservation(effectiveBySig);
+                                    clearedCount++;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                if (Main.ModEntry != null && Main.ModEntry.Logger != null)
+                    Main.ModEntry.Logger.Warning(string.Format("[SignalRegistry] Error purging downstream reservations: {0}", ex.Message));
+            }
+            return clearedCount;
+        }
+
+        /// <summary>
+        /// Retrieves the active AIEngineer holding a reservation on the given DVSignal, if any.
+        /// </summary>
+        public static AITraffic.Driver.AIEngineer GetEngineerHoldingSignalReservation(DVSignal signal)
+        {
+            if (signal == null) return null;
+            if (signal.Parent != null) signal = signal.Parent;
+            var mgr = AITraffic.Core.TrafficManager.Instance;
+            if (mgr != null && mgr.ActiveEngineers != null)
+            {
+                for (int i = 0; i < mgr.ActiveEngineers.Count; i++)
+                {
+                    var eng = mgr.ActiveEngineers[i];
+                    if (eng != null && eng.HoldsSignalReservation(signal))
+                    {
+                        return eng;
+                    }
+                }
+            }
+            return null;
+        }
+
+        /// <summary>
+        /// Looks up the governing main signal (if any) on the specified track facing the specified direction of travel.
+        /// Returns the signal and its placement span along the track.
+        /// </summary>
+        public static bool TryGetGoverningMainSignal(RailTrack track, bool forward, out DVSignal mainSignal, out double signalSpan)
+        {
+            mainSignal = null;
+            signalSpan = 0.0;
+            if (track == null || !ModCompatManager.IsDVSignalsLoaded) return false;
+
+            List<DVSignal> curSignals;
+            if (s_trackSignals.TryGetValue(track, out curSignals) && curSignals != null)
+            {
+                float dir = forward ? 1.0f : -1.0f;
+                for (int i = 0; i < curSignals.Count; i++)
+                {
+                    var sig = curSignals[i];
+                    if (sig == null || sig.Controller == null || !sig.Controller.PlacementInfo.HasValue) continue;
+                    if (!IsSignalFacingTrain(sig, dir)) continue;
+
+                    var effSig = sig.Parent != null ? sig.Parent : sig;
+                    if (IsMainSignal(effSig))
+                    {
+                        mainSignal = effSig;
+                        signalSpan = sig.Controller.PlacementInfo.Value.Span;
+                        return true;
+                    }
+                }
+            }
+            return false;
         }
 
         /// <summary>

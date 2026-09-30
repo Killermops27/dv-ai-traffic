@@ -210,7 +210,7 @@ namespace AITraffic.Config
                 ShowLocoTags = GUILayout.Toggle(ShowLocoTags, " Show 3D Locomotive Tags (Renders in-world floating nametags above AI locomotives)");
                 ShowRouteVisualizer = GUILayout.Toggle(ShowRouteVisualizer, " Show 3D Route Visualization (Draws luminous 3D path line along tracks in world)");
                 ShowSignalTags = GUILayout.Toggle(ShowSignalTags, " Show 3D Signal Tags (Renders in-world floating status tags over upcoming signals)");
-                DebugVisuals = GUILayout.Toggle(DebugVisuals, " Debug Visuals (Render AI monitor, sensors and route gizmos)");
+                DebugVisuals = GUILayout.Toggle(DebugVisuals, " Debug Visuals (Render AI monitor, sensors and route gizmos) [Ctrl+Shift+D]");
                 MoreTrainEncounters = GUILayout.Toggle(MoreTrainEncounters, " More Train Encounters (Spawns passing loop trains routed via player position)");
 
                 GUILayout.Space(12);
@@ -232,13 +232,22 @@ namespace AITraffic.Config
 
                 GUILayout.BeginHorizontal();
                 GUILayout.Label("Station Wake-Up Mode:", GUILayout.Width(240));
-                if (GUILayout.Button(string.Format("Mode: {0}", StationWakeUp), GUILayout.Width(180)))
+                string modeDisplay = StationWakeUp == StationWakeUpMode.WorkerTrainsOnly ? "Worker Trains Only (Recommended)" :
+                                     StationWakeUp == StationWakeUpMode.AllAITrains ? "All AI Trains (Experimental)" : "Disabled";
+                if (GUILayout.Button(modeDisplay, GUILayout.Width(250)))
                 {
                     if (StationWakeUp == StationWakeUpMode.WorkerTrainsOnly) StationWakeUp = StationWakeUpMode.AllAITrains;
                     else if (StationWakeUp == StationWakeUpMode.AllAITrains) StationWakeUp = StationWakeUpMode.Disabled;
                     else StationWakeUp = StationWakeUpMode.WorkerTrainsOnly;
                 }
                 GUILayout.EndHorizontal();
+
+                string modeDesc = StationWakeUp == StationWakeUpMode.WorkerTrainsOnly
+                    ? "Populates station yards dynamically only when player-employed AI worker missions approach."
+                    : StationWakeUp == StationWakeUpMode.AllAITrains
+                    ? "Populates station yards whenever any AI train approaches (higher car count and physics load)."
+                    : "Vanilla behavior: stations only generate jobs and cars when the player camera is physically near.";
+                GUILayout.Label(modeDesc, descStyle);
 
                 GUILayout.BeginHorizontal();
                 GUILayout.Label("Reserve Arrival Track First:", GUILayout.Width(240));

@@ -84,11 +84,29 @@ namespace AITraffic.Core
             try
             {
                 Application.quitting += OnApplicationQuit;
+                UnityEngine.SceneManagement.SceneManager.sceneUnloaded += OnSceneUnloaded;
             }
             catch {}
 
             if (Main.ModEntry != null && Main.ModEntry.Logger != null)
-                Main.ModEntry.Logger.Log("[TrafficManager] Initialized singleton instance with quit lifecycle hooks.");
+                Main.ModEntry.Logger.Log("[TrafficManager] Initialized singleton instance with quit and scene lifecycle hooks.");
+        }
+
+        private void OnSceneUnloaded(UnityEngine.SceneManagement.Scene scene)
+        {
+            try
+            {
+                if (Main.ModEntry != null && Main.ModEntry.Logger != null)
+                    Main.ModEntry.Logger.Log(string.Format("[TrafficManager] Scene '{0}' unloaded. Aborting active spawn coroutines and resetting spawner state.", scene.name));
+
+                StopAllCoroutines();
+                TrainSpawner.ResetSpawningState();
+            }
+            catch (Exception ex)
+            {
+                if (Main.ModEntry != null && Main.ModEntry.Logger != null)
+                    Main.ModEntry.Logger.Error(string.Format("Error handling OnSceneUnloaded: {0}", ex));
+            }
         }
 
         private void OnApplicationQuit()
@@ -105,10 +123,27 @@ namespace AITraffic.Core
             try
             {
                 Application.quitting -= OnApplicationQuit;
+                UnityEngine.SceneManagement.SceneManager.sceneUnloaded -= OnSceneUnloaded;
             }
             catch {}
 
             DespawnAllAITrains();
+
+            try
+            {
+                for (int i = 0; i < _visualizerCaches.Count; i++)
+                {
+                    if (_visualizerCaches[i] != null && _visualizerCaches[i].ConeMesh != null)
+                    {
+                        Destroy(_visualizerCaches[i].ConeMesh);
+                    }
+                }
+                _visualizerCaches.Clear();
+                _routeLineRenderers.Clear();
+                _routeConeFilters.Clear();
+                _routeConeRenderers.Clear();
+            }
+            catch {}
 
             if (s_instance == this)
             {
@@ -465,6 +500,10 @@ namespace AITraffic.Core
             if (CarSpawner.Instance == null || CarSpawner.Instance.AllCars == null)
                 return;
 
+            // Never run orphan cleanup while an ambient consist is actively being spawned or coupled
+            if (AITraffic.Fleet.TrainSpawner.IsSpawningAmbientConsist)
+                return;
+
             float configuredDespawnDist = _settings != null ? _settings.DespawnDistance : TrainDespawner.DefaultSafeDespawnDistance;
             Transform playerTransform = PlayerManager.PlayerTransform;
             Vector3 playerPos = playerTransform != null ? playerTransform.position : Vector3.zero;
@@ -479,6 +518,14 @@ namespace AITraffic.Core
                 var car = allCars[i];
                 if (car == null) continue;
 
+                // Never touch cars that are currently being spawned or configured
+                if (AITraffic.Fleet.TrainSpawner.IsCarSpawning(car))
+                    continue;
+
+                // Protect world/derelict locomotives (e.g. S060 at restoration shed) which have playerSpawnedCar == false
+                if (!car.playerSpawnedCar || car.logicCar == null)
+                    continue;
+
                 // Never touch player worker trains
                 if (ModCompatManager.IsWorkerTrain(car) || WorkerManager.IsTrainCarInAnyWorkerTask(car))
                     continue;
@@ -487,8 +534,13 @@ namespace AITraffic.Core
                 if (playerCar != null && (car == playerCar || (car.trainset != null && car.trainset.cars != null && car.trainset.cars.Contains(playerCar))))
                     continue;
 
+                // Check marker spawn age: give newly spawned cars at least 60 seconds grace period before considering them orphaned
+                var marker = car.gameObject != null ? car.gameObject.GetComponent<AITrafficCarMarker>() : null;
+                if (marker != null && Time.time - marker.SpawnTime < 60f)
+                    continue;
+
                 // Check if this car is an ambient AI car
-                bool isAiCar = (car.gameObject != null && car.gameObject.GetComponent<AITrafficCarMarker>() != null) ||
+                bool isAiCar = marker != null ||
                                ModCompatManager.IsAmbientAITrain(car) ||
                                ModCompatManager.IsAmbientAITrainId(car.ID);
 
@@ -667,7 +719,9 @@ namespace AITraffic.Core
                         bool isAi = (car.gameObject != null && car.gameObject.GetComponent<AITrafficCarMarker>() != null) ||
                                     ModCompatManager.IsAmbientAITrain(car) ||
                                     ModCompatManager.IsAmbientAITrainId(car.ID) ||
-                                    car.GetComponent<AIEngineer>() != null;
+                                    car.GetComponent<AIEngineer>() != null ||
+                                    TrainSpawner.IsCarSpawning(car) ||
+                                    TrainSpawner.IsCarSpawning(car.ID);
 
                         if (isAi)
                         {
@@ -729,6 +783,99 @@ namespace AITraffic.Core
                     Main.ModEntry.Logger.Error(string.Format("Error in PurgeAllWorldAICars: {0}", ex));
                 return purgedCount;
             }
+        }
+
+        /// <summary>
+        /// Explicit manual debug tool: deletes physically derailed rolling stock that has no active job
+        /// and is not occupied by or coupled to the player. Never called automatically.
+        /// </summary>
+        public int PurgeDerailedGhostCars()
+        {
+            int purgedCount = 0;
+            try
+            {
+                if (CarSpawner.Instance == null || CarSpawner.Instance.AllCars == null) return 0;
+                TrainCar playerCar = PlayerManager.Car;
+                var allCars = CarSpawner.Instance.AllCars;
+                List<TrainCar> toDelete = new List<TrainCar>();
+
+                for (int i = 0; i < allCars.Count; i++)
+                {
+                    var car = allCars[i];
+                    if (car == null) continue;
+
+                    // Strictly protect player's locomotive and coupled consist
+                    if (playerCar != null && (car == playerCar || (car.trainset != null && car.trainset.cars != null && car.trainset.cars.Contains(playerCar))))
+                        continue;
+
+                    // Strictly protect any car involved in a player worker task
+                    if (ModCompatManager.IsWorkerTrain(car) || WorkerManager.IsTrainCarInAnyWorkerTask(car))
+                        continue;
+
+                    // Strictly protect cars with an active or pending station job
+                    if (HasActiveOrPendingJob(car))
+                        continue;
+
+                    // Only target AI-related ghost cars that derailed:
+                    // (has AI marker, registered as ambient, has AIEngineer, active spawning, or has preventDebtDisplay
+                    // which is exclusively set on AI traffic cars, never on player/station/SelfShunt equipment)
+                    bool isAiGhost = (car.gameObject != null && car.gameObject.GetComponent<AITrafficCarMarker>() != null) ||
+                                     ModCompatManager.IsAmbientAITrain(car) ||
+                                     ModCompatManager.IsAmbientAITrainId(car.ID) ||
+                                     car.GetComponent<AIEngineer>() != null ||
+                                     TrainSpawner.IsCarSpawning(car) ||
+                                     TrainSpawner.IsCarSpawning(car.ID) ||
+                                     (car.playerSpawnedCar && car.preventDebtDisplay);
+
+                    // Target cars that are physically derailed and identified as AI ghost cars
+                    if (car.derailed && isAiGhost)
+                    {
+                        toDelete.Add(car);
+                    }
+                }
+
+                if (toDelete.Count > 0)
+                {
+                    purgedCount = toDelete.Count;
+                    for (int i = 0; i < toDelete.Count; i++)
+                    {
+                        var c = toDelete[i];
+                        if (c == null) continue;
+                        if (c.trainset != null) ModCompatManager.UntagTrain(c.trainset);
+                        if (c.gameObject != null)
+                        {
+                            var marker = c.gameObject.GetComponent<AITrafficCarMarker>();
+                            if (marker != null) UnityEngine.Object.Destroy(marker);
+                        }
+                    }
+                    CarSpawner.Instance.DeleteTrainCars(toDelete, forceInstantDestroy: true);
+                }
+
+                if (Main.ModEntry != null && Main.ModEntry.Logger != null)
+                    Main.ModEntry.Logger.Log(string.Format("[TrafficManager] Manual derailed ghost car purge complete: Cleaned up {0} derailed unassigned cars.", purgedCount));
+
+                return purgedCount;
+            }
+            catch (Exception ex)
+            {
+                if (Main.ModEntry != null && Main.ModEntry.Logger != null)
+                    Main.ModEntry.Logger.Error(string.Format("Error in PurgeDerailedGhostCars: {0}", ex));
+                return purgedCount;
+            }
+        }
+
+        private static bool HasActiveOrPendingJob(TrainCar car)
+        {
+            if (car == null || car.logicCar == null) return false;
+            try
+            {
+                if (DV.Logic.Job.JobsManager.Instance != null)
+                {
+                    return DV.Logic.Job.JobsManager.Instance.GetJobOfCar(car.logicCar, false) != null;
+                }
+            }
+            catch {}
+            return false;
         }
 
         #endregion
@@ -896,17 +1043,41 @@ namespace AITraffic.Core
             public double LastSpan;
             public readonly List<Vector3> Points = new List<Vector3>();
             public Vector3[] PointsArray = new Vector3[0];
+            public readonly Mesh ConeMesh = new Mesh();
+            public readonly List<Vector3> ConeVertices = new List<Vector3>();
+            public readonly List<int> ConeTriangles = new List<int>();
+            public readonly List<Color> ConeColors = new List<Color>();
         }
 
         private readonly List<VisualizerTrackCache> _visualizerCaches = new List<VisualizerTrackCache>();
         private readonly List<LineRenderer> _routeLineRenderers = new List<LineRenderer>();
+        private readonly List<MeshFilter> _routeConeFilters = new List<MeshFilter>();
+        private readonly List<MeshRenderer> _routeConeRenderers = new List<MeshRenderer>();
 
         private void LateUpdate()
         {
             CheckFloatingOriginShift();
             Update3DRouteVisualizer();
+
+            bool ctrlPressed = Input.GetKey(KeyCode.LeftControl) || Input.GetKey(KeyCode.RightControl);
+            bool shiftPressed = Input.GetKey(KeyCode.LeftShift) || Input.GetKey(KeyCode.RightShift);
+
+            // Toggle Master Debug Monitor HUD with Ctrl + Shift + D
+            if (ctrlPressed && shiftPressed && Input.GetKeyDown(KeyCode.D))
+            {
+                if (_settings != null)
+                {
+                    _settings.DebugVisuals = !_settings.DebugVisuals;
+                    if (Main.ModEntry != null && Main.ModEntry.Logger != null)
+                    {
+                        Main.ModEntry.Logger.Log(string.Format("[TrafficManager] Debug HUD toggled via hotkey (Ctrl+Shift+D): {0}",
+                            _settings.DebugVisuals ? "Enabled" : "Disabled"));
+                    }
+                }
+            }
+
 #if DEBUG
-            if (Input.GetKey(KeyCode.LeftControl) && Input.GetKey(KeyCode.LeftShift) && Input.GetKeyDown(KeyCode.M))
+            if (ctrlPressed && shiftPressed && Input.GetKeyDown(KeyCode.M))
             {
                 AITraffic.Diagnostics.TopologyMapExporter.ExportToDesktop();
             }
@@ -922,11 +1093,13 @@ namespace AITraffic.Core
                 {
                     if (_routeLineRenderers[i] != null)
                         _routeLineRenderers[i].enabled = false;
+                    if (i < _routeConeRenderers.Count && _routeConeRenderers[i] != null)
+                        _routeConeRenderers[i].enabled = false;
                 }
                 return;
             }
 
-            // Maintain LineRenderer and cache pool for active engineers
+            // Maintain LineRenderer, cone mesh, and cache pool for active engineers
             while (_routeLineRenderers.Count < _activeEngineers.Count)
             {
                 int newIdx = _routeLineRenderers.Count;
@@ -945,16 +1118,32 @@ namespace AITraffic.Core
                 lr.shadowCastingMode = UnityEngine.Rendering.ShadowCastingMode.Off;
                 lr.receiveShadows = false;
                 _routeLineRenderers.Add(lr);
-                _visualizerCaches.Add(new VisualizerTrackCache());
+
+                var coneObj = new GameObject("Cones");
+                coneObj.transform.SetParent(lineObj.transform, false);
+                coneObj.layer = 0;
+                var mf = coneObj.AddComponent<MeshFilter>();
+                var mr = coneObj.AddComponent<MeshRenderer>();
+                if (mat != null) mr.sharedMaterial = mat;
+                mr.shadowCastingMode = UnityEngine.Rendering.ShadowCastingMode.Off;
+                mr.receiveShadows = false;
+                _routeConeFilters.Add(mf);
+                _routeConeRenderers.Add(mr);
+
+                var cache = new VisualizerTrackCache();
+                mf.sharedMesh = cache.ConeMesh;
+                _visualizerCaches.Add(cache);
             }
 
             for (int i = 0; i < _routeLineRenderers.Count; i++)
             {
                 var lr = _routeLineRenderers[i];
+                var mr = i < _routeConeRenderers.Count ? _routeConeRenderers[i] : null;
                 var cache = _visualizerCaches[i];
                 if (i >= _activeEngineers.Count)
                 {
                     if (lr != null) lr.enabled = false;
+                    if (mr != null) mr.enabled = false;
                     cache.Engineer = null;
                     cache.TrackIndex = -1;
                     cache.Path = null;
@@ -965,6 +1154,7 @@ namespace AITraffic.Core
                 if (eng == null || eng.TrainCar == null || eng.CurrentPath == null || eng.CurrentPath.Tracks == null || eng.CurrentPath.Tracks.Count == 0)
                 {
                     if (lr != null) lr.enabled = false;
+                    if (mr != null) mr.enabled = false;
                     cache.Engineer = null;
                     cache.TrackIndex = -1;
                     cache.Path = null;
@@ -980,9 +1170,10 @@ namespace AITraffic.Core
                 }
 
                 Material pathMat = GetPathMaterial(i % TrainPathColors.Length);
-                if (pathMat != null && lr.sharedMaterial != pathMat)
+                if (pathMat != null)
                 {
-                    lr.sharedMaterial = pathMat;
+                    if (lr.sharedMaterial != pathMat) lr.sharedMaterial = pathMat;
+                    if (mr != null && mr.sharedMaterial != pathMat) mr.sharedMaterial = pathMat;
                 }
 
                 Color pathColor = TrainPathColors[i % TrainPathColors.Length];
@@ -1069,6 +1260,8 @@ namespace AITraffic.Core
                     cache.PointsArray = cache.Points.ToArray();
                     lr.positionCount = cache.PointsArray.Length;
                     lr.SetPositions(cache.PointsArray);
+
+                    GeneratePathCones(cache, i < _routeConeFilters.Count ? _routeConeFilters[i] : null, pathColor);
                 }
 
                 // Crucial visibility fix: Ensure this runs ALWAYS, so toggling visuals or caching never leaves lr.enabled == false
@@ -1076,11 +1269,132 @@ namespace AITraffic.Core
                 {
                     if (!lr.gameObject.activeSelf) lr.gameObject.SetActive(true);
                     if (!lr.enabled) lr.enabled = true;
+                    if (mr != null && !mr.enabled) mr.enabled = true;
                 }
                 else
                 {
                     if (lr.enabled) lr.enabled = false;
+                    if (mr != null && mr.enabled) mr.enabled = false;
                 }
+            }
+        }
+
+        private static void GeneratePathCones(VisualizerTrackCache cache, MeshFilter mf, Color pathColor)
+        {
+            if (cache == null || cache.ConeMesh == null) return;
+
+            cache.ConeMesh.Clear();
+            cache.ConeVertices.Clear();
+            cache.ConeTriangles.Clear();
+            cache.ConeColors.Clear();
+
+            if (cache.Points == null || cache.Points.Count < 2) return;
+
+            Transform filterTransform = mf != null ? mf.transform : null;
+
+            float totalDistance = 0f;
+            for (int p = 0; p < cache.Points.Count - 1; p++)
+            {
+                totalDistance += Vector3.Distance(cache.Points[p], cache.Points[p + 1]);
+            }
+
+            if (totalDistance < 5f) return;
+
+            const float coneInterval = 40f;
+            const float coneLength = 2.0f;
+            const float coneRadius = 0.45f;
+            const int sides = 6;
+
+            float nextConeDist = totalDistance < 40f ? totalDistance * 0.5f : 20f;
+            float accumulatedDist = 0f;
+
+            for (int p = 0; p < cache.Points.Count - 1; p++)
+            {
+                Vector3 p0 = cache.Points[p];
+                Vector3 p1 = cache.Points[p + 1];
+                float segLen = Vector3.Distance(p0, p1);
+                if (segLen < 0.001f) continue;
+
+                while (accumulatedDist + segLen >= nextConeDist && nextConeDist <= totalDistance)
+                {
+                    float t = Mathf.Clamp01((nextConeDist - accumulatedDist) / segLen);
+                    Vector3 worldPos = Vector3.Lerp(p0, p1, t);
+                    Vector3 worldDir = (p1 - p0).normalized;
+
+                    Vector3 localPos = filterTransform != null ? filterTransform.InverseTransformPoint(worldPos) : worldPos;
+                    Vector3 localDir = filterTransform != null ? filterTransform.InverseTransformDirection(worldDir).normalized : worldDir;
+
+                    Vector3 up = Vector3.up;
+                    if (filterTransform != null) up = filterTransform.InverseTransformDirection(Vector3.up).normalized;
+                    if (Mathf.Abs(Vector3.Dot(localDir, up)) > 0.90f)
+                    {
+                        up = filterTransform != null ? filterTransform.InverseTransformDirection(Vector3.forward).normalized : Vector3.forward;
+                    }
+
+                    Vector3 right = Vector3.Cross(up, localDir).normalized;
+                    up = Vector3.Cross(localDir, right).normalized;
+
+                    float progress = Mathf.Clamp01(nextConeDist / totalDistance);
+                    Color coneCol = new Color(pathColor.r, pathColor.g, pathColor.b, Mathf.Lerp(0.95f, 0.35f, progress));
+
+                    int baseIdx = cache.ConeVertices.Count;
+                    float halfLen = coneLength * 0.5f;
+                    Vector3 tip = localPos + localDir * halfLen;
+                    Vector3 baseCenter = localPos - localDir * halfLen;
+
+                    // Apex & Base Center
+                    cache.ConeVertices.Add(tip);
+                    cache.ConeColors.Add(coneCol);
+                    cache.ConeVertices.Add(baseCenter);
+                    cache.ConeColors.Add(coneCol);
+
+                    // Perimeter
+                    for (int s = 0; s < sides; s++)
+                    {
+                        float angle = (s * Mathf.PI * 2f) / sides;
+                        Vector3 ringPt = baseCenter + (right * Mathf.Cos(angle) + up * Mathf.Sin(angle)) * coneRadius;
+                        cache.ConeVertices.Add(ringPt);
+                        cache.ConeColors.Add(coneCol);
+                    }
+
+                    // Triangles (Double-sided mantle + double-sided base cap for full visibility under any shader)
+                    for (int s = 0; s < sides; s++)
+                    {
+                        int curr = baseIdx + 2 + s;
+                        int next = baseIdx + 2 + ((s + 1) % sides);
+
+                        // Mantle
+                        cache.ConeTriangles.Add(baseIdx);
+                        cache.ConeTriangles.Add(curr);
+                        cache.ConeTriangles.Add(next);
+
+                        cache.ConeTriangles.Add(baseIdx);
+                        cache.ConeTriangles.Add(next);
+                        cache.ConeTriangles.Add(curr);
+
+                        // Base Cap
+                        cache.ConeTriangles.Add(baseIdx + 1);
+                        cache.ConeTriangles.Add(curr);
+                        cache.ConeTriangles.Add(next);
+
+                        cache.ConeTriangles.Add(baseIdx + 1);
+                        cache.ConeTriangles.Add(next);
+                        cache.ConeTriangles.Add(curr);
+                    }
+
+                    nextConeDist += coneInterval;
+                }
+
+                accumulatedDist += segLen;
+            }
+
+            if (cache.ConeVertices.Count > 0)
+            {
+                cache.ConeMesh.SetVertices(cache.ConeVertices);
+                cache.ConeMesh.SetTriangles(cache.ConeTriangles, 0);
+                cache.ConeMesh.SetColors(cache.ConeColors);
+                cache.ConeMesh.RecalculateNormals();
+                cache.ConeMesh.RecalculateBounds();
             }
         }
 
@@ -1157,7 +1471,7 @@ namespace AITraffic.Core
             // Draw floating toast notifications for worker hiring and arrival (always shown even if ambient traffic is Off)
             AITraffic.Workers.WorkerManager.Instance.DrawToastGUI();
 
-            if (_settings != null && _settings.Density == TrafficDensity.Off)
+            if (_settings != null && _settings.Density == TrafficDensity.Off && !_settings.DebugVisuals)
                 return;
 
             InitStyles();
@@ -1168,7 +1482,7 @@ namespace AITraffic.Core
             {
                 float screenW = Screen.width;
                 float screenH = Screen.height;
-                float boxWidth = _showWorkerDispatcher ? 740f : 720f;
+                float boxWidth = _showWorkerDispatcher ? 760f : 740f;
                 float boxHeight = _showWorkerDispatcher ? Mathf.Min(880f, screenH - 70f) : Mathf.Min(780f, screenH - 70f);
 
                 Rect hudRect = new Rect(20f, 50f, boxWidth, boxHeight);
@@ -1199,6 +1513,10 @@ namespace AITraffic.Core
 #if DEBUG
                 _showPerformanceProfiler = GUILayout.Toggle(_showPerformanceProfiler, " ⚡ Perf", GUILayout.Width(68));
 #endif
+                if (_settings != null && GUILayout.Button("✕", GUILayout.Width(22)))
+                {
+                    _settings.DebugVisuals = false;
+                }
                 GUILayout.EndHorizontal();
                 GUILayout.Space(2f);
 
@@ -1238,6 +1556,11 @@ namespace AITraffic.Core
                 {
                     int purged = PurgeAllWorldAICars(forceAll: false);
                     _lastDispatchStatus = string.Format("<color=#00FF88>Purged {0} AI cars from world.</color>", purged);
+                }
+                if (GUILayout.Button("💥 Purge Derailed", GUILayout.Height(22)))
+                {
+                    int purged = PurgeDerailedGhostCars();
+                    _lastDispatchStatus = string.Format("<color=#FF5555>Purged {0} derailed unassigned ghost cars.</color>", purged);
                 }
 #if DEBUG
                 if (GUILayout.Button("🗺️ Export Map", GUILayout.Height(22)))

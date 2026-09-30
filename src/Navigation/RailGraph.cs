@@ -122,6 +122,9 @@ namespace AITraffic.Navigation
         public byte OutBranchIndex { get; internal set; }
         public bool IsYardTrack { get; internal set; }
         public bool IsJunctionTrack { get; internal set; }
+        public bool IsStrictlyAvoidedThroughTrack { get; internal set; }
+        public bool IsPassingLoopOrSiding { get; internal set; }
+        public bool IsShuntingOrStorageTrack { get; internal set; }
         public DV.Logic.Job.Track LogicTrack { get; internal set; }
 
         public RailEdge(int id, RailTrack track, RailNode fromNode, RailNode toNode)
@@ -699,6 +702,10 @@ namespace AITraffic.Navigation
                 {
                     edge.SpeedLimit = geoLimit;
                 }
+
+                edge.IsStrictlyAvoidedThroughTrack = Pathfinder.IsStrictlyAvoidedThroughTrack(edge.Track);
+                edge.IsPassingLoopOrSiding = Pathfinder.IsPassingOrSidingTrack(edge.Track);
+                edge.IsShuntingOrStorageTrack = Pathfinder.IsShuntingOrStorageTrack(edge.Track);
             }
 
             for (int n = 0; n < Nodes.Count; n++)

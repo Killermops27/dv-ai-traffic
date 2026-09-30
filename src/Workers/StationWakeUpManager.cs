@@ -134,6 +134,16 @@ namespace AITraffic.Workers
                         float distSq = (eng.TrainCar.transform.position - center).sqrMagnitude;
                         if (distSq <= wakeSqrDist)
                         {
+                            if (!_wokenStations.Contains(station))
+                            {
+                                _wokenStations.Add(station);
+                                if (Main.ModEntry != null && Main.ModEntry.Logger != null)
+                                {
+                                    string sName = station.stationInfo != null ? station.stationInfo.Name : station.name;
+                                    Main.ModEntry.Logger.Log(string.Format("[StationWakeUp] Waking station '{0}' for approaching ambient train '{1}' (dist: {2:F0}m).",
+                                        sName, eng.TrainCar.ID, Mathf.Sqrt(distSq)));
+                                }
+                            }
                             return true;
                         }
                     }
@@ -145,7 +155,8 @@ namespace AITraffic.Workers
 
         /// <summary>
         /// Prevents premature destruction/despawning of un-taken jobs and yard cars
-        /// while an AI worker train is operating in or approaching the station.
+        /// while an AI worker train or ambient train is operating in or approaching the station.
+        /// Maintains an outer hysteresis zone (1600m) to prevent destruction/regeneration loops.
         /// </summary>
         public bool ShouldInhibitJobDestroy(StationJobGenerationRange range)
         {
@@ -155,12 +166,13 @@ namespace AITraffic.Workers
             StationController station = GetStationFromRange(range);
             if (station == null) return false;
 
+            Vector3 center = range.stationCenterAnchor != null ? range.stationCenterAnchor.position : station.transform.position;
+            float destroySqrDist = Mathf.Max(range.destroyGeneratedJobsSqrDistanceRegular, 2560000f); // 1600m^2
+
+            // 1. Check Player-Employed Workers (Active)
             var activeTasks = WorkerManager.Instance.ActiveTasks;
             if (activeTasks != null && activeTasks.Count > 0)
             {
-                Vector3 center = range.stationCenterAnchor != null ? range.stationCenterAnchor.position : station.transform.position;
-                float destroySqrDist = Mathf.Max(range.destroyGeneratedJobsSqrDistanceRegular, 2560000f); // 1600m^2
-
                 for (int i = 0; i < activeTasks.Count; i++)
                 {
                     var task = activeTasks[i];
@@ -177,12 +189,10 @@ namespace AITraffic.Workers
                 }
             }
 
+            // 2. Check Player-Employed Workers (Completed at Destination)
             var completedTasks = WorkerManager.Instance.CompletedTasks;
             if (completedTasks != null && completedTasks.Count > 0)
             {
-                Vector3 center = range.stationCenterAnchor != null ? range.stationCenterAnchor.position : station.transform.position;
-                float destroySqrDist = Mathf.Max(range.destroyGeneratedJobsSqrDistanceRegular, 2560000f);
-
                 for (int i = 0; i < completedTasks.Count; i++)
                 {
                     var task = completedTasks[i];
@@ -198,6 +208,29 @@ namespace AITraffic.Workers
                     }
                 }
             }
+
+            // 3. Check Ambient AI Trains (if AllAITrains mode is selected)
+            if (Main.Settings.StationWakeUp == StationWakeUpMode.AllAITrains && TrafficManager.Instance != null)
+            {
+                var engineers = TrafficManager.Instance.ActiveEngineers;
+                if (engineers != null && engineers.Count > 0)
+                {
+                    for (int i = 0; i < engineers.Count; i++)
+                    {
+                        var eng = engineers[i];
+                        if (eng == null || eng.TrainCar == null) continue;
+
+                        float distSq = (eng.TrainCar.transform.position - center).sqrMagnitude;
+                        if (distSq <= destroySqrDist)
+                        {
+                            return true;
+                        }
+                    }
+                }
+            }
+
+            // All qualifying trains have cleared the outer destroy radius; allow clean reset
+            _wokenStations.Remove(station);
 
             return false;
         }

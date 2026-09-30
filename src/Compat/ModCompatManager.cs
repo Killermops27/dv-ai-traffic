@@ -422,6 +422,39 @@ namespace AITraffic.Compat
         #region AI Train Tagging & Save Isolation
 
         /// <summary>
+        /// Tags a single <see cref="TrainCar"/> as dynamic AI traffic immediately upon instantiation.
+        /// </summary>
+        public static void TagCarAsAITraffic(TrainCar car)
+        {
+            if (car == null) return;
+            try
+            {
+                lock (s_aiCarsLock)
+                {
+                    car.playerSpawnedCar = true;
+                    car.preventDebtDisplay = true;
+                    if (car.gameObject != null && car.gameObject.GetComponent<AITrafficCarMarker>() == null)
+                    {
+                        car.gameObject.AddComponent<AITrafficCarMarker>();
+                    }
+                    if (!string.IsNullOrEmpty(car.CarGUID)) s_aiCarGuids.Add(car.CarGUID);
+                    if (!string.IsNullOrEmpty(car.ID))
+                    {
+                        s_aiCarIds.Add(car.ID);
+                        s_historicalAmbientCarIds.Add(car.ID);
+                        s_knownNonAiCarIds.Remove(car.ID);
+                    }
+                    s_aiCars.Add(car);
+                }
+            }
+            catch (Exception ex)
+            {
+                if (Main.ModEntry != null && Main.ModEntry.Logger != null)
+                    Main.ModEntry.Logger.Error(string.Format("Error tagging car as AI traffic: {0}", ex));
+            }
+        }
+
+        /// <summary>
         /// Tags a list of <see cref="TrainCar"/>s as dynamic AI traffic immediately upon spawning.
         /// </summary>
         public static void TagCarsAsAITraffic(List<TrainCar> cars)
@@ -640,7 +673,7 @@ namespace AITraffic.Compat
         public static bool IsAmbientAITrain(TrainCar car)
         {
             if (car == null) return false;
-            if (AITraffic.Fleet.TrainSpawner.IsSpawningAmbientConsist) return true;
+            if (AITraffic.Fleet.TrainSpawner.IsCarSpawning(car)) return true;
             if (IsWorkerTrain(car)) return false;
             return IsAITrain(car);
         }
@@ -652,6 +685,7 @@ namespace AITraffic.Compat
         public static bool IsAmbientAITrainId(string carId)
         {
             if (string.IsNullOrEmpty(carId)) return false;
+            if (AITraffic.Fleet.TrainSpawner.IsCarSpawning(carId)) return true;
 
             lock (s_aiCarsLock)
             {
