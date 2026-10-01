@@ -531,6 +531,27 @@ namespace AITraffic.Navigation
         }
 
         /// <summary>
+        /// Finds the first governing home/main signal in the upcoming signals list, bypassing advance distant signals.
+        /// </summary>
+        public static DVSignal FindFirstGoverningSignal(IList<UpcomingSignal> upcomingSignals, out float distance)
+        {
+            distance = float.PositiveInfinity;
+            if (upcomingSignals == null) return null;
+            for (int i = 0; i < upcomingSignals.Count; i++)
+            {
+                var sigEntry = upcomingSignals[i];
+                if (sigEntry.Signal == null) continue;
+                var rawSig = sigEntry.Signal.Parent != null ? sigEntry.Signal.Parent : sigEntry.Signal;
+                if (IsGoverningSignal(rawSig))
+                {
+                    distance = sigEntry.Distance;
+                    return rawSig;
+                }
+            }
+            return null;
+        }
+
+        /// <summary>
         /// Checks whether a DVSignal acts as a Station Entry Signal (E-Sig / Einfahrsignal)
         /// or explicitly requires route reservation to display a clear aspect into a station/yard.
         /// </summary>
