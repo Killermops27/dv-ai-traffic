@@ -4,7 +4,7 @@
 [![Mod Loader: UMM](https://img.shields.io/badge/ModLoader-Unity%20Mod%20Manager-orange.svg)](https://www.nexusmods.com/site/mods/21)
 [![Requires: DVSignals](https://img.shields.io/badge/Requires-DVSignals-green.svg)](https://github.com/WhistleWiz/dv-signals)
 [![Requires: CommsRadioAPI](https://img.shields.io/badge/Requires-CommsRadioAPI-purple.svg)](https://github.com/fauxnik/dv-comms-radio-api)
-[![Compatible: ZCouplers](https://img.shields.io/badge/Compatible-ZCouplers-blueviolet.svg)](https://www.nexusmods.com/derailvalley/mods/813)
+[![Compatible: ZCouplers](https://img.shields.io/badge/Compatible-ZCouplers-blueviolet.svg)](https://github.com/mspielberg/dv-zcouplers)
 [![Latest Release: v0.2.7](https://img.shields.io/badge/Release-v0.2.7-brightgreen.svg)](https://github.com/Killermops27/dv-ai-traffic/releases/tag/v0.2.7)
 [![Nexus Mods](https://img.shields.io/badge/Nexus%20Mods-1685-orange.svg)](https://www.nexusmods.com/derailvalley/mods/1685)
 
@@ -121,9 +121,10 @@ Built with cross-mod interoperability in mind:
 3. **[DVSignals](https://github.com/WhistleWiz/dv-signals)** installed in `Derail Valley/Mods/`
 4. **[CommsRadioAPI](https://github.com/fauxnik/dv-comms-radio-api)** installed in `Derail Valley/Mods/`
 
-### Strongly Recommended:
-* **[Double Track (`DoubleTrack`)](https://www.nexusmods.com/derailvalley/mods/808)**: Strongly recommended for smooth traffic flow and bi-directional mainline capacity.
-* **[Zeibach's Couplers (`ZCouplers`)](https://www.nexusmods.com/derailvalley/mods/813)**: Supported with AI stress protection.
+### Strongly Recommended & Compatible:
+* **[Double Track (`DoubleTrack`)](https://github.com/Chump-the-Lump/DV-DoubleTrack)**: Strongly recommended for smooth traffic flow and bi-directional mainline capacity.
+* **[Zeibach's Couplers (`ZCouplers`)](https://github.com/mspielberg/dv-zcouplers)**: Supported with AI stress protection.
+* **[PassengerJobs](https://www.nexusmods.com/derailvalley/mods/203)**, **[PersistentJobsMod](https://www.nexusmods.com/derailvalley/mods/794)**, **[SelfShunt](https://github.com/Chump-the-Lump/DV-SelfShunter)**: Fully compatible.
 
 ---
 

@@ -4,7 +4,7 @@
 [![Mod Loader: UMM](https://img.shields.io/badge/ModLoader-Unity%20Mod%20Manager-orange.svg)](https://www.nexusmods.com/site/mods/21)
 [![Requires: DVSignals](https://img.shields.io/badge/Requires-DVSignals-green.svg)](https://github.com/WhistleWiz/dv-signals)
 [![Requires: CommsRadioAPI](https://img.shields.io/badge/Requires-CommsRadioAPI-purple.svg)](https://github.com/fauxnik/dv-comms-radio-api)
-[![Compatible: ZCouplers](https://img.shields.io/badge/Compatible-ZCouplers-blueviolet.svg)](https://www.nexusmods.com/derailvalley/mods/813)
+[![Compatible: ZCouplers](https://img.shields.io/badge/Compatible-ZCouplers-blueviolet.svg)](https://github.com/mspielberg/dv-zcouplers)
 [![Latest Release](https://img.shields.io/github/v/release/Killermops27/dv-ai-traffic?include_prereleases&color=brightgreen)](https://github.com/Killermops27/dv-ai-traffic/releases)
 [![Nexus Mods](https://img.shields.io/badge/Nexus%20Mods-1685-orange.svg)](https://www.nexusmods.com/derailvalley/mods/1685)
 [![Status: Early Alpha](https://img.shields.io/badge/Status-Early%20Alpha%20(Bugs%20Expected)-red.svg)](#disclaimer)
@@ -125,9 +125,10 @@ Built with cross-mod interoperability in mind:
 3. **[DVSignals](https://github.com/WhistleWiz/dv-signals)** installed in your `Derail Valley/Mods/` directory
 4. **[CommsRadioAPI](https://github.com/fauxnik/dv-comms-radio-api)** installed in your `Derail Valley/Mods/` directory
 
-### Strongly Recommended:
-* **[Double Track (`DoubleTrack`)](https://www.nexusmods.com/derailvalley/mods/808)**: Highly recommended for smooth traffic flow. Double track sections provide bi-directional passing capacity, significantly mitigating single-track traffic bottlenecks and deadlocks between ambient AI trains and player operations.
-* **[Zeibach's Couplers (`ZCouplers`)](https://www.nexusmods.com/derailvalley/mods/813)**: Supported with AI stress protection.
+### Strongly Recommended & Compatible:
+* **[Double Track (`DoubleTrack`)](https://github.com/Chump-the-Lump/DV-DoubleTrack)**: Highly recommended for smooth traffic flow. Double track sections provide bi-directional passing capacity, significantly mitigating single-track traffic bottlenecks and deadlocks between ambient AI trains and player operations.
+* **[Zeibach's Couplers (`ZCouplers`)](https://github.com/mspielberg/dv-zcouplers)**: Supported with AI stress protection.
+* **[PassengerJobs](https://www.nexusmods.com/derailvalley/mods/203)**, **[PersistentJobsMod](https://www.nexusmods.com/derailvalley/mods/794)**, **[SelfShunt](https://github.com/Chump-the-Lump/DV-SelfShunter)**: Fully compatible.
 
 ---
 
