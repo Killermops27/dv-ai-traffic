@@ -101,6 +101,10 @@
       <HintPath>$(DVInstallPath)\DerailValley_Data\Managed\DV.Utils.dll</HintPath>
       <Private>False</Private>
     </Reference>
+    <Reference Include="DV.WeatherSystem">
+      <HintPath>$(DVInstallPath)\DerailValley_Data\Managed\DV.WeatherSystem.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
     <Reference Include="DV.Common">
       <HintPath>$(DVInstallPath)\DerailValley_Data\Managed\DV.Common.dll</HintPath>
       <Private>False</Private>

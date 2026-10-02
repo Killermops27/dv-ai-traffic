@@ -1,8 +1,8 @@
 [center][size=5][b][color=#FFB833]Derail Valley AI Traffic (AITraffic)[/color][/b][/size]
 [size=3][i]Autonomous AI Train Traffic, Timetable Dispatching & Player-Employed AI Workers[/i][/size]
-[size=2]Author: [b]Killermops27[/b] | Version: [b][color=#55DD55]0.2.6 (Alpha)[/color][/b][/size]
+[size=2]Author: [b]Killermops27[/b] | Version: [b][color=#55DD55]0.2.7 (Alpha)[/color][/b][/size]
 
-[url=https://github.com/Killermops27/dv-ai-traffic][b]GitHub Repository[/b][/url] • [url=https://github.com/Killermops27/dv-ai-traffic/releases/tag/v0.2.6][b]Latest Release[/b][/url] • [url=https://github.com/Killermops27/dv-ai-traffic/issues][b]Report a Bug[/b][/url] • [url=https://www.nexusmods.com/derailvalley/mods/1685][b]Nexus Mods #1685[/b][/url]
+[url=https://github.com/Killermops27/dv-ai-traffic][b]GitHub Repository[/b][/url] • [url=https://github.com/Killermops27/dv-ai-traffic/releases/tag/v0.2.7][b]Latest Release[/b][/url] • [url=https://github.com/Killermops27/dv-ai-traffic/issues][b]Report a Bug[/b][/url] • [url=https://www.nexusmods.com/derailvalley/mods/1685][b]Nexus Mods #1685[/b][/url]
 [/center]
 
 [hr]
@@ -16,17 +16,27 @@ If you find reproducible bugs, please report them on our [url=https://github.com
 
 [hr]
 
-[size=4][b][color=#FFB833]✦ What's New in Version 0.2.6[/color][/b][/size]
+[size=4][b][color=#FFB833]✦ What's New in Version 0.2.7[/color][/b][/size]
 
 [list]
-[*][b]Player Corridor Right-of-Way & Signal Clearance:[/b] AI checks player DVSignals reservations, immediately releasing junction locks and switch alignment requests when a single-track corridor is reserved by the player.
-[*][b]Head-to-Head Encounter & Siding Deadlock Prevention:[/b] Ambient trains approaching single-track corridors evaluate opposing traffic in advance and hold safely inside passing loops with deterministic tie-breaking.
-[*][b]Station Entry Signal Lockout Fix:[/b] Mapped sub-distant repeater heads to parent governing signals and enforced strict single-signal reservation, preventing downstream exit signals from turning entry signals red.
-[*][b]Dynamic Chain-of-Switches Alignment:[/b] Facing a red signal expands switch alignment lookahead up to 64 tracks and 3500m, proactively throwing switches and waking signal controllers until aspects clear to green.
-[*][b]Refined Destination Despawning & Final Parking:[/b] Trains only shut down after reaching buffer stop or obstacle within 35m; all despawn checks strictly respect the user-configured [i]DespawnDistance[/i] setting.
-[*][b]Crash Recovery & World AI Car Purge:[/b] Derailments trigger emergency shutdowns and lock releases; added automatic despawn of crashed rakes and a manual/automatic [i]Purge All AI Cars[/i] tool to clean abandoned rolling stock.
-[*][b]In-Block Switch Protection & Player Interlock:[/b] Switches inside an active signal block or within 250m of an approaching train (≥ 1.5 km/h) remain locked against manual or Comms Radio player interference, playing native rejection audio if thrown.
-[*][b]Physics-Based Derailment Prevention & Tail Speed Clamping:[/b] Lowered curve floor clamp to 15 km/h, added 1800m centrifugal curve lookahead, and hold locomotive speed until the entire consist clears sharp curves; damage immunity now fully suppresses derailment stress.
+[*][b]Career License Blocker & Lag Spike Elimination:[/b] Automatically removes vanilla license blocker colliders from AI locomotives on spawn, permanently eliminating 60 Hz log spam, managed stack trace allocations, and PhysX stutter at speed.
+[*][b]Station Job Generation Loop & FPS Spam Fix:[/b] Enforced strict mutual exclusion between station job generation and destroy zones, eliminating the alternating 30–60 Hz flip-flop loop and yard car flickering.
+[*][b]Asynchronous Route Pathfinding & Zero-Allocation Caching:[/b] Heavy full-valley A* path calculations run asynchronously on background threads, completely freeing the Unity main thread and eliminating 30ms–150ms spawn frame hitches.
+[*][b]Scene Reload Safeguards & Ghost Consist Purge:[/b] Cancels active spawn coroutines immediately on scene reload, tags rolling stock immediately per-car, and introduces an in-game [i][ 💥 Purge Derailed ][/i] debug tool to clear orphaned cars.
+[*][b]Switch-Blade 7m Physical Zone & Lock De-Thrashing:[/b] Reduced switch fouling envelopes from 60m to a realistic 7.0m movable blade zone ([i]SwitchBladeZoneMeters = 7.0f[/i]), preventing parked cars on sidings from fouling main turnouts and stopping lock thrashing.
+[*][b]Station Entry Signal Reservation Purge & Interlocking Fallback:[/b] Safely purges orphaned downstream route reservations in DVSignals [i]TrackReserver[/i], resolving indefinite [i]Hp 0[/i] red signal lockouts while protecting other active AI trains.
+[*][b]Physics-Adaptive Hill Starts & Balanced Bleed:[/b] Dynamic equilibrium throttle model computes holding power against grade and mass, smoothly bleeding train air brakes without rollback stalls or wheel slip.
+[*][b]Distant Advance Warning Braking Fix & Stopped Switch Throwing:[/b] Fixed [i]NEXT_STOP[/i] and [i]VR0[/i] advance warnings so trains brake for downstream signals instead of halting at green proceed masts, and leaves turnouts unlocked while stopped for player manual throwing.
+[*][b]Strict Yard Avoidance & Emergency Detours:[/b] Disqualifies intermediate yard loading, transfer, and shunting tracks from mainline routes, with a 15 km/h slow shunting detour fallback when stopped at red signals for ≥ 30s.
+[*][b]Emergency Deadlock Despawn:[/b] Ambient procedural trains stuck for ≥ 5 minutes are cleanly despawned, releasing all locks and reservations without touching player consists.
+[/list]
+
+[hr]
+
+[size=4][b][color=#FFB833]✦ Known Issues & Compatibility Notes[/color][/b][/size]
+
+[list]
+[*][b]Modded Locomotives & Trainsets (Future Goal):[/b] Currently, [b]no modded locomotives, custom railcars, or third-party trainsets are officially supported[/b]. Only vanilla base-game rolling stock is supported at this time. Supporting modded locomotives and custom consists is a planned future goal.
 [/list]
 
 [hr]
@@ -96,7 +106,6 @@ If you find reproducible bugs, please report them on our [url=https://github.com
 [*]Toggle [b]Debug HUD[/b] to view live train telemetry, target speeds, and limiting factors.
 [*]Toggle [b][ 3D Locos ][/b] to display overhead floating tags.
 [*]Toggle [b][ Ride-Along ][/b] when riding inside AI locomotive cabs.
-[*]Toggle [b][ ⚡ Perf ][/b] in Debug HUD to view rolling FPS and pathfinding profiler metrics.
 [*]Click [b][ 🧹 Purge AI Cars ][/b] to clean orphaned ambient rolling stock from the map.
 [/list]
 
@@ -108,7 +117,7 @@ If you find reproducible bugs, please report them on our [url=https://github.com
 1. [url=https://store.steampowered.com/app/588030/Derail_Valley/][b]Derail Valley[/b][/url] (Latest PC / Steam release)
 2. [url=https://www.nexusmods.com/site/mods/21][b]Unity Mod Manager (UMM)[/b][/url] (v0.27.0 or newer)
 3. [url=https://github.com/WhistleWiz/dv-signals][b]DV Signals[/b][/url] (Required for block occupancy and physical signal logic)
-4. [url=https://github.com/Killermops27/dv-ai-traffic][b]CommsRadioAPI[/b][/url] (Required for Comms Radio dispatch mode)
+4. [url=https://github.com/fauxnik/dv-comms-radio-api][b]CommsRadioAPI[/b][/url] (Required for Comms Radio dispatch mode)
 
 [b]Strongly Recommended & Compatible Mods:[/b]
 [list]
@@ -121,7 +130,7 @@ If you find reproducible bugs, please report them on our [url=https://github.com
 
 [size=4][b][color=#FFB833]✦ Installation[/color][/b][/size]
 
-1. Download [b]AITraffic-v0.2.6.zip[/b] from the Files tab.
+1. Download [b]AITraffic-v0.2.7.zip[/b] from the Files tab.
 2. Drag and drop the archive directly into the Unity Mod Manager [b]Mods[/b] tab, OR extract into your [i]Derail Valley/Mods/[/i] folder so that [i]Info.json[/i] is at [i]Derail Valley/Mods/AITraffic/Info.json[/i].
 3. Start Derail Valley and verify that [b]AI Traffic[/b], [b]DVSignals[/b], and [b]CommsRadioAPI[/b] show green status lights in UMM ([b]Ctrl + F10[/b]).
 

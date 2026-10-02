@@ -442,6 +442,7 @@ namespace AITraffic.Core
             }
 
             // O(1) Fast-fail candidate filtration
+            var playerOccupied = AITraffic.Navigation.SignalRegistry.GetPlayerOccupiedTracks((PlayerManager.Car != null) ? PlayerManager.Car.trainset : null);
             var candidateTracks = new List<RailTrack>();
             for (int i = 0; i < rawTracks.Count; i++)
             {
@@ -454,8 +455,8 @@ namespace AITraffic.Core
                 // 2. Physical occupancy gate (O(1) snapshot lookup)
                 if (IsTrackOccupied(trk, occupiedSnapshot)) continue;
 
-                // 3. Player occupancy gate
-                if (AITraffic.Navigation.SignalRegistry.IsTrackOccupiedByPlayer(trk, null)) continue;
+                // 3. Player occupancy gate (O(1) snapshot lookup)
+                if (playerOccupied != null ? playerOccupied.Contains(trk) : AITraffic.Navigation.SignalRegistry.IsTrackOccupiedByPlayer(trk, null)) continue;
 
                 Signals.Game.Signal _;
                 if (ModCompatManager.IsDVSignalsLoaded && Signals.Game.Railway.TrackReserver.IsTrackReserved(trk, out _))
@@ -503,10 +504,15 @@ namespace AITraffic.Core
             }
 
             // Sort candidate tracks prioritizing the optimal 600m - 1200m sweet spot
+            var graph = AITraffic.Navigation.RailGraph.Instance;
             candidateTracks.Sort((a, b) =>
             {
-                float da = Vector3.Distance(a.curve.GetPointAt(0.5f), playerPos);
-                float db = Vector3.Distance(b.curve.GetPointAt(0.5f), playerPos);
+                var edgeA = (graph != null) ? graph.GetEdge(a) : null;
+                var edgeB = (graph != null) ? graph.GetEdge(b) : null;
+                Vector3 posA = (edgeA != null) ? edgeA.MidPoint : a.curve.GetPointAt(0.5f);
+                Vector3 posB = (edgeB != null) ? edgeB.MidPoint : b.curve.GetPointAt(0.5f);
+                float da = Vector3.Distance(posA, playerPos);
+                float db = Vector3.Distance(posB, playerPos);
                 float scoreA = Mathf.Abs(da - 850f);
                 float scoreB = Mathf.Abs(db - 850f);
                 return scoreA.CompareTo(scoreB);
@@ -527,11 +533,12 @@ namespace AITraffic.Core
                 destStationCandidates[swapIdx] = temp;
             }
 
-            var pathfinder = new AITraffic.Navigation.Pathfinder();
             var pathOptions = new AITraffic.Navigation.PathfinderOptions
             {
                 StrictlyAvoidOccupied = true,
                 OccupiedTracksSnapshot = occupiedSnapshot,
+                PlayerOccupiedTracksSnapshot = playerOccupied,
+                PlayerPosition = playerPos,
                 RequesterTrainset = (PlayerManager.Car != null) ? PlayerManager.Car.trainset : null,
                 ConsistLength = 100.0f
             };
@@ -544,7 +551,8 @@ namespace AITraffic.Core
             {
                 if (stopSearches) break;
                 var candTrack = candidateTracks[tIdx];
-                Vector3 candPos = candTrack.curve.GetPointAt(0.5f);
+                var candEdge = (graph != null) ? graph.GetEdge(candTrack) : null;
+                Vector3 candPos = (candEdge != null) ? candEdge.MidPoint : candTrack.curve.GetPointAt(0.5f);
                 Vector3 trackToPlayer = (playerPos - candPos).normalized;
 
                 float trackLen = candTrack.curve.length;
@@ -611,8 +619,6 @@ namespace AITraffic.Core
                         if (destTrack == null || destTrack == candTrack) continue;
 
                         pathSearches++;
-                        // Strictly yield 1 frame before each path search to prevent frame hitching
-                        yield return null;
 
                         if (pathSearches >= 4)
                         {
@@ -620,7 +626,12 @@ namespace AITraffic.Core
                             break;
                         }
 
-                        var path = pathfinder.FindPath(candTrack, destTrack, pathOptions);
+                        var pathTask = AITraffic.Navigation.Pathfinder.FindPathAsync(candTrack, destTrack, pathOptions);
+                        while (!pathTask.IsCompleted)
+                        {
+                            yield return null;
+                        }
+                        var path = pathTask.Result;
                         if (path == null || !path.IsValid || path.Tracks == null || path.Tracks.Count < 3)
                             continue;
 
@@ -1154,7 +1165,9 @@ namespace AITraffic.Core
                     DVSignal govSig;
                     double sigSpan;
                     bool hasMainSig = AITraffic.Navigation.SignalRegistry.TryGetGoverningMainSignal(spawnTrack, isForwardDeparture, out govSig, out sigSpan);
-                    bool startInShuntingMode = !hasMainSig;
+                    var spawnEdge = (AITraffic.Navigation.RailGraph.Instance != null) ? AITraffic.Navigation.RailGraph.Instance.GetEdge(spawnTrack) : null;
+                    bool isYardOrStorage = (spawnEdge != null && spawnEdge.IsYardTrack) || AITraffic.Navigation.Pathfinder.IsIndustrialYardOrStorageTrack(spawnTrack);
+                    bool startInShuntingMode = isYardOrStorage && !hasMainSig;
                     float trackLen = (spawnTrack.curve != null) ? spawnTrack.curve.length : 0f;
 
                     if (hasMainSig && trackLen > 0f)
@@ -1235,8 +1248,8 @@ namespace AITraffic.Core
                     RecordOrigin(corridor.OriginYardId);
 
                     if (Main.ModEntry != null && Main.ModEntry.Logger != null)
-                        Main.ModEntry.Logger.Log(string.Format("[TrafficScheduler] Dispatched Tier 1 Ambient Train ({0} -> {1}, Consist: {2}) on track '{3}' (Route: {4:F0}m).",
-                            corridor.OriginYardId, corridor.DestinationYardId, corridor.PreferredConsist, spawnTrack.name, routePath.TotalDistance));
+                        Main.ModEntry.Logger.Log(string.Format("[TrafficScheduler] Dispatched Tier 1 Ambient Train ({0} -> {1}, Consist: {2}) on track '{3}' (Route: {4:F0}m, ShuntingMode: {5}).",
+                            corridor.OriginYardId, corridor.DestinationYardId, corridor.PreferredConsist, spawnTrack.name, routePath.TotalDistance, startInShuntingMode));
 
                     if (Main.Settings != null && Main.Settings.MoreTrainEncounters)
                     {
@@ -1384,7 +1397,9 @@ namespace AITraffic.Core
                             DVSignal govSig;
                             double sigSpan;
                             bool hasMainSig = AITraffic.Navigation.SignalRegistry.TryGetGoverningMainSignal(spawnTrack, isForwardDeparture, out govSig, out sigSpan);
-                            bool startInShuntingMode = !hasMainSig;
+                            var spawnEdge = (AITraffic.Navigation.RailGraph.Instance != null) ? AITraffic.Navigation.RailGraph.Instance.GetEdge(spawnTrack) : null;
+                            bool isYardOrStorage = (spawnEdge != null && spawnEdge.IsYardTrack) || AITraffic.Navigation.Pathfinder.IsIndustrialYardOrStorageTrack(spawnTrack);
+                            bool startInShuntingMode = isYardOrStorage && !hasMainSig;
                             float trackLen = (spawnTrack.curve != null) ? spawnTrack.curve.length : 0f;
 
                             if (hasMainSig && trackLen > 0f)
@@ -1463,8 +1478,8 @@ namespace AITraffic.Core
                                 RecordOrigin(origYard);
 
                                 if (Main.ModEntry != null && Main.ModEntry.Logger != null)
-                                    Main.ModEntry.Logger.Log(string.Format("[TrafficScheduler] Dispatched Dynamic Ambient Train ({0} -> {1}, Consist: {2}) on track '{3}' (Route: {4:F0}m).",
-                                        origName, destName, inferredConsist, spawnTrack.name, fallbackPath.TotalDistance));
+                                    Main.ModEntry.Logger.Log(string.Format("[TrafficScheduler] Dispatched Dynamic Ambient Train ({0} -> {1}, Consist: {2}) on track '{3}' (Route: {4:F0}m, ShuntingMode: {5}).",
+                                        origName, destName, inferredConsist, spawnTrack.name, fallbackPath.TotalDistance, startInShuntingMode));
 
                                 if (Main.Settings != null && Main.Settings.MoreTrainEncounters)
                                 {
@@ -2217,7 +2232,7 @@ namespace AITraffic.Core
                     if (t.curve == null || t.curve.length < 75f) continue;
 
                     // Spatial distance check using physical curve midpoint FIRST to skip ~98% of tracks immediately
-                    Vector3 trackMid = t.curve.GetPointAt(0.5f);
+                    Vector3 trackMid = edge.MidPoint;
                     if (Vector3.Distance(trackMid, origPos) > 1500f) continue;
 
                     // Exclude steep mainline edges (> 0.5% grade)
@@ -2261,7 +2276,10 @@ namespace AITraffic.Core
             for (int i = 0; i < results.Count; i++)
             {
                 var t = results[i];
-                float g = (t.curve != null && t.curve.length > 1f) ? Mathf.Abs(t.curve.GetPointAt(1f).y - t.curve.GetPointAt(0f).y) / t.curve.length : 0f;
+                var edge = (AITraffic.Navigation.RailGraph.Instance != null) ? AITraffic.Navigation.RailGraph.Instance.GetEdge(t) : null;
+                float g = (edge != null)
+                    ? Mathf.Abs(edge.Grade)
+                    : ((t.curve != null && t.curve.length > 1f) ? Mathf.Abs(t.curve.GetPointAt(1f).y - t.curve.GetPointAt(0f).y) / t.curve.length : 0f);
                 if (g <= MaxSpawnInclineGrade)
                 {
                     flatTracks.Add(t);
@@ -2327,11 +2345,15 @@ namespace AITraffic.Core
             // Multi-station corridors MUST span a realistic distance between stations (at least 45% of direct Euclidean distance)
             float minCorridorDist = Mathf.Max(350f, directStationDist * 0.45f);
 
+            var playerOccupied = AITraffic.Navigation.SignalRegistry.GetPlayerOccupiedTracks();
+            Vector3 playerPos = AITraffic.Navigation.SignalRegistry.GetPlayerPosition();
             var pathfinder = new AITraffic.Navigation.Pathfinder();
             var pathOptions = new AITraffic.Navigation.PathfinderOptions
             {
                 StrictlyAvoidOccupied = true,
                 OccupiedTracksSnapshot = occupiedSnapshot,
+                PlayerOccupiedTracksSnapshot = playerOccupied,
+                PlayerPosition = playerPos,
                 ConsistLength = minLength
             };
 
@@ -2447,11 +2469,14 @@ namespace AITraffic.Core
             // Multi-station corridors MUST span a realistic distance between stations (at least 45% of direct Euclidean distance)
             float minCorridorDist = Mathf.Max(350f, directStationDist * 0.45f);
 
-            var pathfinder = new AITraffic.Navigation.Pathfinder();
+            var playerOccupied = AITraffic.Navigation.SignalRegistry.GetPlayerOccupiedTracks();
+            Vector3 playerPos = AITraffic.Navigation.SignalRegistry.GetPlayerPosition();
             var pathOptions = new AITraffic.Navigation.PathfinderOptions
             {
                 StrictlyAvoidOccupied = true,
                 OccupiedTracksSnapshot = occupiedSnapshot,
+                PlayerOccupiedTracksSnapshot = playerOccupied,
+                PlayerPosition = playerPos,
                 ConsistLength = minLength
             };
 
@@ -2471,9 +2496,13 @@ namespace AITraffic.Core
                     if (depTrack == dt) continue;
 
                     pathSearches++;
-                    yield return null;
 
-                    var path = pathfinder.FindPath(depTrack, dt, pathOptions);
+                    var pathTask = AITraffic.Navigation.Pathfinder.FindPathAsync(depTrack, dt, pathOptions);
+                    while (!pathTask.IsCompleted)
+                    {
+                        yield return null;
+                    }
+                    var path = pathTask.Result;
                     if (path != null && path.IsValid && path.Tracks.Count > 0 && path.TotalDistance >= minCorridorDist)
                     {
                         // Check if candidate route traverses any strictly avoided loading tracks ([L]) or turntables ([T])

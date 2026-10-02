@@ -35,6 +35,9 @@ namespace AITraffic.Workers
 
         // On-screen toast notification state
         private string _toastMessage = string.Empty;
+        private string _toastHeaderTitle = "[AI Worker Dispatcher]";
+        private string _toastActionLabel = string.Empty;
+        private Action _toastAction = null;
         private float _toastExpireTime = 0f;
         private const float ToastDuration = 7.0f;
         private GUIStyle _toastBoxStyle;
@@ -836,10 +839,13 @@ namespace AITraffic.Workers
         /// <summary>
         /// Displays an on-screen toast banner notification.
         /// </summary>
-        public void ShowToast(string message)
+        public void ShowToast(string message, string headerTitle = "[AI Worker Dispatcher]", float duration = ToastDuration, string actionLabel = null, Action onAction = null)
         {
             _toastMessage = message;
-            _toastExpireTime = Time.time + ToastDuration;
+            _toastHeaderTitle = !string.IsNullOrEmpty(headerTitle) ? headerTitle : "[AI Worker Dispatcher]";
+            _toastActionLabel = actionLabel ?? string.Empty;
+            _toastAction = onAction;
+            _toastExpireTime = Time.time + duration;
         }
 
         private void InitToastStyles()
@@ -882,8 +888,9 @@ namespace AITraffic.Workers
             float timeLeft = _toastExpireTime - Time.time;
             float alpha = Mathf.Clamp01(timeLeft); // Smooth fade-out in last second
 
-            float bannerWidth = 520f;
-            float bannerHeight = 65f;
+            bool hasAction = (_toastAction != null && !string.IsNullOrEmpty(_toastActionLabel));
+            float bannerWidth = 560f;
+            float bannerHeight = hasAction ? 92f : 68f;
             float screenX = (Screen.width - bannerWidth) * 0.5f;
             float screenY = 24f;
 
@@ -893,8 +900,27 @@ namespace AITraffic.Workers
 
             GUI.color = new Color(1f, 1f, 1f, alpha);
             GUILayout.BeginArea(new Rect(screenX + 10f, screenY + 6f, bannerWidth - 20f, bannerHeight - 12f));
-            GUILayout.Label("[AI Worker Dispatcher]", _toastHeaderStyle);
+            GUILayout.Label(_toastHeaderTitle, _toastHeaderStyle);
             GUILayout.Label(_toastMessage, _toastTextStyle);
+
+            if (hasAction)
+            {
+                GUILayout.Space(3f);
+                if (GUILayout.Button(_toastActionLabel, GUILayout.Height(22)))
+                {
+                    var act = _toastAction;
+                    _toastAction = null;
+                    _toastMessage = string.Empty;
+                    try
+                    {
+                        if (act != null) act.Invoke();
+                    }
+                    catch (Exception ex)
+                    {
+                        Debug.LogError("[WorkerManager] Error invoking toast action: " + ex);
+                    }
+                }
+            }
             GUILayout.EndArea();
 
             GUI.color = prevColor;

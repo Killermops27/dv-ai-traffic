@@ -3,9 +3,9 @@
 [![Game: Derail Valley](https://img.shields.io/badge/Game-Derail%20Valley-blue.svg)](http://www.derailvalley.com/)
 [![Mod Loader: UMM](https://img.shields.io/badge/ModLoader-Unity%20Mod%20Manager-orange.svg)](https://www.nexusmods.com/site/mods/21)
 [![Requires: DVSignals](https://img.shields.io/badge/Requires-DVSignals-green.svg)](https://github.com/WhistleWiz/dv-signals)
-[![Requires: CommsRadioAPI](https://img.shields.io/badge/Requires-CommsRadioAPI-purple.svg)](https://github.com/Killermops27/dv-ai-traffic)
+[![Requires: CommsRadioAPI](https://img.shields.io/badge/Requires-CommsRadioAPI-purple.svg)](https://github.com/fauxnik/dv-comms-radio-api)
 [![Compatible: ZCouplers](https://img.shields.io/badge/Compatible-ZCouplers-blueviolet.svg)](https://www.nexusmods.com/derailvalley/mods/813)
-[![Latest Release: v0.2.6](https://img.shields.io/badge/Release-v0.2.6-brightgreen.svg)](https://github.com/Killermops27/dv-ai-traffic/releases/tag/v0.2.6)
+[![Latest Release: v0.2.7](https://img.shields.io/badge/Release-v0.2.7-brightgreen.svg)](https://github.com/Killermops27/dv-ai-traffic/releases/tag/v0.2.7)
 [![Nexus Mods](https://img.shields.io/badge/Nexus%20Mods-1685-orange.svg)](https://www.nexusmods.com/derailvalley/mods/1685)
 
 An autonomous AI train traffic, timetable dispatching, and player-employed AI worker system for **Derail Valley**, bringing the railway network to life with schedule-driven freight, passenger, shunting, and haulage movements.
@@ -22,16 +22,18 @@ An autonomous AI train traffic, timetable dispatching, and player-employed AI wo
 
 ---
 
-## 🌟 What's New in v0.2.6
+## 🌟 What's New in v0.2.7
 
-- 🚦 **Player Corridor Right-of-Way & Signal Clearance:** AI respects player DVSignals reservations, immediately releasing all junction locks and switch alignment requests when a single-track corridor is reserved by the player.
-- 🔄 **Head-to-Head Encounter & Siding Deadlock Prevention:** Ambient trains approaching single-track corridors evaluate opposing traffic in advance and hold safely inside passing loops with deterministic tie-breaking.
-- 🚉 **Station Entry Signal Lockout Fix:** Mapped sub-distant repeater heads directly to parent governing signals and enforced strict single-signal reservation, preventing downstream exit signals from turning entry signals red.
-- 🔀 **Dynamic Chain-of-Switches Alignment:** Facing a red signal expands switch alignment lookahead up to 64 tracks and 3500m, proactively throwing switches and waking signal controllers until aspects clear to green.
-- ⏱️ **Refined Destination Despawning & Final Parking:** Trains only shut down after reaching buffer stop or obstacle within 35m; all despawn checks strictly respect the user-configured `DespawnDistance` setting.
-- 🧹 **Crash Recovery & World AI Car Purge:** Derailments trigger emergency shutdowns and lock releases; added automatic despawn of crashed rakes and a manual/automatic `Purge All AI Cars` tool to clean abandoned rolling stock.
-- 🔒 **In-Block Switch Protection & Player Interlock:** Switches inside an active signal block or within 250m of an approaching train (≥ 1.5 km/h) remain locked against manual or Comms Radio player interference, playing native rejection audio if thrown.
-- ⚠️ **Physics-Based Derailment Prevention & Tail Speed Clamping:** Lowered curve floor clamp to 15 km/h, added 1800m centrifugal curve lookahead, and hold locomotive speed until the entire consist clears sharp curves; damage immunity now fully suppresses derailment stress.
+- ⚡ **Career License Blocker Elimination & Lag Spike Fix:** Cleanly removes `LocoZoneBlocker` components on AI locomotives upon spawn/dispatch, permanently eliminating 60 Hz log spam, managed stack trace allocations, and PhysX broadphase snapping at speed.
+- 🔁 **Station Job Generation Loop & FPS Spam Elimination:** Fixed mutual exclusion in station zones, eliminating the alternating 30–60 Hz flip-flop loop that caused console spam and yard car visual flickering.
+- 🧵 **Asynchronous Background Route Pathfinding:** Moved heavy full-valley A* path calculations to background worker threads (`Task.Run`), completely freeing the Unity main thread and eliminating 30ms–150ms spawn frame hitches.
+- 🔄 **Scene Reload Safeguards & Ghost Consist Purge:** Automatically halts spawner coroutines on scene unload, tags rolling stock immediately per-car, and adds an emergency `[ 💥 Purge Derailed ]` tool in the Debug HUD.
+- 📐 **Switch-Blade 7m Physical Zone & Lock De-Thrashing:** Reduced switch fouling envelopes from 60m to a realistic 7.0m movable blade zone (`SwitchBladeZoneMeters = 7.0f`), preventing cars parked down sidings from fouling main turnouts.
+- 🚉 **Station Entry Signal Reservation Purge & Interlocking:** Safely purges orphaned downstream reservations in DVSignals `TrackReserver`, resolving indefinite `Hp 0` red signal lockouts while protecting other active AI trains.
+- 🏔️ **Physics-Adaptive Hill Starts & Balanced Bleed:** Dynamic equilibrium throttle model computes holding power against grade and consist mass, smoothly bleeding train brakes without rollback stalls or wheel slip.
+- 🛑 **Distant Signal Advance Warning Fix & Stopped Switch Throwing:** Fixed `NEXT_STOP`/`VR0` advance warning braking so trains brake for downstream signals instead of halting at green proceed masts, and leaves turnouts unlocked while stopped for player manual throwing.
+- 🔀 **Strict Yard Avoidance & Emergency Detours:** Disqualifies intermediate yard loading, transfer, and shunting tracks from mainline routes, with a 15 km/h slow shunting detour fallback when stopped at red signals for ≥ 30s.
+- ⏰ **Emergency Deadlock Despawn:** Ambient procedural trains stuck for ≥ 5 minutes are cleanly despawned, releasing all locks and reservations without touching player consists.
 
 ---
 
@@ -117,7 +119,7 @@ Built with cross-mod interoperability in mind:
 1. **[Derail Valley](https://store.steampowered.com/app/588030/Derail_Valley/)** (PC / Steam release)
 2. **[Unity Mod Manager (UMM)](https://www.nexusmods.com/site/mods/21)** (v0.27.0 or newer)
 3. **[DVSignals](https://github.com/WhistleWiz/dv-signals)** installed in `Derail Valley/Mods/`
-4. **[CommsRadioAPI](https://github.com/Killermops27/dv-ai-traffic)** installed in `Derail Valley/Mods/`
+4. **[CommsRadioAPI](https://github.com/fauxnik/dv-comms-radio-api)** installed in `Derail Valley/Mods/`
 
 ### Strongly Recommended:
 * **[Double Track (`DoubleTrack`)](https://www.nexusmods.com/derailvalley/mods/808)**: Strongly recommended for smooth traffic flow and bi-directional mainline capacity.
@@ -127,7 +129,7 @@ Built with cross-mod interoperability in mind:
 
 ## 🛠️ Installation
 
-1. Download the latest **`AITraffic-v0.2.6.zip`** from [GitHub Releases](https://github.com/Killermops27/dv-ai-traffic/releases) or [Nexus Mods](https://www.nexusmods.com/derailvalley/mods/1685).
+1. Download the latest **`AITraffic-v0.2.7.zip`** from [GitHub Releases](https://github.com/Killermops27/dv-ai-traffic/releases) or [Nexus Mods](https://www.nexusmods.com/derailvalley/mods/1685).
 2. Install via **Unity Mod Manager (UMM)**:
    - Drag and drop the downloaded `.zip` file directly into the UMM **Mods** tab, **OR**
    - Extract the `.zip` archive into your `Derail Valley/Mods/` folder so that `Info.json` is located at:

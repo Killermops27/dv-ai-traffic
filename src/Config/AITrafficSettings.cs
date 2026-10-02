@@ -45,6 +45,8 @@ namespace AITraffic.Config
         public StationWakeUpMode StationWakeUp = StationWakeUpMode.WorkerTrainsOnly;
         public bool ReserveArrivalTrackFirst = true;
         public bool MoreTrainEncounters = true;
+        public bool EmergencyDespawnStuckTrains = true;
+        public float EmergencyDespawnMinutes = 5.0f;
 
         // Custom styling cache
         [NonSerialized]
@@ -197,6 +199,17 @@ namespace AITraffic.Config
                     DespawnDistance = SpawnDistanceMax + 300f;
                 }
                 GUILayout.EndHorizontal();
+
+                // Emergency Stuck Ambient Despawn
+                GUILayout.Space(4);
+                EmergencyDespawnStuckTrains = GUILayout.Toggle(EmergencyDespawnStuckTrains, " Emergency Despawn Stuck Trains (Deletes ambient trains stopped > timeout)");
+                if (EmergencyDespawnStuckTrains)
+                {
+                    GUILayout.BeginHorizontal();
+                    GUILayout.Label(string.Format("Stuck Train Timeout: <b>{0:F1} min</b>", EmergencyDespawnMinutes), GUILayout.Width(220));
+                    EmergencyDespawnMinutes = Mathf.Round(GUILayout.HorizontalSlider(EmergencyDespawnMinutes, 1.0f, 10.0f) * 2f) / 2f;
+                    GUILayout.EndHorizontal();
+                }
 
                 GUILayout.Space(8);
 

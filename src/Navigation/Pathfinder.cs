@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Threading.Tasks;
 using UnityEngine;
 
 namespace AITraffic.Navigation
@@ -117,6 +118,16 @@ namespace AITraffic.Navigation
         public HashSet<RailTrack> OccupiedTracksSnapshot { get; set; }
 
         /// <summary>
+        /// Optional precomputed snapshot of tracks occupied by the player for O(1) thread-safe player avoidance during A*.
+        /// </summary>
+        public HashSet<RailTrack> PlayerOccupiedTracksSnapshot { get; set; }
+
+        /// <summary>
+        /// Snapshot of player position in world space for proximity checks during A*.
+        /// </summary>
+        public Vector3 PlayerPosition { get; set; }
+
+        /// <summary>
         /// Total physical length of the consist in meters. Used to prune loops too short for the train to fit.
         /// </summary>
         public float ConsistLength { get; set; }
@@ -139,6 +150,8 @@ namespace AITraffic.Navigation
             RequesterTrainset = null;
             ExcludedTracks = null;
             OccupiedTracksSnapshot = null;
+            PlayerOccupiedTracksSnapshot = null;
+            PlayerPosition = Vector3.zero;
             TurnoutDivergingPenalty = 40f;
             CrossoverPenalty = 0f;
             YardTrackPenaltyPerMeter = 1.5f;
@@ -166,6 +179,8 @@ namespace AITraffic.Navigation
                 RequesterTrainset = this.RequesterTrainset,
                 ExcludedTracks = this.ExcludedTracks != null ? new HashSet<RailTrack>(this.ExcludedTracks) : null,
                 OccupiedTracksSnapshot = this.OccupiedTracksSnapshot,
+                PlayerOccupiedTracksSnapshot = this.PlayerOccupiedTracksSnapshot != null ? new HashSet<RailTrack>(this.PlayerOccupiedTracksSnapshot) : null,
+                PlayerPosition = this.PlayerPosition,
                 TurnoutDivergingPenalty = this.TurnoutDivergingPenalty,
                 CrossoverPenalty = this.CrossoverPenalty,
                 YardTrackPenaltyPerMeter = this.YardTrackPenaltyPerMeter,
@@ -361,6 +376,105 @@ namespace AITraffic.Navigation
             Debug.LogWarning("[AITraffic] " + msg);
         }
 
+        private static void EnsureOptionsSnapshots(PathfinderOptions options, RailGraph graph)
+        {
+            if (options == null) return;
+            if (options.OccupiedTracksSnapshot == null && graph != null)
+            {
+                options.OccupiedTracksSnapshot = RailGraph.BuildOccupiedTracksSnapshot(options.RequesterTrainset);
+            }
+            if (options.PlayerOccupiedTracksSnapshot == null)
+            {
+                options.PlayerOccupiedTracksSnapshot = SignalRegistry.GetPlayerOccupiedTracks(options.RequesterTrainset);
+            }
+            if (options.PlayerPosition == Vector3.zero)
+            {
+                options.PlayerPosition = SignalRegistry.GetPlayerPosition();
+            }
+        }
+
+        /// <summary>
+        /// Finds the shortest route from start track to destination track asynchronously on a background worker thread.
+        /// Captures all necessary main-thread snapshots before dispatching so Unity frame generation runs at 100% FPS.
+        /// </summary>
+        public static Task<RailPath> FindPathAsync(
+            RailTrack startTrack,
+            RailTrack destinationTrack,
+            PathfinderOptions options = null,
+            System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken))
+        {
+            if (startTrack == null || destinationTrack == null)
+            {
+                return Task.FromResult<RailPath>(null);
+            }
+
+            var opts = options != null ? options.Clone() : PathfinderOptions.Default;
+            var graph = RailGraph.Instance ?? new RailGraph();
+            if (!graph.IsInitialized)
+            {
+                graph.Initialize();
+            }
+            EnsureOptionsSnapshots(opts, graph);
+
+            return Task.Run(() =>
+            {
+                if (cancellationToken.IsCancellationRequested) return null;
+                var pf = new Pathfinder(graph);
+                return pf.FindPath(startTrack, destinationTrack, opts);
+            }, cancellationToken);
+        }
+
+        /// <summary>
+        /// Finds the shortest route from start track to destination track with specified heading asynchronously.
+        /// </summary>
+        public static Task<RailPath> FindPathAsync(
+            RailTrack startTrack,
+            RailTrack destinationTrack,
+            bool startForward,
+            PathfinderOptions options = null,
+            System.Threading.CancellationToken cancellationToken = default(System.Threading.CancellationToken))
+        {
+            if (startTrack == null || destinationTrack == null)
+            {
+                return Task.FromResult<RailPath>(null);
+            }
+
+            var opts = options != null ? options.Clone() : PathfinderOptions.Default;
+            var graph = RailGraph.Instance ?? new RailGraph();
+            if (!graph.IsInitialized)
+            {
+                graph.Initialize();
+            }
+            EnsureOptionsSnapshots(opts, graph);
+
+            return Task.Run(() =>
+            {
+                if (cancellationToken.IsCancellationRequested) return null;
+                var pf = new Pathfinder(graph);
+                return pf.FindPath(startTrack, destinationTrack, startForward, opts);
+            }, cancellationToken);
+        }
+
+        /// <summary>
+        /// Coroutine wrapper around FindPathAsync that yields frames until the background path search completes.
+        /// </summary>
+        public static System.Collections.IEnumerator FindPathCoroutine(
+            RailTrack startTrack,
+            RailTrack destinationTrack,
+            PathfinderOptions options,
+            Action<RailPath> onComplete)
+        {
+            var task = FindPathAsync(startTrack, destinationTrack, options);
+            while (!task.IsCompleted)
+            {
+                yield return null;
+            }
+            if (onComplete != null)
+            {
+                onComplete(task.Result);
+            }
+        }
+
         /// <summary>
         /// Finds the shortest route from start track to destination track.
         /// </summary>
@@ -392,6 +506,7 @@ namespace AITraffic.Navigation
             }
 
             options = options ?? PathfinderOptions.Default;
+            EnsureOptionsSnapshots(options, _graph);
 
             RailNode startNode = startForward ? startEdge.ToNode : startEdge.FromNode;
             return RunAStar(startEdge, startNode, destEdge, options);
@@ -425,6 +540,7 @@ namespace AITraffic.Navigation
             }
 
             options = options ?? PathfinderOptions.Default;
+            EnsureOptionsSnapshots(options, _graph);
 
             // 1. Dead-end check: Buffer stops / dead ends cannot be exited
             bool toNodeDeadEnd = startEdge.ToNode != null && startEdge.ToNode.IsDeadEnd;
@@ -782,7 +898,7 @@ namespace AITraffic.Navigation
 
                 var traversableEdges = _graph.GetTraversableEdges(current.Node, current.IncomingEdge);
 
-                for (int i = 0; i < traversableEdges.Count; i++)
+                for (int i = 0; i < traversableEdges.Length; i++)
                 {
                     var edge = traversableEdges[i];
                     if (edge == null || edge == current.IncomingEdge) continue;
@@ -933,7 +1049,10 @@ namespace AITraffic.Navigation
             // Intermediate tracks that are physically occupied MUST NEVER be chosen.
             if (options.AvoidOccupiedTracks && !isStartOrDest && !isOccupiedByRequester)
             {
-                bool isOccupied = _graph.IsTrackOccupied(edge.Track, occupiedSnapshot, options.RequesterTrainset);
+                bool isOccupied = (occupiedSnapshot != null)
+                    ? occupiedSnapshot.Contains(edge.Track)
+                    : _graph.IsTrackOccupied(edge.Track, null, options.RequesterTrainset);
+
                 if (isOccupied)
                 {
                     if (options.StrictlyAvoidOccupied)
@@ -966,7 +1085,17 @@ namespace AITraffic.Navigation
 
             if (options.PreventPlayerOvertake && !isWorkerOrPlayerLoco && !isStartOrDest && !isOccupiedByRequester)
             {
-                if (SignalRegistry.IsTrackOccupiedByPlayer(edge.Track, options.RequesterTrainset))
+                bool isPlayerTrack = false;
+                if (options.PlayerOccupiedTracksSnapshot != null)
+                {
+                    isPlayerTrack = options.PlayerOccupiedTracksSnapshot.Contains(edge.Track);
+                }
+                else
+                {
+                    isPlayerTrack = SignalRegistry.IsTrackOccupiedByPlayer(edge.Track, options.RequesterTrainset);
+                }
+
+                if (isPlayerTrack)
                 {
                     cost += 2000000f;
                 }
@@ -1022,7 +1151,16 @@ namespace AITraffic.Navigation
             bool isPassingLoop = (edge != null && edge.IsPassingLoopOrSiding) || IsPassingOrSidingTrack(edge.Track);
             if (isPassingLoop && !isStartOrDest && !isImmediateLadder)
             {
-                cost += 350f;
+                bool isPreferredRightHandCorridorTrack = edge != null &&
+                    edge.IsDoubleTrackMainline &&
+                    edge.ParallelEdge != null &&
+                    (edge.IsForward(fromNode, toNode) == edge.PreferredForward) &&
+                    !IsIndustrialYardOrStorageTrack(edge.Track);
+
+                if (!isPreferredRightHandCorridorTrack)
+                {
+                    cost += 350f;
+                }
             }
 
             // Intermediate Loading, Transfer, Turntable, and Yard Storage/Shunting Track Avoidance:
@@ -1081,14 +1219,24 @@ namespace AITraffic.Navigation
             {
                 if (isPassingLoop)
                 {
-                    Vector3 pPos;
-                    Trainset pSet;
-                    float pSpeed;
-                    if (SignalRegistry.TryGetPlayerTrainInfo(out pSet, out pPos, out pSpeed))
+                    Vector3 pPos = options.PlayerPosition;
+                    if (pPos != Vector3.zero)
                     {
                         if (Vector3.Distance(edge.GetMidPoint(), pPos) < 1500f)
                         {
                             cost += 500000f;
+                        }
+                    }
+                    else
+                    {
+                        Trainset pSet;
+                        float pSpeed;
+                        if (SignalRegistry.TryGetPlayerTrainInfo(out pSet, out pPos, out pSpeed))
+                        {
+                            if (Vector3.Distance(edge.GetMidPoint(), pPos) < 1500f)
+                            {
+                                cost += 500000f;
+                            }
                         }
                     }
                 }
@@ -1135,7 +1283,17 @@ namespace AITraffic.Navigation
             // Diverging turnout penalty
             if (fromNode.Junction != null && requiredBranch > 0)
             {
-                cost += options.TurnoutDivergingPenalty;
+                // Zero out turnout diverging penalty when aligning onto the preferred right-hand track outside stations
+                bool alignsToRightHandTrack = edge != null &&
+                    edge.IsDoubleTrackMainline &&
+                    edge.ParallelEdge != null &&
+                    (edge.IsForward(fromNode, toNode) == edge.PreferredForward) &&
+                    !IsIndustrialYardOrStorageTrack(edge.Track);
+
+                if (!alignsToRightHandTrack)
+                {
+                    cost += options.TurnoutDivergingPenalty;
+                }
             }
 
             // Right-Hand Running Preference at Diverging Junctions
@@ -1148,7 +1306,8 @@ namespace AITraffic.Navigation
                 float candidateLateral = Vector3.Dot(candidateDir, rightNormal);
 
                 // Find lateral spread of alternative outgoing edges from this node
-                // Exclude yard tracks, sidings, and strictly avoided tracks from acting as preferred right-hand options!
+                // Exclude yard tracks and strictly avoided tracks from acting as preferred right-hand options,
+                // but allow passing loops and through-sidings outside stations!
                 float maxLateral = float.MinValue;
                 float minLateral = float.MaxValue;
                 for (int b = 0; b < fromNode.IncidentEdges.Count; b++)
@@ -1156,9 +1315,13 @@ namespace AITraffic.Navigation
                     var altEdge = fromNode.IncidentEdges[b];
                     if (altEdge == null || altEdge == incomingEdge) continue;
 
-                    // Exclude yard tracks, sidings, and avoided tracks from forcing a mainline track to be penalized
+                    // Exclude station yard tracks and strictly avoided tracks from forcing a through track to be penalized
                     if (altEdge.IsYardTrack || altEdge.IsStrictlyAvoidedThroughTrack || IsIndustrialYardOrStorageTrack(altEdge.Track) || IsStrictlyAvoidedThroughTrack(altEdge.Track))
-                        continue;
+                    {
+                        // But do NOT exclude passing loops or through sidings outside stations!
+                        if (!altEdge.IsPassingLoopOrSiding && !IsPassingOrSidingTrack(altEdge.Track))
+                            continue;
+                    }
 
                     Vector3 altDir = altEdge.GetDirection(fromNode);
                     float altLat = Vector3.Dot(altDir, rightNormal);
@@ -1400,6 +1563,13 @@ namespace AITraffic.Navigation
                 {
                     return false;
                 }
+            }
+
+            // DoubleTrack mod passing sidings (e.g. "[y]_[doubletrack]_[Siding-8-T]")
+            if (tName.IndexOf("doubletrack", StringComparison.OrdinalIgnoreCase) >= 0 &&
+                tName.IndexOf("Siding", StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                return true;
             }
 
             // Siding / passing loop keywords

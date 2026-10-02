@@ -3,7 +3,7 @@
 [![Game: Derail Valley](https://img.shields.io/badge/Game-Derail%20Valley-blue.svg)](http://www.derailvalley.com/)
 [![Mod Loader: UMM](https://img.shields.io/badge/ModLoader-Unity%20Mod%20Manager-orange.svg)](https://www.nexusmods.com/site/mods/21)
 [![Requires: DVSignals](https://img.shields.io/badge/Requires-DVSignals-green.svg)](https://github.com/WhistleWiz/dv-signals)
-[![Requires: CommsRadioAPI](https://img.shields.io/badge/Requires-CommsRadioAPI-purple.svg)](https://github.com/Killermops27/dv-ai-traffic)
+[![Requires: CommsRadioAPI](https://img.shields.io/badge/Requires-CommsRadioAPI-purple.svg)](https://github.com/fauxnik/dv-comms-radio-api)
 [![Compatible: ZCouplers](https://img.shields.io/badge/Compatible-ZCouplers-blueviolet.svg)](https://www.nexusmods.com/derailvalley/mods/813)
 [![Latest Release](https://img.shields.io/github/v/release/Killermops27/dv-ai-traffic?include_prereleases&color=brightgreen)](https://github.com/Killermops27/dv-ai-traffic/releases)
 [![Nexus Mods](https://img.shields.io/badge/Nexus%20Mods-1685-orange.svg)](https://www.nexusmods.com/derailvalley/mods/1685)
@@ -123,7 +123,7 @@ Built with cross-mod interoperability in mind:
 1. **[Derail Valley](https://store.steampowered.com/app/588030/Derail_Valley/)** (PC / Steam release)
 2. **[Unity Mod Manager (UMM)](https://www.nexusmods.com/site/mods/21)** (v0.27.0 or newer, configured for Doorstop / Assembly Injection)
 3. **[DVSignals](https://github.com/WhistleWiz/dv-signals)** installed in your `Derail Valley/Mods/` directory
-4. **[CommsRadioAPI](https://github.com/Killermops27/dv-ai-traffic)** installed in your `Derail Valley/Mods/` directory
+4. **[CommsRadioAPI](https://github.com/fauxnik/dv-comms-radio-api)** installed in your `Derail Valley/Mods/` directory
 
 ### Strongly Recommended:
 * **[Double Track (`DoubleTrack`)](https://www.nexusmods.com/derailvalley/mods/808)**: Highly recommended for smooth traffic flow. Double track sections provide bi-directional passing capacity, significantly mitigating single-track traffic bottlenecks and deadlocks between ambient AI trains and player operations.
@@ -133,7 +133,7 @@ Built with cross-mod interoperability in mind:
 
 ## 🛠️ Installation
 
-1. Download the latest **`AITraffic-v0.2.6.zip`** from the **[Releases](https://github.com/Killermops27/dv-ai-traffic/releases)** section or **[Nexus Mods](https://www.nexusmods.com/derailvalley/mods/1685)**.
+1. Download the latest **`AITraffic-v0.2.7.zip`** from the **[Releases](https://github.com/Killermops27/dv-ai-traffic/releases)** section or **[Nexus Mods](https://www.nexusmods.com/derailvalley/mods/1685)**.
 2. Install via **Unity Mod Manager (UMM)**:
    - Drag and drop the downloaded `.zip` file directly into the UMM **Mods** tab, **OR**
    - Extract the `.zip` archive into your `Derail Valley/Mods/` folder so that `Info.json` is located at:

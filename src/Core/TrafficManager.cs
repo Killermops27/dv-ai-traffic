@@ -142,6 +142,12 @@ namespace AITraffic.Core
                 _routeLineRenderers.Clear();
                 _routeConeFilters.Clear();
                 _routeConeRenderers.Clear();
+
+                if (s_outlineMaterial != null)
+                {
+                    Destroy(s_outlineMaterial);
+                    s_outlineMaterial = null;
+                }
             }
             catch {}
 
@@ -241,9 +247,57 @@ namespace AITraffic.Core
         {
             if (engineer != null && _activeEngineers.Remove(engineer))
             {
+                UnregisterStalledAmbientEngineer(engineer);
                 if (Main.ModEntry != null && Main.ModEntry.Logger != null)
                     Main.ModEntry.Logger.Log(string.Format("[TrafficManager] Unregistered AI Engineer for loco '{0}'. Active AI trains: {1}",
                         engineer.TrainCar != null ? engineer.TrainCar.ID : "Unknown", _activeEngineers.Count));
+            }
+        }
+
+        private readonly List<AIEngineer> _stalledAmbientEngineers = new List<AIEngineer>();
+        public List<AIEngineer> StalledAmbientEngineers { get { return _stalledAmbientEngineers; } }
+
+        /// <summary>
+        /// Registers an ambient AI train that has permanently stalled on a grade.
+        /// </summary>
+        public void RegisterStalledAmbientEngineer(AIEngineer engineer)
+        {
+            if (engineer != null && !_stalledAmbientEngineers.Contains(engineer))
+            {
+                _stalledAmbientEngineers.Add(engineer);
+            }
+        }
+
+        /// <summary>
+        /// Unregisters a stalled ambient AI train upon clearing or despawn.
+        /// </summary>
+        public void UnregisterStalledAmbientEngineer(AIEngineer engineer)
+        {
+            if (engineer != null)
+            {
+                _stalledAmbientEngineers.Remove(engineer);
+            }
+        }
+
+        /// <summary>
+        /// Despawns the oldest permanently stalled ambient AI train from the world.
+        /// </summary>
+        public void DespawnFirstStalledAmbientTrain()
+        {
+            for (int i = _stalledAmbientEngineers.Count - 1; i >= 0; i--)
+            {
+                var eng = _stalledAmbientEngineers[i];
+                _stalledAmbientEngineers.RemoveAt(i);
+                if (eng != null && eng.TrainCar != null)
+                {
+                    string id = eng.TrainCar.ID;
+                    DespawnAITrain(eng);
+                    if (AITraffic.Workers.WorkerManager.Instance != null)
+                    {
+                        AITraffic.Workers.WorkerManager.Instance.ShowToast(string.Format("Stalled AI Train '{0}' cleared from track.", id), "[AI Traffic]");
+                    }
+                    break;
+                }
             }
         }
 
@@ -391,26 +445,6 @@ namespace AITraffic.Core
 
                 float distToPlayer = playerPos != Vector3.zero ? Vector3.Distance(engineer.TrainCar.transform.position, playerPos) : 0f;
 
-                // Rule 0: Derailed / Crashed Consist Despawning
-                // If an AI train has suffered a derailment/collision across any car in its consist, has come to a stop, and dwelled for >= 60s
-                if (engineer.HasConsistDerailed || engineer.TrainCar.derailed)
-                {
-                    if (engineer.StationaryTimer >= 60f && distToPlayer > configuredDespawnDist)
-                    {
-                        if (TrainDespawner.CanDespawnSafely(engineer, minDistance: configuredDespawnDist, frustumDistance: configuredDespawnDist))
-                        {
-                            if (Main.ModEntry != null && Main.ModEntry.Logger != null)
-                                Main.ModEntry.Logger.Log(string.Format("[TrafficManager] Despawning derailed AI consist '{0}' ({1} cars, player distance: {2:F0}m >= setting {3:F0}m).",
-                                    engineer.TrainCar.ID, engineer.RegisteredConsistCars.Count, distToPlayer, configuredDespawnDist));
-
-                            _activeEngineers.RemoveAt(i);
-                            TrainDespawner.DespawnTrain(engineer, forceInstant: true);
-                            continue;
-                        }
-                    }
-                    continue;
-                }
-
                 // 1. Terminus / Completed Route Despawning:
                 // A train stopped at terminus with engine shut down is ready to be cleared ONLY after:
                 // 1. It has genuinely entered final parking (State == EngineState.TerminusStop and CurrentSpeedKmh < 0.2f)
@@ -441,7 +475,75 @@ namespace AITraffic.Core
                     continue;
                 }
 
-                // 2. Active En-Route Train Rules:
+                // 2. Emergency Recovery: Stuck / Deadlocked Ambient Train Despawning
+                // If an ambient train is stationary for >= emergency timeout (default 5 min / 300s),
+                // emergency delete it with NO regard for distance to player or camera view frustum.
+                // The only exceptions:
+                // - AI worker trains (checked above)
+                // - Terminus trains arrived at destination track (checked above)
+                // - Trains where the player is currently aboard / riding in any car
+                bool emergencyDespawnEnabled = _settings == null || _settings.EmergencyDespawnStuckTrains;
+                float emergencyTimeoutSeconds = (_settings != null && _settings.EmergencyDespawnMinutes > 0f)
+                    ? _settings.EmergencyDespawnMinutes * 60f
+                    : 300f;
+
+                if (emergencyDespawnEnabled && engineer.State != EngineState.TerminusStop && engineer.StationaryTimer >= emergencyTimeoutSeconds)
+                {
+                    // Check if player is currently aboard any car of this consist
+                    bool isPlayerAboard = false;
+                    TrainCar playerCar = PlayerManager.Car;
+                    if (playerCar != null)
+                    {
+                        if (engineer.TrainCar == playerCar)
+                        {
+                            isPlayerAboard = true;
+                        }
+                        else if (engineer.RegisteredConsistCars != null && engineer.RegisteredConsistCars.Contains(playerCar))
+                        {
+                            isPlayerAboard = true;
+                        }
+                        else if (engineer.TrainCar != null && engineer.TrainCar.trainset != null && engineer.TrainCar.trainset.cars != null && engineer.TrainCar.trainset.cars.Contains(playerCar))
+                        {
+                            isPlayerAboard = true;
+                        }
+                    }
+
+                    if (!isPlayerAboard)
+                    {
+                        if (Main.ModEntry != null && Main.ModEntry.Logger != null)
+                        {
+                            Main.ModEntry.Logger.Warning(string.Format("[TrafficManager] Emergency despawning stuck AI train '{0}' (stationary for {1:F0}s >= timeout {2:F0}s, player distance: {3:F0}m).",
+                                engineer.TrainCar.ID, engineer.StationaryTimer, emergencyTimeoutSeconds, distToPlayer));
+                        }
+
+                        _activeEngineers.RemoveAt(i);
+                        UnregisterStalledAmbientEngineer(engineer);
+                        TrainDespawner.DespawnTrain(engineer, forceInstant: true);
+                        continue;
+                    }
+                }
+
+                // 3. Derailed / Crashed Consist Despawning
+                // If an AI train has suffered a derailment/collision across any car in its consist, has come to a stop, and dwelled for >= 60s outside player range
+                if (engineer.HasConsistDerailed || engineer.TrainCar.derailed)
+                {
+                    if (engineer.StationaryTimer >= 60f && distToPlayer > configuredDespawnDist)
+                    {
+                        if (TrainDespawner.CanDespawnSafely(engineer, minDistance: configuredDespawnDist, frustumDistance: configuredDespawnDist))
+                        {
+                            if (Main.ModEntry != null && Main.ModEntry.Logger != null)
+                                Main.ModEntry.Logger.Log(string.Format("[TrafficManager] Despawning derailed AI consist '{0}' ({1} cars, player distance: {2:F0}m >= setting {3:F0}m).",
+                                    engineer.TrainCar.ID, engineer.RegisteredConsistCars.Count, distToPlayer, configuredDespawnDist));
+
+                            _activeEngineers.RemoveAt(i);
+                            TrainDespawner.DespawnTrain(engineer, forceInstant: true);
+                            continue;
+                        }
+                    }
+                    continue;
+                }
+
+                // 4. Active En-Route Train Rules:
 
                 // Rule A: Spawn Grace Period - Never despawn an active train within 90s of creation
                 if (Time.time - engineer.SpawnTime < 90f)
@@ -466,22 +568,6 @@ namespace AITraffic.Core
                         if (Main.ModEntry != null && Main.ModEntry.Logger != null)
                             Main.ModEntry.Logger.Log(string.Format("[TrafficManager] Despawning AI train '{0}' that passed player or moved out of encounter range ({1:F0}m from player >= setting {2:F0}m, moving away).",
                                 engineer.TrainCar.ID, distToPlayer, despawnThreshold));
-
-                        _activeEngineers.RemoveAt(i);
-                        TrainDespawner.DespawnTrain(engineer, forceInstant: true);
-                        continue;
-                    }
-                }
-
-                // Rule D: Deadlock / Permanently Stuck Recovery
-                // If an active train has been completely halted (> 300s / 5 min) and player is at least configuredDespawnDist away
-                if (engineer.StationaryTimer > 300f && distToPlayer > configuredDespawnDist)
-                {
-                    if (TrainDespawner.CanDespawnSafely(engineer, minDistance: configuredDespawnDist, frustumDistance: configuredDespawnDist))
-                    {
-                        if (Main.ModEntry != null && Main.ModEntry.Logger != null)
-                            Main.ModEntry.Logger.Warning(string.Format("[TrafficManager] Despawning stuck AI train '{0}' (stationary for {1:F0}s, player distance: {2:F0}m >= setting {3:F0}m).",
-                                engineer.TrainCar.ID, engineer.StationaryTimer, distToPlayer, configuredDespawnDist));
 
                         _activeEngineers.RemoveAt(i);
                         TrainDespawner.DespawnTrain(engineer, forceInstant: true);
@@ -1034,6 +1120,70 @@ namespace AITraffic.Core
             return null;
         }
 
+        private static Material s_outlineMaterial;
+        private static bool s_isNightOutline = false;
+        private static float s_dayNightCheckTimer = 0f;
+
+        private static bool CheckIsNightTime()
+        {
+            try
+            {
+                if (DV.WeatherSystem.WeatherDriver.Instance != null)
+                {
+                    return !DV.WeatherSystem.WeatherDriver.Instance.IsDay;
+                }
+            }
+            catch {}
+
+            try
+            {
+                var sun = RenderSettings.sun;
+                if (sun != null)
+                {
+                    if (sun.transform.forward.y >= -0.05f || sun.intensity < 0.15f)
+                        return true;
+                }
+                else if (RenderSettings.ambientLight.grayscale < 0.20f)
+                {
+                    return true;
+                }
+            }
+            catch {}
+
+            return false;
+        }
+
+        private static void UpdateOutlineMaterialColor()
+        {
+            if (s_outlineMaterial != null && s_outlineMaterial.HasProperty("_Color"))
+            {
+                s_outlineMaterial.color = s_isNightOutline
+                    ? new Color(0.96f, 0.96f, 0.96f, 0.95f)
+                    : new Color(0.04f, 0.04f, 0.04f, 0.95f);
+            }
+        }
+
+        private static Material GetOutlineMaterial()
+        {
+            if (s_outlineMaterial != null)
+                return s_outlineMaterial;
+
+            if (s_routeShader == null)
+            {
+                GetPathMaterial(0);
+            }
+
+            if (s_routeShader != null)
+            {
+                s_outlineMaterial = new Material(s_routeShader);
+                s_isNightOutline = CheckIsNightTime();
+                UpdateOutlineMaterialColor();
+                return s_outlineMaterial;
+            }
+
+            return null;
+        }
+
         private class VisualizerTrackCache
         {
             public AIEngineer Engineer;
@@ -1045,7 +1195,8 @@ namespace AITraffic.Core
             public Vector3[] PointsArray = new Vector3[0];
             public readonly Mesh ConeMesh = new Mesh();
             public readonly List<Vector3> ConeVertices = new List<Vector3>();
-            public readonly List<int> ConeTriangles = new List<int>();
+            public readonly List<int> ColoredTriangles = new List<int>();
+            public readonly List<int> BlackTriangles = new List<int>();
             public readonly List<Color> ConeColors = new List<Color>();
         }
 
@@ -1076,6 +1227,12 @@ namespace AITraffic.Core
                 }
             }
 
+            // Hotkey 'K' to despawn stalled ambient AI train
+            if (Input.GetKeyDown(KeyCode.K) && _stalledAmbientEngineers.Count > 0)
+            {
+                DespawnFirstStalledAmbientTrain();
+            }
+
 #if DEBUG
             if (ctrlPressed && shiftPressed && Input.GetKeyDown(KeyCode.M))
             {
@@ -1097,6 +1254,19 @@ namespace AITraffic.Core
                         _routeConeRenderers[i].enabled = false;
                 }
                 return;
+            }
+
+            // Check day/night transition periodically (twice per second) to update outline color (black by day, white by night)
+            s_dayNightCheckTimer += Time.deltaTime;
+            if (s_dayNightCheckTimer >= 0.5f)
+            {
+                s_dayNightCheckTimer = 0f;
+                bool isNight = CheckIsNightTime();
+                if (isNight != s_isNightOutline)
+                {
+                    s_isNightOutline = isNight;
+                    UpdateOutlineMaterialColor();
+                }
             }
 
             // Maintain LineRenderer, cone mesh, and cache pool for active engineers
@@ -1124,7 +1294,15 @@ namespace AITraffic.Core
                 coneObj.layer = 0;
                 var mf = coneObj.AddComponent<MeshFilter>();
                 var mr = coneObj.AddComponent<MeshRenderer>();
-                if (mat != null) mr.sharedMaterial = mat;
+                var outlineMatInit = GetOutlineMaterial();
+                if (mat != null && outlineMatInit != null)
+                {
+                    mr.sharedMaterials = new Material[] { mat, outlineMatInit };
+                }
+                else if (mat != null)
+                {
+                    mr.sharedMaterial = mat;
+                }
                 mr.shadowCastingMode = UnityEngine.Rendering.ShadowCastingMode.Off;
                 mr.receiveShadows = false;
                 _routeConeFilters.Add(mf);
@@ -1170,10 +1348,21 @@ namespace AITraffic.Core
                 }
 
                 Material pathMat = GetPathMaterial(i % TrainPathColors.Length);
+                Material outlineMat = GetOutlineMaterial();
                 if (pathMat != null)
                 {
                     if (lr.sharedMaterial != pathMat) lr.sharedMaterial = pathMat;
-                    if (mr != null && mr.sharedMaterial != pathMat) mr.sharedMaterial = pathMat;
+                    if (mr != null)
+                    {
+                        var curMats = mr.sharedMaterials;
+                        if (curMats == null || curMats.Length != 2 || curMats[0] != pathMat || curMats[1] != outlineMat)
+                        {
+                            if (outlineMat != null)
+                                mr.sharedMaterials = new Material[] { pathMat, outlineMat };
+                            else
+                                mr.sharedMaterial = pathMat;
+                        }
+                    }
                 }
 
                 Color pathColor = TrainPathColors[i % TrainPathColors.Length];
@@ -1285,7 +1474,8 @@ namespace AITraffic.Core
 
             cache.ConeMesh.Clear();
             cache.ConeVertices.Clear();
-            cache.ConeTriangles.Clear();
+            cache.ColoredTriangles.Clear();
+            cache.BlackTriangles.Clear();
             cache.ConeColors.Clear();
 
             if (cache.Points == null || cache.Points.Count < 2) return;
@@ -1301,8 +1491,9 @@ namespace AITraffic.Core
             if (totalDistance < 5f) return;
 
             const float coneInterval = 40f;
-            const float coneLength = 2.0f;
-            const float coneRadius = 0.45f;
+            const float coneLength = 2.4f;
+            const float coneRadius = 0.55f;
+            const float ridgeWidth = 0.08f;
             const int sides = 6;
 
             float nextConeDist = totalDistance < 40f ? totalDistance * 0.5f : 20f;
@@ -1335,51 +1526,162 @@ namespace AITraffic.Core
                     up = Vector3.Cross(localDir, right).normalized;
 
                     float progress = Mathf.Clamp01(nextConeDist / totalDistance);
-                    Color coneCol = new Color(pathColor.r, pathColor.g, pathColor.b, Mathf.Lerp(0.95f, 0.35f, progress));
+                    Color coneCol = new Color(pathColor.r, pathColor.g, pathColor.b, Mathf.Lerp(0.95f, 0.40f, progress));
+                    Color outlineCol = new Color(1.0f, 1.0f, 1.0f, 0.95f);
 
-                    int baseIdx = cache.ConeVertices.Count;
                     float halfLen = coneLength * 0.5f;
                     Vector3 tip = localPos + localDir * halfLen;
                     Vector3 baseCenter = localPos - localDir * halfLen;
 
-                    // Apex & Base Center
-                    cache.ConeVertices.Add(tip);
-                    cache.ConeColors.Add(coneCol);
-                    cache.ConeVertices.Add(baseCenter);
-                    cache.ConeColors.Add(coneCol);
-
-                    // Perimeter
+                    // Perimeter ring points on base circle
+                    Vector3[] ringPts = new Vector3[sides];
+                    Vector3[] outVecs = new Vector3[sides];
                     for (int s = 0; s < sides; s++)
                     {
                         float angle = (s * Mathf.PI * 2f) / sides;
-                        Vector3 ringPt = baseCenter + (right * Mathf.Cos(angle) + up * Mathf.Sin(angle)) * coneRadius;
-                        cache.ConeVertices.Add(ringPt);
-                        cache.ConeColors.Add(coneCol);
+                        Vector3 radDir = (right * Mathf.Cos(angle) + up * Mathf.Sin(angle)).normalized;
+                        ringPts[s] = baseCenter + radDir * coneRadius;
+                        outVecs[s] = radDir;
                     }
 
-                    // Triangles (Double-sided mantle + double-sided base cap for full visibility under any shader)
+                    // 1. Submesh 0: Colored Mantle Facets (6 facets)
                     for (int s = 0; s < sides; s++)
                     {
-                        int curr = baseIdx + 2 + s;
-                        int next = baseIdx + 2 + ((s + 1) % sides);
+                        int next = (s + 1) % sides;
+                        Vector3 pCurr = ringPts[s];
+                        Vector3 pNext = ringPts[next];
 
-                        // Mantle
-                        cache.ConeTriangles.Add(baseIdx);
-                        cache.ConeTriangles.Add(curr);
-                        cache.ConeTriangles.Add(next);
+                        int vStart = cache.ConeVertices.Count;
+                        cache.ConeVertices.Add(tip);
+                        cache.ConeVertices.Add(pCurr);
+                        cache.ConeVertices.Add(pNext);
 
-                        cache.ConeTriangles.Add(baseIdx);
-                        cache.ConeTriangles.Add(next);
-                        cache.ConeTriangles.Add(curr);
+                        cache.ConeColors.Add(coneCol);
+                        cache.ConeColors.Add(coneCol);
+                        cache.ConeColors.Add(coneCol);
 
-                        // Base Cap
-                        cache.ConeTriangles.Add(baseIdx + 1);
-                        cache.ConeTriangles.Add(curr);
-                        cache.ConeTriangles.Add(next);
+                        // Double-sided mantle facet
+                        cache.ColoredTriangles.Add(vStart);
+                        cache.ColoredTriangles.Add(vStart + 1);
+                        cache.ColoredTriangles.Add(vStart + 2);
 
-                        cache.ConeTriangles.Add(baseIdx + 1);
-                        cache.ConeTriangles.Add(next);
-                        cache.ConeTriangles.Add(curr);
+                        cache.ColoredTriangles.Add(vStart);
+                        cache.ColoredTriangles.Add(vStart + 2);
+                        cache.ColoredTriangles.Add(vStart + 1);
+                    }
+
+                    // 2. Submesh 1: Black Outlines, Base Cap, and Ridge Ribs
+                    // (a) Base Cap (solid black rear face)
+                    int baseCenterIdx = cache.ConeVertices.Count;
+                    cache.ConeVertices.Add(baseCenter);
+                    cache.ConeColors.Add(outlineCol);
+
+                    int ringStartIdx = cache.ConeVertices.Count;
+                    for (int s = 0; s < sides; s++)
+                    {
+                        cache.ConeVertices.Add(ringPts[s]);
+                        cache.ConeColors.Add(outlineCol);
+                    }
+
+                    for (int s = 0; s < sides; s++)
+                    {
+                        int curr = ringStartIdx + s;
+                        int next = ringStartIdx + ((s + 1) % sides);
+
+                        // Double-sided base cap triangle
+                        cache.BlackTriangles.Add(baseCenterIdx);
+                        cache.BlackTriangles.Add(curr);
+                        cache.BlackTriangles.Add(next);
+
+                        cache.BlackTriangles.Add(baseCenterIdx);
+                        cache.BlackTriangles.Add(next);
+                        cache.BlackTriangles.Add(curr);
+                    }
+
+                    // (b) 6 Black Ridge Ribs (from tip to each base vertex)
+                    const float halfRibW = ridgeWidth * 0.5f;
+                    for (int s = 0; s < sides; s++)
+                    {
+                        Vector3 edgeVec = ringPts[s] - tip;
+                        Vector3 outNorm = outVecs[s];
+                        Vector3 binorm = Vector3.Cross(edgeVec, outNorm).normalized;
+
+                        Vector3 eTip = tip + outNorm * 0.015f;
+                        Vector3 eBase = ringPts[s] + outNorm * 0.015f;
+
+                        Vector3 r0 = eTip - binorm * halfRibW;
+                        Vector3 r1 = eTip + binorm * halfRibW;
+                        Vector3 r2 = eBase + binorm * halfRibW;
+                        Vector3 r3 = eBase - binorm * halfRibW;
+
+                        int ribStart = cache.ConeVertices.Count;
+                        cache.ConeVertices.Add(r0);
+                        cache.ConeVertices.Add(r1);
+                        cache.ConeVertices.Add(r2);
+                        cache.ConeVertices.Add(r3);
+
+                        cache.ConeColors.Add(outlineCol);
+                        cache.ConeColors.Add(outlineCol);
+                        cache.ConeColors.Add(outlineCol);
+                        cache.ConeColors.Add(outlineCol);
+
+                        // Double-sided quad
+                        cache.BlackTriangles.Add(ribStart);
+                        cache.BlackTriangles.Add(ribStart + 1);
+                        cache.BlackTriangles.Add(ribStart + 2);
+
+                        cache.BlackTriangles.Add(ribStart);
+                        cache.BlackTriangles.Add(ribStart + 2);
+                        cache.BlackTriangles.Add(ribStart + 1);
+
+                        cache.BlackTriangles.Add(ribStart);
+                        cache.BlackTriangles.Add(ribStart + 2);
+                        cache.BlackTriangles.Add(ribStart + 3);
+
+                        cache.BlackTriangles.Add(ribStart);
+                        cache.BlackTriangles.Add(ribStart + 3);
+                        cache.BlackTriangles.Add(ribStart + 2);
+                    }
+
+                    // (c) Black Base Rim Collar (wrapping around the base)
+                    for (int s = 0; s < sides; s++)
+                    {
+                        int next = (s + 1) % sides;
+                        Vector3 pCurr = ringPts[s];
+                        Vector3 pNext = ringPts[next];
+
+                        Vector3 pCurrFwd = Vector3.Lerp(pCurr, tip, 0.18f) + outVecs[s] * 0.012f;
+                        Vector3 pNextFwd = Vector3.Lerp(pNext, tip, 0.18f) + outVecs[next] * 0.012f;
+                        Vector3 pCurrElev = pCurr + outVecs[s] * 0.012f;
+                        Vector3 pNextElev = pNext + outVecs[next] * 0.012f;
+
+                        int rimStart = cache.ConeVertices.Count;
+                        cache.ConeVertices.Add(pCurrElev);
+                        cache.ConeVertices.Add(pNextElev);
+                        cache.ConeVertices.Add(pNextFwd);
+                        cache.ConeVertices.Add(pCurrFwd);
+
+                        cache.ConeColors.Add(outlineCol);
+                        cache.ConeColors.Add(outlineCol);
+                        cache.ConeColors.Add(outlineCol);
+                        cache.ConeColors.Add(outlineCol);
+
+                        // Double-sided quad
+                        cache.BlackTriangles.Add(rimStart);
+                        cache.BlackTriangles.Add(rimStart + 1);
+                        cache.BlackTriangles.Add(rimStart + 2);
+
+                        cache.BlackTriangles.Add(rimStart);
+                        cache.BlackTriangles.Add(rimStart + 2);
+                        cache.BlackTriangles.Add(rimStart + 1);
+
+                        cache.BlackTriangles.Add(rimStart);
+                        cache.BlackTriangles.Add(rimStart + 2);
+                        cache.BlackTriangles.Add(rimStart + 3);
+
+                        cache.BlackTriangles.Add(rimStart);
+                        cache.BlackTriangles.Add(rimStart + 3);
+                        cache.BlackTriangles.Add(rimStart + 2);
                     }
 
                     nextConeDist += coneInterval;
@@ -1390,9 +1692,11 @@ namespace AITraffic.Core
 
             if (cache.ConeVertices.Count > 0)
             {
+                cache.ConeMesh.subMeshCount = 2;
                 cache.ConeMesh.SetVertices(cache.ConeVertices);
-                cache.ConeMesh.SetTriangles(cache.ConeTriangles, 0);
                 cache.ConeMesh.SetColors(cache.ConeColors);
+                cache.ConeMesh.SetTriangles(cache.ColoredTriangles, 0);
+                cache.ConeMesh.SetTriangles(cache.BlackTriangles, 1);
                 cache.ConeMesh.RecalculateNormals();
                 cache.ConeMesh.RecalculateBounds();
             }
@@ -1675,9 +1979,21 @@ namespace AITraffic.Core
                             : "";
                         string slipStr = eng.IsWheelSlipping ? " | <color=#FF5555><b>[SLIP]</b></color>" : "";
                         string rollbackStr = eng.IsRollbackDetected ? " | <color=#FF0000><b>[ROLLBACK CLAMP]</b></color>" : "";
-                        string hillStr = eng.IsHillStarting ? " | <color=#FFD700><b>[HILL START]</b></color>" : "";
+                        string hillStr = "";
+                        if (eng.HillStage == AIEngineer.HillLaunchStage.Stage1_Clean)
+                            hillStr = string.Format(" | <color=#FFD700><b>[HILL: Clean (Eq:{0:F0}%)]</b></color>", eng.HillEquilibriumThrottle * 100f);
+                        else if (eng.HillStage == AIEngineer.HillLaunchStage.Stage2_Sanded)
+                            hillStr = string.Format(" | <color=#FFA500><b>[HILL: Sanded (Eq:{0:F0}%)]</b></color>", eng.HillEquilibriumThrottle * 100f);
+                        else if (eng.HillStage == AIEngineer.HillLaunchStage.RollbackDescent)
+                            hillStr = " | <color=#FF6600><b>[HILL: Rollback Descent]</b></color>";
+                        else if (eng.HillStage == AIEngineer.HillLaunchStage.MomentumRunUp)
+                            hillStr = " | <color=#00FFFF><b>[HILL: Momentum Run-Up]</b></color>";
+                        else if (eng.HillStage == AIEngineer.HillLaunchStage.PermanentlyStalled)
+                            hillStr = " | <color=#FF0000><b>[PERMANENTLY STALLED]</b></color>";
+                        else if (eng.IsHillStarting)
+                            hillStr = " | <color=#FFD700><b>[HILL START]</b></color>";
 
-                        if (!string.IsNullOrEmpty(thermalStr) || !string.IsNullOrEmpty(ampsStr) || eng.IsWheelSlipping || eng.IsRollbackDetected || eng.IsHillStarting)
+                        if (!string.IsNullOrEmpty(thermalStr) || !string.IsNullOrEmpty(ampsStr) || eng.IsWheelSlipping || eng.IsRollbackDetected || eng.IsHillStarting || eng.HillStage != AIEngineer.HillLaunchStage.None)
                         {
                             string telemetry = string.Format("   Powertrain: {0}{1}{2}{3}{4}{5}",
                                 thermalStr,

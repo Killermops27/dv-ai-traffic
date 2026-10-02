@@ -610,8 +610,14 @@ namespace AITraffic.Driver
             {
                 if (distantTargetKmh < lineSpeedKmh)
                 {
-                    float approachSpeedMs = CalculateBrakingSpeed(KmHToMs(distantTargetKmh), distanceToSignal, ServiceDeceleration);
-                    return Mathf.Min(lineSpeedKmh, MsToKmH(approachSpeedMs));
+                    // Distant warning applies to the NEXT signal downstream (at least 400m ahead of this signal mast)
+                    float distantDist = distanceToSignal + 400.0f;
+                    float approachSpeedMs = CalculateBrakingSpeed(KmHToMs(distantTargetKmh), distantDist, ServiceDeceleration);
+                    float approachKmh = MsToKmH(approachSpeedMs);
+                    if (approachKmh < lineSpeedKmh)
+                    {
+                        lineSpeedKmh = approachKmh;
+                    }
                 }
             }
 
@@ -808,12 +814,41 @@ namespace AITraffic.Driver
                     else
                     {
                         // 2. Distant Advance Warning (NEXT_RESTRICTED, NEXT_STOP, VR2, etc.)
+                        // A distant warning (Vorsignal) does NOT command a stop or restriction AT THIS MAST!
+                        // It announces a downstream restriction at the NEXT main/governing signal or block end.
                         float distantTargetKmh;
                         if (TryGetDistantWarningTarget(aspect, def, aspectId, out distantTargetKmh))
                         {
                             if (distantTargetKmh < finalTargetKmh)
                             {
-                                float approachMs = CalculateBrakingSpeed(KmHToMs(distantTargetKmh), distSig, ServiceDeceleration);
+                                float downstreamDist = float.PositiveInfinity;
+                                if (upcomingSignals != null)
+                                {
+                                    for (int nextIdx = i + 1; nextIdx < upcomingSignals.Count; nextIdx++)
+                                    {
+                                        var nextEntry = upcomingSignals[nextIdx];
+                                        if (nextEntry.Signal != null && nextEntry.Distance > distSig)
+                                        {
+                                            downstreamDist = nextEntry.Distance;
+                                            break;
+                                        }
+                                    }
+                                }
+
+                                if (float.IsInfinity(downstreamDist))
+                                {
+                                    if (distanceToDestination > distSig && !float.IsInfinity(distanceToDestination))
+                                    {
+                                        downstreamDist = distanceToDestination;
+                                    }
+                                    else
+                                    {
+                                        // Standard railway distant signal spacing (minimum 400m downstream of this mast)
+                                        downstreamDist = distSig + 400.0f;
+                                    }
+                                }
+
+                                float approachMs = CalculateBrakingSpeed(KmHToMs(distantTargetKmh), downstreamDist, ServiceDeceleration);
                                 float approachKmh = MsToKmH(approachMs);
                                 if (approachKmh < finalTargetKmh)
                                 {

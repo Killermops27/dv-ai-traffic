@@ -127,6 +127,10 @@ namespace AITraffic.Navigation
         public bool IsShuntingOrStorageTrack { get; internal set; }
         public DV.Logic.Job.Track LogicTrack { get; internal set; }
 
+        public Vector3 MidPoint { get; internal set; }
+        public Vector3 FromTangent { get; internal set; }
+        public Vector3 ToTangent { get; internal set; }
+
         public RailEdge(int id, RailTrack track, RailNode fromNode, RailNode toNode)
         {
             if (track == null) throw new ArgumentNullException("track");
@@ -136,15 +140,22 @@ namespace AITraffic.Navigation
             FromNode = fromNode;
             ToNode = toNode;
 
-            if (track.curve != null)
+            if (track.curve != null && track.curve.pointCount > 0)
             {
                 Length = track.curve.length;
+                MidPoint = track.curve.GetPointAt(0.5f);
+                FromTangent = track.curve.GetTangentAt(0f).normalized;
+                ToTangent = track.curve.GetTangentAt(1f).normalized;
             }
             else
             {
                 Vector3 p1 = fromNode != null ? fromNode.Position : Vector3.zero;
                 Vector3 p2 = toNode != null ? toNode.Position : Vector3.zero;
                 Length = Vector3.Distance(p1, p2);
+                MidPoint = (p1 + p2) * 0.5f;
+                Vector3 dir = (Length > 0.001f) ? (p2 - p1).normalized : Vector3.forward;
+                FromTangent = dir;
+                ToTangent = dir;
             }
 
             IsJunctionTrack = track.isJunctionTrack;
@@ -172,6 +183,7 @@ namespace AITraffic.Navigation
         {
             if (fromNode == FromNode)
             {
+                if (FromTangent != Vector3.zero) return FromTangent;
                 if (Track != null && Track.curve != null && Track.curve.pointCount > 0)
                 {
                     return Track.curve.GetTangentAt(0f).normalized;
@@ -183,6 +195,7 @@ namespace AITraffic.Navigation
             }
             else if (fromNode == ToNode)
             {
+                if (ToTangent != Vector3.zero) return -ToTangent;
                 if (Track != null && Track.curve != null && Track.curve.pointCount > 0)
                 {
                     return -Track.curve.GetTangentAt(1f).normalized;
@@ -199,6 +212,7 @@ namespace AITraffic.Navigation
                 float dTo = ToNode != null ? Vector3.SqrMagnitude(fromNode.Position - ToNode.Position) : float.MaxValue;
                 if (dFrom <= dTo)
                 {
+                    if (FromTangent != Vector3.zero) return FromTangent;
                     if (Track != null && Track.curve != null && Track.curve.pointCount > 0)
                         return Track.curve.GetTangentAt(0f).normalized;
                     if (ToNode != null && FromNode != null)
@@ -206,6 +220,7 @@ namespace AITraffic.Navigation
                 }
                 else
                 {
+                    if (ToTangent != Vector3.zero) return -ToTangent;
                     if (Track != null && Track.curve != null && Track.curve.pointCount > 0)
                         return -Track.curve.GetTangentAt(1f).normalized;
                     if (FromNode != null && ToNode != null)
@@ -213,13 +228,14 @@ namespace AITraffic.Navigation
                 }
             }
 
-            return (Track != null && Track.curve != null && Track.curve.pointCount > 0)
-                ? Track.curve.GetTangentAt(0f).normalized
-                : Vector3.forward;
+            return (FromTangent != Vector3.zero)
+                ? FromTangent
+                : ((Track != null && Track.curve != null && Track.curve.pointCount > 0) ? Track.curve.GetTangentAt(0f).normalized : Vector3.forward);
         }
 
         public Vector3 GetMidPoint()
         {
+            if (MidPoint != Vector3.zero) return MidPoint;
             if (Track != null && Track.curve != null)
             {
                 return Track.curve.GetPointAt(0.5f);
@@ -367,6 +383,7 @@ namespace AITraffic.Navigation
                     CalculateSpeedLimits();
                     DetectDoubleTrackCorridors();
                     BuildSpatialTrackGrid();
+                    PrecomputeTraversableEdges();
 
                     IsInitialized = true;
                     Log(string.Format("[RailGraph] Initialization complete: {0} nodes, {1} edges.", Nodes.Count, Edges.Count));
@@ -394,6 +411,7 @@ namespace AITraffic.Navigation
             _edgesById.Clear();
             _trackReservations.Clear();
             _spatialGrid.Clear();
+            _traversableEdgesCache.Clear();
             IsInitialized = false;
         }
 
@@ -690,7 +708,19 @@ namespace AITraffic.Navigation
                                   tName.IndexOf("Platform", StringComparison.OrdinalIgnoreCase) >= 0 ||
                                   tName.IndexOf("Pax", StringComparison.OrdinalIgnoreCase) >= 0;
 
-                if (edge.IsYardTrack)
+                edge.IsStrictlyAvoidedThroughTrack = Pathfinder.IsStrictlyAvoidedThroughTrack(edge.Track);
+                edge.IsPassingLoopOrSiding = Pathfinder.IsPassingOrSidingTrack(edge.Track);
+                edge.IsShuntingOrStorageTrack = Pathfinder.IsShuntingOrStorageTrack(edge.Track);
+
+                bool isPassingLoopOutsideStation = (edge.IsPassingLoopOrSiding || tName.IndexOf("Siding", StringComparison.OrdinalIgnoreCase) >= 0) &&
+                                                   !Pathfinder.IsIndustrialYardOrStorageTrack(edge.Track);
+
+                if (isPassingLoopOutsideStation)
+                {
+                    // User directive: on sidings other than in station allow the speed like on mainline depending on curve of the track
+                    edge.SpeedLimit = geoLimit;
+                }
+                else if (edge.IsYardTrack)
                 {
                     edge.SpeedLimit = Mathf.Min(30f, geoLimit);
                 }
@@ -702,10 +732,6 @@ namespace AITraffic.Navigation
                 {
                     edge.SpeedLimit = geoLimit;
                 }
-
-                edge.IsStrictlyAvoidedThroughTrack = Pathfinder.IsStrictlyAvoidedThroughTrack(edge.Track);
-                edge.IsPassingLoopOrSiding = Pathfinder.IsPassingOrSidingTrack(edge.Track);
-                edge.IsShuntingOrStorageTrack = Pathfinder.IsShuntingOrStorageTrack(edge.Track);
             }
 
             for (int n = 0; n < Nodes.Count; n++)
@@ -755,19 +781,26 @@ namespace AITraffic.Navigation
                 }
             }
 
-            var mainlineEdges = Edges.Where(e => (!e.IsYardTrack || (e.Track != null && e.Track.name != null && e.Track.name.IndexOf("DT-", StringComparison.OrdinalIgnoreCase) >= 0)) && e.Length >= 10f).ToList();
+            var corridorCandidateEdges = Edges.Where(e =>
+                e != null &&
+                e.Track != null &&
+                e.Track.curve != null &&
+                !e.IsStrictlyAvoidedThroughTrack &&
+                (!e.IsYardTrack || e.IsPassingLoopOrSiding || (e.Track.name != null && (e.Track.name.IndexOf("DT-", StringComparison.OrdinalIgnoreCase) >= 0 || e.Track.name.IndexOf("doubletrack", StringComparison.OrdinalIgnoreCase) >= 0))) &&
+                !Pathfinder.IsIndustrialYardOrStorageTrack(e.Track) &&
+                e.Length >= 10f).ToList();
 
-            for (int i = 0; i < mainlineEdges.Count; i++)
+            for (int i = 0; i < corridorCandidateEdges.Count; i++)
             {
-                var edge1 = mainlineEdges[i];
+                var edge1 = corridorCandidateEdges[i];
                 if (edge1.Track == null || edge1.Track.curve == null) continue;
                 Vector3 start1 = edge1.Track.curve.GetPointAt(0f);
                 Vector3 mid1 = edge1.GetMidPoint();
                 Vector3 tan1 = edge1.GetTangentAtSpan(edge1.Length * 0.5f);
 
-                for (int j = i + 1; j < mainlineEdges.Count; j++)
+                for (int j = i + 1; j < corridorCandidateEdges.Count; j++)
                 {
-                    var edge2 = mainlineEdges[j];
+                    var edge2 = corridorCandidateEdges[j];
                     if (edge2.Track == null || edge2.Track.curve == null) continue;
                     Vector3 tan2 = edge2.GetTangentAtSpan(edge2.Length * 0.5f);
                     float dot = Vector3.Dot(tan1, tan2);
@@ -909,25 +942,33 @@ namespace AITraffic.Navigation
         /// </summary>
         public static Vector3 GetIncomingVector(RailNode currentNode, RailEdge incomingEdge)
         {
-            if (incomingEdge == null || incomingEdge.Track == null || incomingEdge.Track.curve == null || incomingEdge.Track.curve.pointCount < 2)
-                return Vector3.forward;
+            if (incomingEdge == null) return Vector3.forward;
 
             if (currentNode == incomingEdge.ToNode)
             {
-                return incomingEdge.Track.curve.GetTangentAt(1.0f).normalized;
+                if (incomingEdge.ToTangent != Vector3.zero) return incomingEdge.ToTangent;
+                if (incomingEdge.Track != null && incomingEdge.Track.curve != null && incomingEdge.Track.curve.pointCount >= 2)
+                    return incomingEdge.Track.curve.GetTangentAt(1.0f).normalized;
             }
             if (currentNode == incomingEdge.FromNode)
             {
+                if (incomingEdge.FromTangent != Vector3.zero) return -incomingEdge.FromTangent;
+                if (incomingEdge.Track != null && incomingEdge.Track.curve != null && incomingEdge.Track.curve.pointCount >= 2)
+                    return -incomingEdge.Track.curve.GetTangentAt(0.0f).normalized;
+            }
+
+            if (incomingEdge.Track != null && incomingEdge.Track.curve != null && incomingEdge.Track.curve.pointCount >= 2)
+            {
+                Vector3 p0 = incomingEdge.Track.curve[0].position;
+                Vector3 p1 = incomingEdge.Track.curve.Last().position;
+                if (Vector3.Distance(p1, currentNode.Position) <= Vector3.Distance(p0, currentNode.Position))
+                {
+                    return incomingEdge.Track.curve.GetTangentAt(1.0f).normalized;
+                }
                 return -incomingEdge.Track.curve.GetTangentAt(0.0f).normalized;
             }
 
-            Vector3 p0 = incomingEdge.Track.curve[0].position;
-            Vector3 p1 = incomingEdge.Track.curve.Last().position;
-            if (Vector3.Distance(p1, currentNode.Position) <= Vector3.Distance(p0, currentNode.Position))
-            {
-                return incomingEdge.Track.curve.GetTangentAt(1.0f).normalized;
-            }
-            return -incomingEdge.Track.curve.GetTangentAt(0.0f).normalized;
+            return Vector3.forward;
         }
 
         /// <summary>
@@ -935,32 +976,95 @@ namespace AITraffic.Navigation
         /// </summary>
         public static Vector3 GetDepartingVector(RailNode currentNode, RailEdge candidateEdge)
         {
-            if (candidateEdge == null || candidateEdge.Track == null || candidateEdge.Track.curve == null || candidateEdge.Track.curve.pointCount < 2)
-                return Vector3.forward;
+            if (candidateEdge == null) return Vector3.forward;
 
             if (currentNode == candidateEdge.FromNode)
             {
-                return candidateEdge.Track.curve.GetTangentAt(0.0f).normalized;
+                if (candidateEdge.FromTangent != Vector3.zero) return candidateEdge.FromTangent;
+                if (candidateEdge.Track != null && candidateEdge.Track.curve != null && candidateEdge.Track.curve.pointCount >= 2)
+                    return candidateEdge.Track.curve.GetTangentAt(0.0f).normalized;
             }
             if (currentNode == candidateEdge.ToNode)
             {
+                if (candidateEdge.ToTangent != Vector3.zero) return -candidateEdge.ToTangent;
+                if (candidateEdge.Track != null && candidateEdge.Track.curve != null && candidateEdge.Track.curve.pointCount >= 2)
+                    return -candidateEdge.Track.curve.GetTangentAt(1.0f).normalized;
+            }
+
+            if (candidateEdge.Track != null && candidateEdge.Track.curve != null && candidateEdge.Track.curve.pointCount >= 2)
+            {
+                Vector3 p0 = candidateEdge.Track.curve[0].position;
+                Vector3 p1 = candidateEdge.Track.curve.Last().position;
+                if (Vector3.Distance(p0, currentNode.Position) <= Vector3.Distance(p1, currentNode.Position))
+                {
+                    return candidateEdge.Track.curve.GetTangentAt(0.0f).normalized;
+                }
                 return -candidateEdge.Track.curve.GetTangentAt(1.0f).normalized;
             }
 
-            Vector3 p0 = candidateEdge.Track.curve[0].position;
-            Vector3 p1 = candidateEdge.Track.curve.Last().position;
-            if (Vector3.Distance(p0, currentNode.Position) <= Vector3.Distance(p1, currentNode.Position))
+            return Vector3.forward;
+        }
+
+        private static readonly RailEdge[] s_emptyEdges = new RailEdge[0];
+        private readonly Dictionary<long, RailEdge[]> _traversableEdgesCache = new Dictionary<long, RailEdge[]>();
+
+        private static long GetTraversableKey(int nodeId, int incomingEdgeId)
+        {
+            return ((long)nodeId << 32) | (uint)incomingEdgeId;
+        }
+
+        public void PrecomputeTraversableEdges()
+        {
+            _traversableEdgesCache.Clear();
+            if (Nodes == null) return;
+            for (int n = 0; n < Nodes.Count; n++)
             {
-                return candidateEdge.Track.curve.GetTangentAt(0.0f).normalized;
+                var node = Nodes[n];
+                if (node == null) continue;
+
+                // 1. Unconstrained
+                var unconstrained = ComputeTraversableEdgesInternal(node, null);
+                _traversableEdgesCache[GetTraversableKey(node.Id, 0)] = unconstrained.ToArray();
+
+                // 2. Constrained by each incident edge
+                if (node.IncidentEdges != null)
+                {
+                    for (int e = 0; e < node.IncidentEdges.Count; e++)
+                    {
+                        var inEdge = node.IncidentEdges[e];
+                        if (inEdge == null) continue;
+                        var traversable = ComputeTraversableEdgesInternal(node, inEdge);
+                        _traversableEdgesCache[GetTraversableKey(node.Id, inEdge.Id)] = traversable.ToArray();
+                    }
+                }
             }
-            return -candidateEdge.Track.curve.GetTangentAt(1.0f).normalized;
         }
 
         /// <summary>
         /// Returns all traversable outgoing edges from currentNode when arriving via incomingEdge,
         /// respecting junction geometry, switch constraints, and vector angular continuity.
+        /// Fully thread-safe using a precomputed array lookup cache.
         /// </summary>
-        public List<RailEdge> GetTraversableEdges(RailNode currentNode, RailEdge incomingEdge)
+        public RailEdge[] GetTraversableEdges(RailNode currentNode, RailEdge incomingEdge)
+        {
+            if (currentNode == null) return s_emptyEdges;
+            long key = GetTraversableKey(currentNode.Id, incomingEdge != null ? incomingEdge.Id : 0);
+            RailEdge[] cached;
+            if (_traversableEdgesCache.TryGetValue(key, out cached) && cached != null)
+            {
+                return cached;
+            }
+
+            var list = ComputeTraversableEdgesInternal(currentNode, incomingEdge);
+            cached = list.ToArray();
+            lock (_traversableEdgesCache)
+            {
+                _traversableEdgesCache[key] = cached;
+            }
+            return cached;
+        }
+
+        private List<RailEdge> ComputeTraversableEdgesInternal(RailNode currentNode, RailEdge incomingEdge)
         {
             var result = new List<RailEdge>();
             if (currentNode == null) return result;
@@ -1233,9 +1337,15 @@ namespace AITraffic.Navigation
         {
             if (track == null) return false;
 
+            // 1. Snapshot lookup (O(1) in-memory check, thread-safe!)
+            if (occupiedSnapshot != null)
+            {
+                return occupiedSnapshot.Contains(track);
+            }
+
             try
             {
-                // 1. Direct physical bogie check on track (O(1))
+                // 2. Direct physical bogie check on track (fallback when snapshot is null)
                 var bogies = track.BogiesOnTrack();
                 if (bogies != null && bogies.Count > 0)
                 {
@@ -1252,12 +1362,6 @@ namespace AITraffic.Navigation
                             }
                         }
                     }
-                }
-
-                // 2. Snapshot lookup (O(1))
-                if (occupiedSnapshot != null)
-                {
-                    return occupiedSnapshot.Contains(track);
                 }
             }
             catch { }

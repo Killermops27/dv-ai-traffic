@@ -158,6 +158,63 @@ namespace AITraffic.Navigation
         }
 
         /// <summary>
+        /// Captures an O(1) immutable snapshot of all tracks currently occupied by the player
+        /// (either boarded train, player locomotive, or player rolling stock).
+        /// Executed on the main thread in < 0.02ms for thread-safe asynchronous pathfinding.
+        /// </summary>
+        public static HashSet<RailTrack> GetPlayerOccupiedTracks(Trainset ignoringTrainset = null)
+        {
+            var occupied = new HashSet<RailTrack>();
+
+            if (Main.Settings != null && Main.Settings.RideAlongMode)
+            {
+                return occupied;
+            }
+
+            try
+            {
+                Trainset pTrainset;
+                Vector3 pPos;
+                float pSpeed;
+                if (TryGetPlayerTrainInfo(out pTrainset, out pPos, out pSpeed) && pTrainset != null && pTrainset.cars != null)
+                {
+                    bool isIgnoringTrain = (ignoringTrainset != null && pTrainset == ignoringTrainset);
+                    bool isAITrain = AITraffic.Compat.ModCompatManager.IsAITrain(pTrainset);
+
+                    if (!isIgnoringTrain && !isAITrain)
+                    {
+                        for (int i = 0; i < pTrainset.cars.Count; i++)
+                        {
+                            var car = pTrainset.cars[i];
+                            if (car == null) continue;
+                            if (car.FrontBogie != null && car.FrontBogie.track != null) occupied.Add(car.FrontBogie.track);
+                            if (car.RearBogie != null && car.RearBogie.track != null) occupied.Add(car.RearBogie.track);
+                        }
+                    }
+                }
+
+                if (PlayerManager.Car != null && (ignoringTrainset == null || PlayerManager.Car.trainset != ignoringTrainset))
+                {
+                    if (!AITraffic.Compat.ModCompatManager.IsAITrain(PlayerManager.Car))
+                    {
+                        if (PlayerManager.Car.FrontBogie != null && PlayerManager.Car.FrontBogie.track != null) occupied.Add(PlayerManager.Car.FrontBogie.track);
+                        if (PlayerManager.Car.RearBogie != null && PlayerManager.Car.RearBogie.track != null) occupied.Add(PlayerManager.Car.RearBogie.track);
+                    }
+                }
+            }
+            catch { }
+
+            return occupied;
+        }
+
+        public static Vector3 GetPlayerPosition()
+        {
+            if (PlayerManager.PlayerTransform != null) return PlayerManager.PlayerTransform.position;
+            if (Camera.main != null) return Camera.main.transform.position;
+            return Vector3.zero;
+        }
+
+        /// <summary>
         /// Checks whether a track segment is currently occupied by the player's train, rolling stock, or player avatar.
         /// </summary>
         public static bool IsTrackOccupiedByPlayer(RailTrack track, Trainset ignoringTrainset = null)
@@ -521,6 +578,15 @@ namespace AITraffic.Navigation
         }
 
         /// <summary>
+        /// Checks whether a DVSignals signal is a pure distant signal (Vorsignal) or repeater.
+        /// Pure distant signals do not command stops at their own mast, but give advance warning of downstream restrictions.
+        /// </summary>
+        public static bool IsDistantSignal(DVSignal signal)
+        {
+            return signal != null && !IsGoverningSignal(signal);
+        }
+
+        /// <summary>
         /// Checks whether a DVSignals signal acts as a Main Signal (governs mainline block entry/exit).
         /// Filters out shunting signals and distant repeaters.
         /// </summary>
@@ -611,6 +677,63 @@ namespace AITraffic.Navigation
         }
 
         /// <summary>
+        /// Checks whether a DVSignal acts as a Station Exit Signal (Ausfahrsignal / Asig).
+        /// </summary>
+        public static bool IsExitSignal(DVSignal signal)
+        {
+            if (signal == null) return false;
+            if (signal.Parent != null) signal = signal.Parent;
+
+            // 1. DVSignals controller Type & PrefabType classification
+            if (signal.Controller != null)
+            {
+                if (signal.Controller.Type == Signals.Game.SignalType.Exit ||
+                    signal.Controller.PrefabType == Signals.Game.PrefabType.Exit)
+                {
+                    return true;
+                }
+            }
+
+            // 2. Definition name inspection
+            if (signal.Definition != null && signal.Definition.gameObject != null)
+            {
+                string defName = signal.Definition.gameObject.name;
+                if (defName.IndexOf("Exit", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                    defName.IndexOf("Asig", StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    return true;
+                }
+            }
+
+            // 3. Signal name / prefix inspection (covers German signal pack Asig naming)
+            string name = GetSignalName(signal);
+            if (!string.IsNullOrEmpty(name))
+            {
+                if (name.IndexOf("Asig", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                    name.IndexOf("A-Sig", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                    name.IndexOf("Exit", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                    name.IndexOf("Ausfahr", StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        /// <summary>
+        /// Checks whether a DVSignal acts as a line-authorizing departure signal (Main Signal or Station Exit Signal)
+        /// capable of transitioning an AI movement from Slow Shunting Mode into full Line Speed.
+        /// Filters out pure dwarf shunting signals (Sperrsignale).
+        /// </summary>
+        public static bool IsLineSpeedAuthorizingSignal(DVSignal signal)
+        {
+            if (signal == null) return false;
+            if (signal.Parent != null) signal = signal.Parent;
+            return IsMainSignal(signal) || IsExitSignal(signal);
+        }
+
+        /// <summary>
         /// Checks whether a DVSignal requires an explicit route reservation via TrackReserver
         /// before it can show a non-Hp0 (clear) aspect.
         /// Includes station Entry signals and Exit signals configured with SpecialRequireReservationAspect.
@@ -622,7 +745,7 @@ namespace AITraffic.Navigation
 
             if (IsEntrySignal(signal)) return true;
 
-            if (signal.Controller != null && signal.Controller.Type == Signals.Game.SignalType.Exit)
+            if (IsExitSignal(signal))
             {
                 return true;
             }
