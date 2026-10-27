@@ -1,4 +1,5 @@
 using System;
+using System.Collections;
 using System.Collections.Generic;
 using UnityEngine;
 using AITraffic.Compat;
@@ -32,12 +33,15 @@ namespace AITraffic.Fleet
         /// Checks whether all cars belonging to an AI train (including any separated/derailed consist cars)
         /// can be safely despawned without visible pop-in/pop-out or disrupting the player.
         /// </summary>
+        private static readonly List<TrainCar> s_despawnCarsScratch = new List<TrainCar>(32);
+
         public static bool CanDespawnSafely(AIEngineer engineer, float minDistance = DefaultTerminusSafeDespawnDistance, float frustumDistance = DefaultTerminusFrustumDistance)
         {
             if (engineer == null)
                 return true;
 
-            List<TrainCar> allCars = new List<TrainCar>();
+            var allCars = s_despawnCarsScratch;
+            allCars.Clear();
             if (engineer.RegisteredConsistCars != null && engineer.RegisteredConsistCars.Count > 0)
             {
                 for (int i = 0; i < engineer.RegisteredConsistCars.Count; i++)
@@ -183,7 +187,7 @@ namespace AITraffic.Fleet
                 if (ModCompatManager.IsWorkerTrain(car) || WorkerManager.IsTrainCarInAnyWorkerTask(car))
                 {
                     if (Main.ModEntry != null && Main.ModEntry.Logger != null)
-                        Main.ModEntry.Logger.Warning(string.Format("[TrainDespawner] Aborting despawn of trainset: car '{0}' is part of an AI worker task or player consist!", car.ID));
+                        Main.ModEntry.Logger.Warning(string.Format("[TrainDespawner] Aborting despawn of trainset: car '{0}' is part of an AI worker task or player consist!", ModCompatManager.GetCarId(car)));
                     return false;
                 }
             }
@@ -191,7 +195,7 @@ namespace AITraffic.Fleet
             try
             {
                 int carCount = trainset.cars.Count;
-                string leadId = trainset.firstCar != null ? trainset.firstCar.ID : "Unknown";
+                string leadId = trainset.firstCar != null ? ModCompatManager.GetCarId(trainset.firstCar) : "Unknown";
 
                 // 1. Remove AIEngineer components, release locks/reservations, and stop sounds/coroutines
                 for (int i = 0; i < trainset.cars.Count; i++)
@@ -204,7 +208,14 @@ namespace AITraffic.Fleet
                     {
                         engineer.EmergencyBrake();
                         engineer.ReleaseAllSignalReservations();
-                        AITraffic.Navigation.JunctionController.Instance.ReleaseAllLocksFor(engineer);
+                        if (AITraffic.Core.TrafficManager.Instance != null)
+                        {
+                            AITraffic.Core.TrafficManager.Instance.UnregisterEngineer(engineer);
+                        }
+                        if (AITraffic.Navigation.JunctionController.Instance != null)
+                        {
+                            AITraffic.Navigation.JunctionController.Instance.ReleaseAllLocksFor(engineer);
+                        }
                         if (AITraffic.Navigation.RailGraph.Instance != null)
                         {
                             AITraffic.Navigation.RailGraph.Instance.ReleaseAllReservationsFor(engineer);
@@ -219,14 +230,11 @@ namespace AITraffic.Fleet
                     }
                 }
 
-                // 2. Untag cars from AI registry to prevent save leaks
-                ModCompatManager.UntagTrain(trainset);
-
-                // 3. Create a snapshot copy of cars list for deletion
+                // CRITICAL INVARIANT [FLT-06]: Delete cars BEFORE untagging so SimController.OnCarDestroyed and
+                // PersistentJobsMod hooks still see AITrafficCarMarker and s_aiCars membership during PrepareForDestroy.
                 List<TrainCar> carsToDelete = new List<TrainCar>(trainset.cars);
-
-                // 4. Delete cars using CarSpawner
-                CarSpawner.Instance.DeleteTrainCars(carsToDelete, forceInstantDestroy: forceInstant);
+                SafeDeleteCars(carsToDelete, forceInstant);
+                ModCompatManager.UntagTrain(trainset);
 
                 if (Main.ModEntry != null && Main.ModEntry.Logger != null)
                     Main.ModEntry.Logger.Log(string.Format("[TrainDespawner] Despawned AI trainset (Lead: {0}, Cars: {1}).", leadId, carCount));
@@ -245,7 +253,9 @@ namespace AITraffic.Fleet
         /// Despawns an AI train and ALL of its registered consist cars (including any cars
         /// separated or derailed during a collision) from the game world.
         /// </summary>
-        public static bool DespawnTrain(AIEngineer engineer, bool forceInstant = true)
+        private const int TimeSlicedDespawnCarsPerFrame = 2;
+
+        public static bool DespawnTrain(AIEngineer engineer, bool forceInstant = false)
         {
             if (engineer == null)
                 return false;
@@ -299,15 +309,15 @@ namespace AITraffic.Fleet
                     if (ModCompatManager.IsWorkerTrain(car) || WorkerManager.IsTrainCarInAnyWorkerTask(car))
                     {
                         if (Main.ModEntry != null && Main.ModEntry.Logger != null)
-                            Main.ModEntry.Logger.Warning(string.Format("[TrainDespawner] Aborting despawn of train: car '{0}' is part of an AI worker task or player consist!", car.ID));
+                            Main.ModEntry.Logger.Warning(string.Format("[TrainDespawner] Aborting despawn of train: car '{0}' is part of an AI worker task or player consist!", ModCompatManager.GetCarId(car)));
                         return false;
                     }
                 }
 
-                string leadId = engineer.TrainCar != null ? engineer.TrainCar.ID : "Unknown";
+                string leadId = engineer.TrainCar != null ? ModCompatManager.GetCarId(engineer.TrainCar) : "Unknown";
                 int carCount = carsToDelete.Count;
 
-                // 2. Untag all affected Trainsets and cleanup markers/reservations
+                // 2. Immediately shut down AIEngineer and release all signal/junction/corridor reservations upfront
                 HashSet<Trainset> affectedTrainsets = new HashSet<Trainset>();
                 for (int i = 0; i < carsToDelete.Count; i++)
                 {
@@ -324,6 +334,10 @@ namespace AITraffic.Fleet
                     {
                         eng.EmergencyBrake();
                         eng.ReleaseAllSignalReservations();
+                        if (AITraffic.Core.TrafficManager.Instance != null)
+                        {
+                            AITraffic.Core.TrafficManager.Instance.UnregisterEngineer(eng);
+                        }
                         if (AITraffic.Navigation.JunctionController.Instance != null)
                         {
                             AITraffic.Navigation.JunctionController.Instance.ReleaseAllLocksFor(eng);
@@ -344,29 +358,36 @@ namespace AITraffic.Fleet
                         AITraffic.Navigation.RailGraph.Instance.ReleaseAllReservationsFor(car);
                     }
 
-                    if (car.gameObject != null)
+                }
+
+                // CRITICAL INVARIANT [FLT-06]: Execute SafeDeleteCars BEFORE untagging or destroying AITrafficCarMarker
+                // so synchronous OnCarDestroyed debt hooks recognize the despawning AI cars.
+                bool canTimeSlice = !forceInstant &&
+                                    Main.IsWorldFullyLoaded &&
+                                    carsToDelete.Count > TimeSlicedDespawnCarsPerFrame &&
+                                    AITraffic.Core.TrafficManager.Instance != null &&
+                                    AITraffic.Core.TrafficManager.Instance.isActiveAndEnabled;
+
+                if (canTimeSlice)
+                {
+                    AITraffic.Core.TrafficManager.Instance.StartCoroutine(
+                        TimeSlicedDespawnRoutine(carsToDelete, affectedTrainsets, leadId, carCount));
+                }
+                else
+                {
+                    SafeDeleteCars(carsToDelete, true);
+
+                    foreach (var ts in affectedTrainsets)
                     {
-                        var marker = car.gameObject.GetComponent<AITrafficCarMarker>();
-                        if (marker != null)
+                        if (ts != null)
                         {
-                            UnityEngine.Object.Destroy(marker);
+                            ModCompatManager.UntagTrain(ts);
                         }
                     }
+
+                    if (Main.IsDebugLoggingEnabled)
+                        Main.LogDebug(string.Format("[TrainDespawner] Despawned entire AI consist (Lead: {0}, Total Cars: {1}).", leadId, carCount));
                 }
-
-                foreach (var ts in affectedTrainsets)
-                {
-                    if (ts != null)
-                    {
-                        ModCompatManager.UntagTrain(ts);
-                    }
-                }
-
-                // 3. Delete cars using CarSpawner
-                CarSpawner.Instance.DeleteTrainCars(carsToDelete, forceInstantDestroy: forceInstant);
-
-                if (Main.ModEntry != null && Main.ModEntry.Logger != null)
-                    Main.ModEntry.Logger.Log(string.Format("[TrainDespawner] Despawned entire AI consist (Lead: {0}, Total Cars: {1}).", leadId, carCount));
 
                 return true;
             }
@@ -375,6 +396,149 @@ namespace AITraffic.Fleet
                 if (Main.ModEntry != null && Main.ModEntry.Logger != null)
                     Main.ModEntry.Logger.Error(string.Format("Error in TrainDespawner.DespawnTrain(AIEngineer): {0}", ex));
                 return false;
+            }
+        }
+
+        private static IEnumerator TimeSlicedDespawnRoutine(List<TrainCar> carsToDelete, HashSet<Trainset> affectedTrainsets, string leadId, int carCount)
+        {
+            List<TrainCar> slice = new List<TrainCar>(TimeSlicedDespawnCarsPerFrame);
+            for (int i = 0; i < carsToDelete.Count; i += TimeSlicedDespawnCarsPerFrame)
+            {
+                if (!Main.IsWorldFullyLoaded || CarSpawner.Instance == null)
+                {
+                    // World unloading mid-coroutine: flush remaining cars immediately
+                    slice.Clear();
+                    for (int j = i; j < carsToDelete.Count; j++)
+                    {
+                        if (carsToDelete[j] != null) slice.Add(carsToDelete[j]);
+                    }
+                    if (slice.Count > 0)
+                    {
+                        SafeDeleteCars(slice, true);
+                    }
+                    break;
+                }
+
+                slice.Clear();
+                int end = Mathf.Min(i + TimeSlicedDespawnCarsPerFrame, carsToDelete.Count);
+                for (int j = i; j < end; j++)
+                {
+                    var c = carsToDelete[j];
+                    if (c != null) slice.Add(c);
+                }
+
+                if (slice.Count > 0)
+                {
+                    SafeDeleteCars(slice, true);
+                }
+
+                if (end < carsToDelete.Count)
+                {
+                    yield return null;
+                }
+            }
+
+            if (affectedTrainsets != null)
+            {
+                foreach (var ts in affectedTrainsets)
+                {
+                    if (ts != null)
+                    {
+                        ModCompatManager.UntagTrain(ts);
+                    }
+                }
+            }
+
+            if (Main.IsDebugLoggingEnabled)
+                Main.LogDebug(string.Format("[TrainDespawner] Time-sliced despawn completed for AI consist (Lead: {0}, Total Cars: {1}).", leadId, carCount));
+        }
+
+        /// <summary>
+        /// Multi-tier robust deletion of train cars.
+        /// Filters null and destroyed objects, attempts batch DeleteTrainCars, and falls back to per-car
+        /// deletion or direct GameObject destruction if CarSpawner encounters null logicCars.
+        /// </summary>
+        // CRITICAL INVARIANT [FLT-04]: Multi-tier safe deletion guarding against corrupted logicCar NREs (See GRAVEYARD.md)
+        public static void SafeDeleteCars(List<TrainCar> carsToDelete, bool forceInstant = true)
+        {
+            if (carsToDelete == null || carsToDelete.Count == 0 || CarSpawner.Instance == null)
+                return;
+
+            // 1. Sanitize list and pre-capture GUIDs/IDs before CarSpawner nulls car.logicCar in PrepareForDestroy
+            List<TrainCar> validCars = new List<TrainCar>();
+            List<string> preCapturedGuids = new List<string>();
+            List<string> preCapturedIds = new List<string>();
+            for (int i = 0; i < carsToDelete.Count; i++)
+            {
+                var c = carsToDelete[i];
+                if (c != null && c.gameObject != null && !validCars.Contains(c))
+                {
+                    validCars.Add(c);
+                    preCapturedGuids.Add(ModCompatManager.GetCarGuid(c));
+                    preCapturedIds.Add(ModCompatManager.GetCarId(c));
+                }
+            }
+
+            if (validCars.Count == 0) return;
+
+            // 2. Attempt batch deletion while AITrafficCarMarker and s_aiCars tags are still active
+            bool batchSucceeded = false;
+            try
+            {
+                CarSpawner.Instance.DeleteTrainCars(validCars, forceInstantDestroy: forceInstant);
+                batchSucceeded = true;
+            }
+            catch (Exception ex)
+            {
+                if (Main.IsWorldFullyLoaded)
+                {
+                    Main.LogWarning(string.Format("[TrainDespawner] Batch DeleteTrainCars threw {0}: {1}. Falling back to per-car deletion.", ex.GetType().Name, ex.Message));
+                }
+                else if (Main.IsDebugLoggingEnabled)
+                {
+                    Main.LogDebug(string.Format("[TrainDespawner] Teardown batch deletion threw {0}: {1}. Falling back to per-car deletion.", ex.GetType().Name, ex.Message));
+                }
+            }
+
+            if (batchSucceeded)
+            {
+                ModCompatManager.UntagCars(validCars, preCapturedGuids, preCapturedIds);
+            }
+
+            // 3. Fallback to per-car deletion if batch failed
+            if (!batchSucceeded)
+            {
+                for (int i = 0; i < validCars.Count; i++)
+                {
+                    var car = validCars[i];
+                    if (car == null || car.gameObject == null) continue;
+
+                    try
+                    {
+                        if (car.logicCar != null)
+                        {
+                            CarSpawner.Instance.DeleteCar(car);
+                        }
+                        else
+                        {
+                            // Missing logicCar causes vanilla NRE; destroy GameObject directly
+                            UnityEngine.Object.Destroy(car.gameObject);
+                        }
+                    }
+                    catch (Exception singleEx)
+                    {
+                        if (Main.ModEntry != null && Main.ModEntry.Logger != null)
+                        {
+                            Main.ModEntry.Logger.Warning(string.Format("[TrainDespawner] Single CarSpawner.DeleteCar failed for car '{0}' ({1}). Destroying GameObject directly.", ModCompatManager.GetCarId(car), singleEx.Message));
+                        }
+                        if (car.gameObject != null)
+                        {
+                            UnityEngine.Object.Destroy(car.gameObject);
+                        }
+                    }
+                }
+
+                ModCompatManager.UntagCars(validCars, preCapturedGuids, preCapturedIds);
             }
         }
 

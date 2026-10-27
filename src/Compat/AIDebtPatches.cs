@@ -31,10 +31,12 @@ namespace AITraffic.Compat
             {
                 try
                 {
-                    if (car != null && (TrainSpawner.IsCarSpawning(car) || ModCompatManager.IsAmbientAITrain(car)))
+                    // CRITICAL INVARIANT [FLT-06]: Check IsSpawningAmbientConsist in addition to IsCarSpawning(car) because
+                    // SimController.OnLogicCarInitialized fires synchronously inside CarSpawner.SpawnCar before RegisterSpawningCar.
+                    if (car != null && (TrainSpawner.IsSpawningAmbientConsist || TrainSpawner.IsCarSpawning(car) || ModCompatManager.IsAmbientAITrain(car)))
                     {
-                        if (Main.ModEntry != null && Main.ModEntry.Logger != null)
-                            Main.ModEntry.Logger.Log(string.Format("[AIDebt] Suppressed debt registration for ambient AI loco '{0}'.", car.ID));
+                        if (Main.IsDebugLoggingEnabled)
+                            Main.LogDebug(string.Format("[AIDebt] Suppressed debt registration for ambient AI loco '{0}'.", ModCompatManager.GetCarId(car)));
 
                         return false; // Do not track debt for ambient AI locomotives
                     }
@@ -72,16 +74,31 @@ namespace AITraffic.Compat
 
                     if (existing != null)
                     {
-                        if (existing.car != null && (TrainSpawner.IsCarSpawning(existing.car) || ModCompatManager.IsAmbientAITrain(existing.car) || ModCompatManager.IsAmbientAITrainId(existing.car.ID)))
+                        // CRITICAL INVARIANT [FLT-06]: TrainCar.PrepareForDestroy sets existing.car.logicCar = null before firing
+                        // OnDestroyCar -> StageLocoDebtOnLocoDestroy. Always fall back to existing.ID and debtData.id when GetCarId is empty.
+                        string existingCarId = existing.car != null ? ModCompatManager.GetCarId(existing.car) : string.Empty;
+                        if (string.IsNullOrEmpty(existingCarId) && !string.IsNullOrEmpty(existing.ID))
+                        {
+                            existingCarId = existing.ID;
+                        }
+                        if (string.IsNullOrEmpty(existingCarId))
+                        {
+                            var trackerData = locoDebtTrackerToStage.GetDebtData();
+                            if (trackerData != null && !string.IsNullOrEmpty(trackerData.id))
+                            {
+                                existingCarId = trackerData.id;
+                            }
+                        }
+
+                        if (TrainSpawner.IsSpawningAmbientConsist ||
+                            (existing.car != null && (TrainSpawner.IsCarSpawning(existing.car) || ModCompatManager.IsAmbientAITrain(existing.car))) ||
+                            (!string.IsNullOrEmpty(existingCarId) && (TrainSpawner.IsCarSpawning(existingCarId) || ModCompatManager.IsAmbientAITrainId(existingCarId))))
                         {
                             LocoDebtController.Instance.trackedLocosDebts.Remove(existing);
-                            if (CareerManagerDebtController.Instance != null)
-                            {
-                                CareerManagerDebtController.Instance.UnregisterDebt(existing);
-                            }
+                            SafeUnregisterDebt(existing);
 
-                            if (Main.ModEntry != null && Main.ModEntry.Logger != null)
-                                Main.ModEntry.Logger.Log(string.Format("[AIDebt] Suppressed staged destroyed debt on despawn of AI loco '{0}'.", existing.car.ID));
+                            if (Main.IsDebugLoggingEnabled)
+                                Main.LogDebug(string.Format("[AIDebt] Suppressed staged destroyed debt on despawn of AI loco '{0}'.", existingCarId));
 
                             return false; // Suppress creating StagedLocoDebt
                         }
@@ -125,8 +142,10 @@ namespace AITraffic.Compat
                 {
                     if (__instance != null)
                     {
+                        // CRITICAL INVARIANT [FLT-06]: Check IsSpawningAmbientConsist in addition to IsCarSpawning(trainCar) because
+                        // TrainCar.InitializeLogicCarRelatedScript fires synchronously inside CarSpawner.SpawnCar before RegisterSpawningCar.
                         var trainCar = __instance.GetComponent<TrainCar>();
-                        if (trainCar != null && (TrainSpawner.IsCarSpawning(trainCar) || ModCompatManager.IsAmbientAITrain(trainCar)))
+                        if (TrainSpawner.IsSpawningAmbientConsist || (trainCar != null && (TrainSpawner.IsCarSpawning(trainCar) || ModCompatManager.IsAmbientAITrain(trainCar))))
                         {
                             __instance.SetDummyDebtTracker();
                             return false;
@@ -157,10 +176,15 @@ namespace AITraffic.Compat
                 {
                     if (__instance != null)
                     {
+                        if (TrainSpawner.IsSpawningAmbientConsist)
+                        {
+                            return false;
+                        }
+
                         var data = __instance.GetDebtData();
                         if (data != null && !string.IsNullOrEmpty(data.id))
                         {
-                            if (ModCompatManager.IsAmbientAITrainId(data.id))
+                            if (TrainSpawner.IsCarSpawning(data.id) || ModCompatManager.IsAmbientAITrainId(data.id))
                             {
                                 return false; // Suppress fuel/oil/sand/wear accumulation for ambient AI
                             }
@@ -188,7 +212,7 @@ namespace AITraffic.Compat
             {
                 try
                 {
-                    if (car != null && (TrainSpawner.IsCarSpawning(car.ID) || ModCompatManager.IsAmbientAITrainId(car.ID)))
+                    if (car != null && (TrainSpawner.IsSpawningAmbientConsist || TrainSpawner.IsCarSpawning(car.ID) || ModCompatManager.IsAmbientAITrainId(car.ID)))
                     {
                         return false; // Suppress tracking ambient AI rolling stock as jobless cars
                     }
@@ -217,7 +241,7 @@ namespace AITraffic.Compat
                     if (debtTrackerCar != null)
                     {
                         var data = debtTrackerCar.GetDebtData();
-                        if (data != null && ModCompatManager.IsAmbientAITrainId(data.id))
+                        if (data != null && (TrainSpawner.IsSpawningAmbientConsist || TrainSpawner.IsCarSpawning(data.id) || ModCompatManager.IsAmbientAITrainId(data.id)))
                         {
                             return false; // Suppress creating staged debt for ambient AI cars
                         }
@@ -247,8 +271,8 @@ namespace AITraffic.Compat
                 {
                     if (debt != null && IsAmbientAIDebt(debt))
                     {
-                        if (Main.ModEntry != null && Main.ModEntry.Logger != null)
-                            Main.ModEntry.Logger.Log(string.Format("[AIDebt] Blocked ambient AI debt registration in CareerManager: ID='{0}', Type={1}", debt.ID, debt.GetType().Name));
+                        if (Main.IsDebugLoggingEnabled)
+                            Main.LogDebug(string.Format("[AIDebt] Blocked ambient AI debt registration in CareerManager: ID='{0}', Type={1}", debt.ID, debt.GetType().Name));
 
                         return false; // Strictly refuse to register ambient AI debt in player career ledger
                     }
@@ -293,34 +317,32 @@ namespace AITraffic.Compat
                 var locoDebt = debt as ExistingLocoDebt;
                 if (locoDebt != null)
                 {
-                    if (locoDebt.car != null && (TrainSpawner.IsCarSpawning(locoDebt.car) || ModCompatManager.IsAmbientAITrain(locoDebt.car)))
-                        return true;
-                    if (!string.IsNullOrEmpty(locoDebt.ID) && ModCompatManager.IsAmbientAITrainId(locoDebt.ID))
+                    // CRITICAL INVARIANT [FLT-12]: Live car => car-scoped checks only; ID fallback only when the car no longer exists.
+                    if (locoDebt.car != null)
+                    {
+                        if (TrainSpawner.IsCarSpawning(locoDebt.car) || ModCompatManager.IsAmbientAITrain(locoDebt.car))
+                            return true;
+                    }
+                    else if (!string.IsNullOrEmpty(locoDebt.ID) && (TrainSpawner.IsCarSpawning(locoDebt.ID) || ModCompatManager.IsAmbientAITrainId(locoDebt.ID)))
                         return true;
                 }
 
                 var ownedDebt = debt as ExistingOwnedCarDebt;
                 if (ownedDebt != null)
                 {
-                    if (ownedDebt.car != null && (TrainSpawner.IsCarSpawning(ownedDebt.car) || ModCompatManager.IsAmbientAITrain(ownedDebt.car)))
-                        return true;
-                    if (!string.IsNullOrEmpty(ownedDebt.ID) && ModCompatManager.IsAmbientAITrainId(ownedDebt.ID))
-                        return true;
-                }
-
-                var stagedLoco = debt as StagedLocoDebt;
-                if (stagedLoco != null)
-                {
-                    if (stagedLoco.locoDebtData != null && ModCompatManager.IsAmbientAITrainId(stagedLoco.locoDebtData.id))
+                    // CRITICAL INVARIANT [FLT-12]: Live car => car-scoped checks only; ID fallback only when the car no longer exists.
+                    if (ownedDebt.car != null)
+                    {
+                        if (TrainSpawner.IsCarSpawning(ownedDebt.car) || ModCompatManager.IsAmbientAITrain(ownedDebt.car))
+                            return true;
+                    }
+                    else if (!string.IsNullOrEmpty(ownedDebt.ID) && (TrainSpawner.IsCarSpawning(ownedDebt.ID) || ModCompatManager.IsAmbientAITrainId(ownedDebt.ID)))
                         return true;
                 }
 
-                var stagedOwned = debt as StagedOwnedCarDebt;
-                if (stagedOwned != null)
-                {
-                    if (stagedOwned.carDebtData != null && ModCompatManager.IsAmbientAITrainId(stagedOwned.carDebtData.id))
-                        return true;
-                }
+                // CRITICAL INVARIANT [FLT-12]: Staged debts (StagedLocoDebt / StagedOwnedCarDebt / StagedOtherDebt) are NEVER auto-hidden,
+                // cleared, or purged. Ambient debts are prevented at the source ([FLT-06] registration/staging prefixes).
+                // Supersedes the v0.2.8 [FLT-06] blanket staged purge (user decision 2026-10-24).
 
                 var otherDebt = debt as ExistingOtherDebt;
                 if (otherDebt != null)
@@ -331,29 +353,12 @@ namespace AITraffic.Compat
                         {
                             var tracker = otherDebt.joblessCarsTrackers[i];
                             var data = tracker != null ? tracker.GetDebtData() : null;
-                            if (data != null && ModCompatManager.IsAmbientAITrainId(data.id))
+                            if (data != null && (TrainSpawner.IsCarSpawning(data.id) || ModCompatManager.IsAmbientAITrainId(data.id)))
                             {
                                 otherDebt.joblessCarsTrackers.RemoveAt(i);
                             }
                         }
                         return otherDebt.joblessCarsTrackers.Count == 0;
-                    }
-                }
-
-                var stagedOther = debt as StagedOtherDebt;
-                if (stagedOther != null)
-                {
-                    if (stagedOther.joblessCarsDebtData != null)
-                    {
-                        for (int i = stagedOther.joblessCarsDebtData.Count - 1; i >= 0; i--)
-                        {
-                            var data = stagedOther.joblessCarsDebtData[i];
-                            if (data != null && ModCompatManager.IsAmbientAITrainId(data.id))
-                            {
-                                stagedOther.joblessCarsDebtData.RemoveAt(i);
-                            }
-                        }
-                        return stagedOther.joblessCarsDebtData.Count == 0;
                     }
                 }
             }
@@ -366,42 +371,92 @@ namespace AITraffic.Compat
             return false;
         }
 
+        // CRITICAL INVARIANT [FLT-06]: Never call CareerManagerDebtController.Instance.UnregisterDebt(debt) unconditionally.
+        // Vanilla UnregisterDebt logs Debug.LogError("Couldn't unregister debt, not found!") whenever the debt was blocked from
+        // entering currentZeroPricedDebts / currentNonZeroPricedDebts. Always verify list membership via SafeUnregisterDebt first.
+        public static void SafeUnregisterDebt(DisplayableDebt debt)
+        {
+            if (debt == null || CareerManagerDebtController.Instance == null) return;
+
+            var cmdc = CareerManagerDebtController.Instance;
+            var traverse = Traverse.Create(cmdc);
+            var zero = traverse.Field<List<DisplayableDebt>>("currentZeroPricedDebts").Value;
+            var nonZero = traverse.Field<List<DisplayableDebt>>("currentNonZeroPricedDebts").Value;
+            bool inZero = zero != null && zero.Contains(debt);
+            bool inNonZero = nonZero != null && nonZero.Contains(debt);
+            if (inZero || inNonZero)
+            {
+                cmdc.UnregisterDebt(debt);
+            }
+        }
+
         /// <summary>
-        /// Inspects the live game's debt controllers and purges any ambient AI debts.
-        /// Guaranteed safe: player locomotives, leased locos, and player-employed worker trains are NEVER touched.
+        /// Inspects the live game's debt controllers and purges any ambient AI debts and staged despawn debts.
+        /// Guaranteed safe: active player locomotives, leased locos, active jobs, and player-employed worker trains are NEVER touched.
         /// </summary>
         public static int ScrubActiveAIDebts()
         {
             int scrubbedCount = 0;
             try
             {
-                // 1. Scrub LocoDebtController tracked locos
-                if (LocoDebtController.Instance != null && LocoDebtController.Instance.trackedLocosDebts != null)
+                // 1. Scrub LocoDebtController tracked locos and staged destroyedLocosDebts
+                if (LocoDebtController.Instance != null)
                 {
-                    var debts = LocoDebtController.Instance.trackedLocosDebts;
-                    for (int i = debts.Count - 1; i >= 0; i--)
+                    if (LocoDebtController.Instance.trackedLocosDebts != null)
                     {
-                        var debt = debts[i];
-                        if (debt == null) continue;
-
-                        TrainCar loco = debt.car;
-                        if ((loco != null && (TrainSpawner.IsCarSpawning(loco) || ModCompatManager.IsAmbientAITrain(loco))) ||
-                            (!string.IsNullOrEmpty(debt.ID) && ModCompatManager.IsAmbientAITrainId(debt.ID)))
+                        var debts = LocoDebtController.Instance.trackedLocosDebts;
+                        for (int i = debts.Count - 1; i >= 0; i--)
                         {
-                            if (CareerManagerDebtController.Instance != null)
-                            {
-                                CareerManagerDebtController.Instance.UnregisterDebt(debt);
-                            }
-                            debts.RemoveAt(i);
-                            scrubbedCount++;
+                            var debt = debts[i];
+                            if (debt == null) continue;
 
-                            if (Main.ModEntry != null && Main.ModEntry.Logger != null)
-                                Main.ModEntry.Logger.Log(string.Format("[AIDebt] Scrubbed active ambient AI debt for loco '{0}'.", loco != null ? loco.ID : debt.ID));
+                            TrainCar loco = debt.car;
+                            // CRITICAL INVARIANT [FLT-12]: ID-based classification only when the tracked car no longer exists.
+                            if ((loco != null && (TrainSpawner.IsCarSpawning(loco) || ModCompatManager.IsAmbientAITrain(loco))) ||
+                                (loco == null && !string.IsNullOrEmpty(debt.ID) && (TrainSpawner.IsCarSpawning(debt.ID) || ModCompatManager.IsAmbientAITrainId(debt.ID))))
+                            {
+                                SafeUnregisterDebt(debt);
+                                debts.RemoveAt(i);
+                                scrubbedCount++;
+
+                                if (Main.IsDebugLoggingEnabled)
+                                    Main.LogDebug(string.Format("[AIDebt] Scrubbed active ambient AI debt for loco '{0}'.", loco != null ? ModCompatManager.GetCarId(loco) : debt.ID));
+                            }
                         }
                     }
+
+                    // [FLT-12]: destroyedLocosDebts (StagedLocoDebt) are never auto-purged; see IsAmbientAIDebt.
                 }
 
-                // 2. Scrub CareerManager current non-zero and zero priced debts
+                // 2. Scrub JobDebtController existing jobless car debts and staged deletedJoblessCarDebts
+                if (JobDebtController.Instance != null)
+                {
+                    if (JobDebtController.Instance.existingJoblessCarDebts != null)
+                    {
+                        var other = JobDebtController.Instance.existingJoblessCarDebts;
+                        if (other.joblessCarsTrackers != null)
+                        {
+                            for (int i = other.joblessCarsTrackers.Count - 1; i >= 0; i--)
+                            {
+                                var tracker = other.joblessCarsTrackers[i];
+                                var data = tracker != null ? tracker.GetDebtData() : null;
+                                if (data != null && (TrainSpawner.IsCarSpawning(data.id) || ModCompatManager.IsAmbientAITrainId(data.id)))
+                                {
+                                    other.joblessCarsTrackers.RemoveAt(i);
+                                    scrubbedCount++;
+                                }
+                            }
+                            if (other.joblessCarsTrackers.Count == 0)
+                            {
+                                SafeUnregisterDebt(other);
+                            }
+                        }
+                    }
+
+                    // [FLT-12]: deletedJoblessCarDebts (StagedOtherDebt) are never auto-purged; see IsAmbientAIDebt.
+                }
+
+                // 3. Scrub CareerManager current non-zero and zero priced debts
                 if (CareerManagerDebtController.Instance != null)
                 {
                     var traverse = Traverse.Create(CareerManagerDebtController.Instance);
@@ -413,7 +468,7 @@ namespace AITraffic.Compat
                             var debt = nonZero[i];
                             if (debt != null && IsAmbientAIDebt(debt))
                             {
-                                CareerManagerDebtController.Instance.UnregisterDebt(debt);
+                                SafeUnregisterDebt(debt);
                                 scrubbedCount++;
                             }
                         }
@@ -427,29 +482,15 @@ namespace AITraffic.Compat
                             var debt = zero[i];
                             if (debt != null && IsAmbientAIDebt(debt))
                             {
-                                CareerManagerDebtController.Instance.UnregisterDebt(debt);
+                                SafeUnregisterDebt(debt);
                                 scrubbedCount++;
                             }
                         }
                     }
-                }
 
-                // 3. Scrub JobDebtController existing jobless car debts
-                if (JobDebtController.Instance != null && JobDebtController.Instance.existingJoblessCarDebts != null)
-                {
-                    var other = JobDebtController.Instance.existingJoblessCarDebts;
-                    if (other.joblessCarsTrackers != null)
+                    if (scrubbedCount > 0)
                     {
-                        for (int i = other.joblessCarsTrackers.Count - 1; i >= 0; i--)
-                        {
-                            var tracker = other.joblessCarsTrackers[i];
-                            var data = tracker != null ? tracker.GetDebtData() : null;
-                            if (data != null && ModCompatManager.IsAmbientAITrainId(data.id))
-                            {
-                                other.joblessCarsTrackers.RemoveAt(i);
-                                scrubbedCount++;
-                            }
-                        }
+                        CareerManagerDebtController.Instance.RefreshExistingDebtsState();
                     }
                 }
             }
@@ -480,10 +521,7 @@ namespace AITraffic.Compat
                     var debt = staged[i];
                     if (debt == null) continue;
 
-                    if (CareerManagerDebtController.Instance != null)
-                    {
-                        CareerManagerDebtController.Instance.UnregisterDebt(debt);
-                    }
+                    SafeUnregisterDebt(debt);
                     staged.RemoveAt(i);
                     purgedCount++;
                 }

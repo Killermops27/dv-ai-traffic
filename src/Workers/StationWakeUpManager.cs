@@ -4,6 +4,7 @@ using UnityEngine;
 using AITraffic.Config;
 using AITraffic.Core;
 using AITraffic.Driver;
+using AITraffic.Compat;
 
 namespace AITraffic.Workers
 {
@@ -110,7 +111,7 @@ namespace AITraffic.Workers
                                     {
                                         string sName = station.stationInfo != null ? station.stationInfo.Name : station.name;
                                         Main.ModEntry.Logger.Log(string.Format("[StationWakeUp] Waking station '{0}' for approaching worker train '{1}' (dist: {2:F0}m).",
-                                            sName, task.LeadLocomotive.ID, Mathf.Sqrt(distSq)));
+                                            sName, ModCompatManager.GetCarId(task.LeadLocomotive), Mathf.Sqrt(distSq)));
                                     }
                                 }
                                 return true;
@@ -141,7 +142,7 @@ namespace AITraffic.Workers
                                 {
                                     string sName = station.stationInfo != null ? station.stationInfo.Name : station.name;
                                     Main.ModEntry.Logger.Log(string.Format("[StationWakeUp] Waking station '{0}' for approaching ambient train '{1}' (dist: {2:F0}m).",
-                                        sName, eng.TrainCar.ID, Mathf.Sqrt(distSq)));
+                                        sName, ModCompatManager.GetCarId(eng.TrainCar), Mathf.Sqrt(distSq)));
                                 }
                             }
                             return true;

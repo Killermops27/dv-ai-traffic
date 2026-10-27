@@ -8,6 +8,7 @@ using AITraffic.Driver;
 using AITraffic.Compat;
 using AITraffic.Navigation;
 using DV.ThingTypes;
+using DV.ThingTypes.TransitionHelpers;
 using DVSignal = Signals.Game.Signal;
 
 namespace AITraffic.Core
@@ -194,6 +195,54 @@ namespace AITraffic.Core
             s_staticFreightDestTracksCache.Clear();
         }
 
+        /// <summary>
+        /// Resets the spawning and dispatch state of the scheduler.
+        /// </summary>
+        public void ResetSpawningState()
+        {
+            _isDispatching = false;
+            _lastDispatchTime = -9999f;
+            ClearCaches();
+        }
+
+        /// <summary>
+        /// Checks whether the player has acquired the specified job license.
+        /// Corridors to/from all military bases (MB, HMB, MFMB) are strictly gated behind JobLicenses.Military1.
+        /// </summary>
+        public static bool IsLicenseAcquired(JobLicenses license)
+        {
+            try
+            {
+                if (LicenseManager.Instance == null)
+                    return false;
+
+                return LicenseManager.Instance.IsJobLicenseAcquired(license.ToV2());
+            }
+            catch (Exception)
+            {
+                return false;
+            }
+        }
+
+        public static bool IsLicenseAcquired(DV.UserLicenses.JobLicenses license)
+        {
+            return IsLicenseAcquired((JobLicenses)license);
+        }
+
+        /// <summary>
+        /// Identifies whether a station YardID belongs to any of the three gated military installations
+        /// ("MB", "HMB", "MFMB").
+        /// </summary>
+        // CRITICAL INVARIANT [FLT-11]: Gate all three military bases (MB, HMB, MFMB) behind Military1 license (See GRAVEYARD.md)
+        public static bool IsMilitaryYardId(string yardId)
+        {
+            if (string.IsNullOrEmpty(yardId)) return false;
+            return string.Equals(yardId, "MB", StringComparison.OrdinalIgnoreCase) ||
+                   string.Equals(yardId, "HMB", StringComparison.OrdinalIgnoreCase) ||
+                   string.Equals(yardId, "MFMB", StringComparison.OrdinalIgnoreCase) ||
+                   yardId.EndsWith("MB", StringComparison.OrdinalIgnoreCase);
+        }
+
         private void RecordDestination(string yardId)
         {
             if (string.IsNullOrEmpty(yardId)) return;
@@ -315,6 +364,12 @@ namespace AITraffic.Core
             if (settings == null || settings.Density == TrafficDensity.Off || maxTrains <= 0)
                 return;
 
+#if DEBUG
+            long __wdSchedStart = AITraffic.Diagnostics.HitchWatchdog.GetTimestamp();
+            long __wdSchedMem = AITraffic.Diagnostics.HitchWatchdog.GetCurrentMemory();
+            try {
+#endif
+
             if (activeTrainCount >= maxTrains)
                 return;
 
@@ -340,6 +395,11 @@ namespace AITraffic.Core
                 _lastDispatchTime = Time.time;
                 TryDispatchTrain(settings, activeTrainCount, maxTrains);
             }
+#if DEBUG
+            } finally {
+                AITraffic.Diagnostics.HitchWatchdog.RecordScheduler(__wdSchedStart, __wdSchedMem);
+            }
+#endif
         }
 
         /// <summary>
@@ -443,6 +503,7 @@ namespace AITraffic.Core
 
             // O(1) Fast-fail candidate filtration
             var playerOccupied = AITraffic.Navigation.SignalRegistry.GetPlayerOccupiedTracks((PlayerManager.Car != null) ? PlayerManager.Car.trainset : null);
+            bool hasMilitaryLicense = IsLicenseAcquired(DV.UserLicenses.JobLicenses.Military1);
             var candidateTracks = new List<RailTrack>();
             for (int i = 0; i < rawTracks.Count; i++)
             {
@@ -467,6 +528,20 @@ namespace AITraffic.Core
                 // 4. Grade & dead-end gate
                 var edge = AITraffic.Navigation.RailGraph.Instance.GetEdge(trk);
                 if (edge == null || Mathf.Abs(edge.Grade) > MaxSpawnInclineGrade) continue;
+
+                // CRITICAL INVARIANT [FLT-11]: Gate all three military bases (MB, HMB, MFMB) behind Military1 license (See GRAVEYARD.md)
+                if (!hasMilitaryLicense)
+                {
+                    if (edge.IsGatedMilitaryTrack || TrainSpawner.IsMilitaryTrack(trk))
+                        continue;
+
+                    var nearestCandStation = FindNearestStation(edge.MidPoint);
+                    if (nearestCandStation != null && nearestCandStation.stationInfo != null &&
+                        IsMilitaryYardId(nearestCandStation.stationInfo.YardID))
+                    {
+                        continue;
+                    }
+                }
 
                 bool isDeadEnd = (trk.inJunction == null && (edge.FromNode == null || edge.FromNode.IncidentEdges.Count <= 1)) ||
                                  (trk.outJunction == null && (edge.ToNode == null || edge.ToNode.IncidentEdges.Count <= 1));
@@ -525,6 +600,11 @@ namespace AITraffic.Core
             }
 
             var destStationCandidates = new List<StationController>(StationController.allStations);
+            // CRITICAL INVARIANT [FLT-11]: Gate all three military bases (MB, HMB, MFMB) behind Military1 license (See GRAVEYARD.md)
+            if (!IsLicenseAcquired(JobLicenses.Military1))
+            {
+                destStationCandidates.RemoveAll(s => s != null && s.stationInfo != null && IsMilitaryYardId(s.stationInfo.YardID));
+            }
             for (int i = destStationCandidates.Count - 1; i > 0; i--)
             {
                 int swapIdx = _rng.Next(0, i + 1);
@@ -635,6 +715,21 @@ namespace AITraffic.Core
                         if (path == null || !path.IsValid || path.Tracks == null || path.Tracks.Count < 3)
                             continue;
 
+                        // Intermediate track avoidance check: Ensure passing train routes never cut through intermediate loading/storage tracks!
+                        bool traversesStrictlyAvoided = false;
+                        for (int t = 1; t < path.Tracks.Count - 1; t++)
+                        {
+                            if (AITraffic.Navigation.Pathfinder.IsStrictlyAvoidedThroughTrack(path.Tracks[t]))
+                            {
+                                traversesStrictlyAvoided = true;
+                                break;
+                            }
+                        }
+                        if (traversesStrictlyAvoided || path.TotalDistance >= 500000f)
+                        {
+                            continue;
+                        }
+
                         // PREDICTIVE DEADLOCK & CONFLICT ANALYSIS
                         if (!PredictDeadlockConflict(candTrack, path, playerPos, occupiedSnapshot))
                         {
@@ -708,6 +803,10 @@ namespace AITraffic.Core
                             origYard = nearestStation.stationInfo.YardID ?? "";
                         }
 
+                        // CRITICAL INVARIANT [RGR-10]: Live occupancy re-check right before instantiation — the snapshot is frames old after async pathfinding.
+                        if (IsTrackOccupied(candTrack))
+                            continue;
+
                         AITraffic.Diagnostics.PerformanceProfiler.SetSchedulerState(string.Format("Spawning Passing Train on '{0}'", candTrack.name));
                         yield return TrafficManager.Instance.StartCoroutine(TrainSpawner.SpawnAITrainCoroutine(
                             candTrack,
@@ -755,9 +854,9 @@ namespace AITraffic.Core
                             if (distT < closestDist) closestDist = distT;
                         }
 
-                        if (Main.ModEntry != null && Main.ModEntry.Logger != null)
+                        if (Main.IsDebugLoggingEnabled)
                         {
-                            Main.ModEntry.Logger.Log(string.Format("[TrafficScheduler] Dispatched Omnipresent Passing Train ({0} -> {1}, Consist: {2}) on track '{3}' (Route: {4:F0}m, Closest to Player: {5:F0}m).",
+                            Main.LogDebug(string.Format("[TrafficScheduler] Dispatched Omnipresent Passing Train ({0} -> {1}, Consist: {2}) on track '{3}' (Route: {4:F0}m, Closest to Player: {5:F0}m).",
                                 origName, destName, consistType, candTrack.name, path.TotalDistance, closestDist));
                         }
 
@@ -769,9 +868,9 @@ namespace AITraffic.Core
                 if (stopSearches) break;
             }
 
-            if (Main.ModEntry != null && Main.ModEntry.Logger != null)
+            if (Main.IsDebugLoggingEnabled)
             {
-                Main.ModEntry.Logger.Log(string.Format("[TrafficScheduler] Passing train check: Evaluated {0} tracks ({1} path searches) near player but found no viable deadlock-free route.",
+                Main.LogDebug(string.Format("[TrafficScheduler] Passing train check: Evaluated {0} tracks ({1} path searches) near player but found no viable deadlock-free route.",
                     maxTracksToCheck, pathSearches));
             }
 
@@ -1039,7 +1138,8 @@ namespace AITraffic.Core
                 // --- PASSING TRAIN DISPATCH ---
                 // Spawns omnipresent passing trains on any valid track within 500m-1400m of the player,
                 // backed by the Predictive Deadlock Engine to guarantee zero head-on traps or blockages.
-                bool shouldTryPassing = (playerPos != Vector3.zero && (Main.Settings == null || Main.Settings.MoreTrainEncounters || _nextDispatchIsEncounter));
+                // CRITICAL INVARIANT [FLT-10]: Gate omnipresent passing encounters with && _nextDispatchIsEncounter so standard corridor traffic is never starved.
+                bool shouldTryPassing = (playerPos != Vector3.zero && (Main.Settings == null || Main.Settings.MoreTrainEncounters) && _nextDispatchIsEncounter);
                 if (shouldTryPassing)
                 {
                     bool passingSuccess = false;
@@ -1059,6 +1159,15 @@ namespace AITraffic.Core
 
                 // 1. Shuffle all predefined corridors
                 var corridorList = new List<TrafficCorridor>(s_corridors);
+
+                // Military Career License Gating: strictly exclude all corridors to/from military bases ("MB", "HMB", "MFMB") if license is not acquired
+                // CRITICAL INVARIANT [FLT-11]: Gate all three military bases (MB, HMB, MFMB) behind Military1 license (See GRAVEYARD.md)
+                if (!IsLicenseAcquired(JobLicenses.Military1))
+                {
+                    corridorList.RemoveAll(c => IsMilitaryYardId(c.OriginYardId) ||
+                                                IsMilitaryYardId(c.DestinationYardId));
+                }
+
                 for (int i = corridorList.Count - 1; i > 0; i--)
                 {
                     int swapIdx = _rng.Next(0, i + 1);
@@ -1206,6 +1315,10 @@ namespace AITraffic.Core
                     AIEngineer engineer = null;
                     bool spawnComplete = false;
 
+                    // CRITICAL INVARIANT [RGR-10]: Live occupancy re-check right before instantiation — the snapshot is frames old after async pathfinding.
+                    if (IsTrackOccupied(spawnTrack))
+                        continue;
+
                     AITraffic.Diagnostics.PerformanceProfiler.SetSchedulerState(string.Format("Spawning Corridor on '{0}'", spawnTrack.name));
                     yield return TrafficManager.Instance.StartCoroutine(TrainSpawner.SpawnAITrainCoroutine(
                         spawnTrack,
@@ -1247,8 +1360,8 @@ namespace AITraffic.Core
                     RecordDestination(corridor.DestinationYardId);
                     RecordOrigin(corridor.OriginYardId);
 
-                    if (Main.ModEntry != null && Main.ModEntry.Logger != null)
-                        Main.ModEntry.Logger.Log(string.Format("[TrafficScheduler] Dispatched Tier 1 Ambient Train ({0} -> {1}, Consist: {2}) on track '{3}' (Route: {4:F0}m, ShuntingMode: {5}).",
+                    if (Main.IsDebugLoggingEnabled)
+                        Main.LogDebug(string.Format("[TrafficScheduler] Dispatched Tier 1 Ambient Train ({0} -> {1}, Consist: {2}) on track '{3}' (Route: {4:F0}m, ShuntingMode: {5}).",
                             corridor.OriginYardId, corridor.DestinationYardId, corridor.PreferredConsist, spawnTrack.name, routePath.TotalDistance, startInShuntingMode));
 
                     if (Main.Settings != null && Main.Settings.MoreTrainEncounters)
@@ -1262,6 +1375,11 @@ namespace AITraffic.Core
 
                 // 3. Dynamic Fallback: Query all stations in the valley, prioritizing origin stations near the player and randomized destinations
                 var allStationList = new List<StationController>(StationController.allStations);
+                // CRITICAL INVARIANT [FLT-11]: Gate all three military bases (MB, HMB, MFMB) behind Military1 license (See GRAVEYARD.md)
+                if (!IsLicenseAcquired(JobLicenses.Military1))
+                {
+                    allStationList.RemoveAll(st => st != null && st.stationInfo != null && IsMilitaryYardId(st.stationInfo.YardID));
+                }
                 for (int i = allStationList.Count - 1; i > 0; i--)
                 {
                     int swapIdx = _rng.Next(0, i + 1);
@@ -1305,6 +1423,11 @@ namespace AITraffic.Core
                     // Build shuffled destination candidates
                     var destCandidates = new List<StationController>(StationController.allStations);
                     destCandidates.Remove(station);
+                    // CRITICAL INVARIANT [FLT-11]: Gate all three military bases (MB, HMB, MFMB) behind Military1 license (See GRAVEYARD.md)
+                    if (!IsLicenseAcquired(JobLicenses.Military1))
+                    {
+                        destCandidates.RemoveAll(st => st != null && st.stationInfo != null && IsMilitaryYardId(st.stationInfo.YardID));
+                    }
 
                     for (int i = destCandidates.Count - 1; i > 0; i--)
                     {
@@ -1438,6 +1561,10 @@ namespace AITraffic.Core
                             AIEngineer engineer = null;
                             bool spawnComplete = false;
 
+                            // CRITICAL INVARIANT [RGR-10]: Live occupancy re-check right before instantiation — the snapshot is frames old after async pathfinding.
+                            if (IsTrackOccupied(spawnTrack))
+                                continue;
+
                             AITraffic.Diagnostics.PerformanceProfiler.SetSchedulerState(string.Format("Spawning Fallback on '{0}'", spawnTrack.name));
                             yield return TrafficManager.Instance.StartCoroutine(TrainSpawner.SpawnAITrainCoroutine(
                                 spawnTrack,
@@ -1477,9 +1604,12 @@ namespace AITraffic.Core
                                 RecordDestination(destYard);
                                 RecordOrigin(origYard);
 
-                                if (Main.ModEntry != null && Main.ModEntry.Logger != null)
-                                    Main.ModEntry.Logger.Log(string.Format("[TrafficScheduler] Dispatched Dynamic Ambient Train ({0} -> {1}, Consist: {2}) on track '{3}' (Route: {4:F0}m, ShuntingMode: {5}).",
+                                // CRITICAL INVARIANT [LOG-01]: Zero Un-Gated Production Logging (See GRAVEYARD.md)
+                                if (Main.IsDebugLoggingEnabled)
+                                {
+                                    Main.LogDebug(string.Format("[TrafficScheduler] Dispatched Dynamic Ambient Train ({0} -> {1}, Consist: {2}) on track '{3}' (Route: {4:F0}m, ShuntingMode: {5}).",
                                         origName, destName, inferredConsist, spawnTrack.name, fallbackPath.TotalDistance, startInShuntingMode));
+                                }
 
                                 if (Main.Settings != null && Main.Settings.MoreTrainEncounters)
                                 {
@@ -1605,12 +1735,31 @@ namespace AITraffic.Core
                 return false;
             }
 
+            // Station central running/bypass lines (ending in [--]) are through-tracks, NOT avoided tracks
+            string name = track.name ?? "";
+            if (name.Contains("[--]") || name.EndsWith("--", StringComparison.OrdinalIgnoreCase) || name.EndsWith("--]", StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+
+            // Exclude specific known trapped yard-neck connector tracks (such as Farm '[#] Road 77')
+            if (name.IndexOf("Road 77", StringComparison.OrdinalIgnoreCase) >= 0 && track.curve.length < 135f)
+            {
+                return false;
+            }
+
             // 1. Check LogicTrack if registered in station
             var logicTrack = ModCompatManager.GetLogicTrack(track);
             if (logicTrack != null && logicTrack.ID != null)
             {
                 string part = logicTrack.ID.TrackPartOnly;
                 string display = logicTrack.ID.FullDisplayID ?? "";
+
+                // Central running lines in logic track
+                if (display.Contains("[--]") || display.EndsWith("--", StringComparison.OrdinalIgnoreCase) || display.EndsWith("--]", StringComparison.OrdinalIgnoreCase))
+                {
+                    return true;
+                }
 
                 // Mainline through track ([#] or TrackID.MAIN_LINE_TYPE)
                 if (part == DV.Logic.Job.TrackID.MAIN_LINE_TYPE || display.Contains("[#]"))
@@ -1634,14 +1783,6 @@ namespace AITraffic.Core
             }
 
             // 2. Name heuristics
-            string name = track.name ?? "";
-
-            // Exclude short internal yard neck tracks (like "[#] Road 77" at Farm, 128m) trapped between yard switches
-            if (track.curve != null && track.curve.length < 150f && name.IndexOf("Road", StringComparison.OrdinalIgnoreCase) >= 0)
-            {
-                return false;
-            }
-
             if (name.Contains("[#]") || name.IndexOf("Main", StringComparison.OrdinalIgnoreCase) >= 0)
             {
                 return true;
@@ -1649,6 +1790,19 @@ namespace AITraffic.Core
             if (name.StartsWith("[Y]") || name.StartsWith("[S]") || name.StartsWith("[L]") || 
                 name.StartsWith("[I]") || name.StartsWith("[O]") || name.StartsWith("[P]") ||
                 name.StartsWith("[C]") || name.StartsWith("[E]") || name.StartsWith("[T]") ||
+                name.EndsWith("-O]", StringComparison.OrdinalIgnoreCase) ||
+                name.EndsWith("-I]", StringComparison.OrdinalIgnoreCase) ||
+                name.EndsWith("-S]", StringComparison.OrdinalIgnoreCase) ||
+                name.EndsWith("-L]", StringComparison.OrdinalIgnoreCase) ||
+                name.EndsWith("-P]", StringComparison.OrdinalIgnoreCase) ||
+                name.EndsWith("-C]", StringComparison.OrdinalIgnoreCase) ||
+                name.EndsWith("-T]", StringComparison.OrdinalIgnoreCase) ||
+                name.IndexOf("_[O]", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                name.IndexOf("_[I]", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                name.IndexOf("_[S]", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                name.IndexOf("_[L]", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                name.IndexOf("_[C]", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                name.IndexOf("_[T]", StringComparison.OrdinalIgnoreCase) >= 0 ||
                 name.IndexOf("Siding", StringComparison.OrdinalIgnoreCase) >= 0 ||
                 name.IndexOf("Spur", StringComparison.OrdinalIgnoreCase) >= 0 ||
                 name.IndexOf("Storage", StringComparison.OrdinalIgnoreCase) >= 0 ||
@@ -2223,6 +2377,7 @@ namespace AITraffic.Core
             if (AITraffic.Navigation.RailGraph.Instance != null && AITraffic.Navigation.RailGraph.Instance.Edges != null)
             {
                 Vector3 origPos = originStation.transform.position;
+                bool hasMilitaryLicense = IsLicenseAcquired(DV.UserLicenses.JobLicenses.Military1);
                 var edges = AITraffic.Navigation.RailGraph.Instance.Edges;
                 for (int i = 0; i < edges.Count; i++)
                 {
@@ -2231,9 +2386,26 @@ namespace AITraffic.Core
                     var t = edge.Track;
                     if (t.curve == null || t.curve.length < 75f) continue;
 
+                    // CRITICAL INVARIANT [FLT-11]: Never annex gated military tracks into adjacent civilian station departures (See GRAVEYARD.md)
+                    if (!hasMilitaryLicense && (edge.IsGatedMilitaryTrack || TrainSpawner.IsMilitaryTrack(t)))
+                        continue;
+
                     // Spatial distance check using physical curve midpoint FIRST to skip ~98% of tracks immediately
                     Vector3 trackMid = edge.MidPoint;
                     if (Vector3.Distance(trackMid, origPos) > 1500f) continue;
+
+                    // Station affinity check: Ensure track is closer to originStation than to any other station (within 250m margin)
+                    var nearestSt = FindNearestStation(trackMid);
+                    if (nearestSt != null && nearestSt != originStation)
+                    {
+                        if (!hasMilitaryLicense && nearestSt.stationInfo != null && IsMilitaryYardId(nearestSt.stationInfo.YardID))
+                            continue;
+
+                        float dOrig = Vector3.Distance(trackMid, origPos);
+                        float dNear = Vector3.Distance(trackMid, nearestSt.transform.position);
+                        if (dNear + 250f < dOrig)
+                            continue;
+                    }
 
                     // Exclude steep mainline edges (> 0.5% grade)
                     if (Mathf.Abs(edge.Grade) > 0.5f) continue;
@@ -2241,6 +2413,22 @@ namespace AITraffic.Core
                     if (IsDeadEndTrack(t) || ModCompatManager.IsTrackActiveYardZone(t)) continue;
 
                     if (IsThroughOrMainlineTrack(t) && !list.Contains(t))
+                    {
+                        list.Add(t);
+                    }
+                }
+            }
+
+            // 3. Tier 2 Fallback: If no Tier 1 through/mainline tracks were found, fall back to station Inbound receiving tracks ([I])
+            if (list.Count == 0 && originStation.AllStationTracks != null)
+            {
+                for (int i = 0; i < originStation.AllStationTracks.Count; i++)
+                {
+                    var t = originStation.AllStationTracks[i];
+                    if (t == null || t.curve == null || t.curve.length < 75f) continue;
+                    if (IsDeadEndTrack(t) || ModCompatManager.IsTrackActiveYardZone(t)) continue;
+
+                    if (IsInboundTrack(t, originStation) && !list.Contains(t))
                     {
                         list.Add(t);
                     }
@@ -2256,6 +2444,10 @@ namespace AITraffic.Core
             var results = new List<RailTrack>();
             if (originStation == null) return results;
 
+            // CRITICAL INVARIANT [FLT-11]: Gate all three military bases (MB, HMB, MFMB) behind Military1 license (See GRAVEYARD.md)
+            if (originStation.stationInfo != null && IsMilitaryYardId(originStation.stationInfo.YardID) && !IsLicenseAcquired(JobLicenses.Military1))
+                return results;
+
             var staticTracks = GetStaticDepartureTracks(originStation);
             if (staticTracks != null)
             {
@@ -2268,6 +2460,25 @@ namespace AITraffic.Core
                     }
                 }
             }
+
+            // Tier 2 Dynamic Fallback: If static departure tracks yielded no clear or sufficiently long candidates,
+            // query clear station Inbound receiving tracks ([I])
+            if (results.Count == 0 && originStation.AllStationTracks != null)
+            {
+                for (int i = 0; i < originStation.AllStationTracks.Count; i++)
+                {
+                    var t = originStation.AllStationTracks[i];
+                    if (t == null || t.curve == null || t.curve.length < minLength) continue;
+                    if (IsDeadEndTrack(t) || IsTrackOccupied(t, occupiedSnapshot) || ModCompatManager.IsTrackActiveYardZone(t)) continue;
+
+                    if (IsInboundTrack(t, originStation) && !results.Contains(t))
+                    {
+                        results.Add(t);
+                    }
+                }
+            }
+
+            results = AITraffic.Fleet.TrainSpawner.FilterCandidateSpawnTracks(results);
 
             // Separate candidate tracks into flat departure tracks (grade <= MaxSpawnInclineGrade) and others
             var flatTracks = new List<RailTrack>();
@@ -2301,118 +2512,6 @@ namespace AITraffic.Core
 
             flatTracks.AddRange(otherTracks);
             return flatTracks;
-        }
-
-        private static RailTrack FindClearDepartureTrack(
-            StationController station,
-            StationController destStation,
-            float minLength,
-            out RailPath routePath,
-            ConsistType consistType = ConsistType.RegionalFreight,
-            HashSet<RailTrack> occupiedSnapshot = null)
-        {
-            routePath = null;
-            if (station == null) return null;
-
-            if (occupiedSnapshot == null)
-            {
-                occupiedSnapshot = (AITraffic.Navigation.RailGraph.Instance != null)
-                    ? AITraffic.Navigation.RailGraph.BuildOccupiedTracksSnapshot()
-                    : new HashSet<RailTrack>();
-            }
-
-            var depTracks = GetCandidateDepartureTracks(station, minLength, occupiedSnapshot);
-            if (depTracks == null || depTracks.Count == 0) return null;
-
-            if (destStation == null)
-            {
-                return depTracks[0];
-            }
-
-            var destTracks = GetCandidateDestinationTracks(destStation, consistType, occupiedSnapshot);
-            if (destTracks == null || destTracks.Count == 0) return null;
-
-            // Randomize destination tracks so arrivals don't always target the identical siding
-            for (int i = destTracks.Count - 1; i > 0; i--)
-            {
-                int r = UnityEngine.Random.Range(0, i + 1);
-                var temp = destTracks[i];
-                destTracks[i] = destTracks[r];
-                destTracks[r] = temp;
-            }
-
-            float directStationDist = Vector3.Distance(station.transform.position, destStation.transform.position);
-            // Multi-station corridors MUST span a realistic distance between stations (at least 45% of direct Euclidean distance)
-            float minCorridorDist = Mathf.Max(350f, directStationDist * 0.45f);
-
-            var playerOccupied = AITraffic.Navigation.SignalRegistry.GetPlayerOccupiedTracks();
-            Vector3 playerPos = AITraffic.Navigation.SignalRegistry.GetPlayerPosition();
-            var pathfinder = new AITraffic.Navigation.Pathfinder();
-            var pathOptions = new AITraffic.Navigation.PathfinderOptions
-            {
-                StrictlyAvoidOccupied = true,
-                OccupiedTracksSnapshot = occupiedSnapshot,
-                PlayerOccupiedTracksSnapshot = playerOccupied,
-                PlayerPosition = playerPos,
-                ConsistLength = minLength
-            };
-
-            // Evaluate up to top 3 departure tracks and top 2 destination tracks to eliminate lag spikes while giving rich track variety
-            int maxDep = Math.Min(3, depTracks.Count);
-            int maxDest = Math.Min(2, destTracks.Count);
-
-            for (int i = 0; i < maxDep; i++)
-            {
-                var depTrack = depTracks[i];
-                if (depTrack == null || depTrack.curve == null || depTrack.curve.length < minLength) continue;
-
-                for (int d = 0; d < maxDest; d++)
-                {
-                    var dt = destTracks[d];
-                    if (depTrack == dt) continue;
-
-                    var path = pathfinder.FindPath(depTrack, dt, pathOptions);
-                    if (path != null && path.IsValid && path.Tracks.Count > 0 && path.TotalDistance >= minCorridorDist)
-                    {
-                        // Check if candidate route traverses any strictly avoided loading tracks ([L]) or turntables ([T])
-                        bool traversesStrictlyAvoided = false;
-                        for (int t = 0; t < path.Tracks.Count; t++)
-                        {
-                            if (AITraffic.Navigation.Pathfinder.IsStrictlyAvoidedThroughTrack(path.Tracks[t]))
-                            {
-                                traversesStrictlyAvoided = true;
-                                break;
-                            }
-                        }
-                        if (traversesStrictlyAvoided || path.TotalDistance >= 500000f)
-                        {
-                            if (Main.ModEntry != null && Main.ModEntry.Logger != null)
-                            {
-                                Main.ModEntry.Logger.Log(string.Format("Skipping spawn track '{0}' to '{1}': Route traverses strictly avoided loading track or has excessive penalty distance ({2:F0}m).",
-                                    depTrack.name, dt.name, path.TotalDistance));
-                            }
-                            continue;
-                        }
-
-                        // Check departure incline: Declines and flat tracks are okay, but NO steep inclines!
-                        float depGrade = CalculateDepartureGrade(path);
-                        if (depGrade > MaxSpawnInclineGrade)
-                        {
-                            if (Main.ModEntry != null && Main.ModEntry.Logger != null)
-                            {
-                                Main.ModEntry.Logger.Log(string.Format("Skipping spawn track '{0}' to '{1}': Departure has steep incline (+{2:F2}% grade > {3:F2}% threshold).",
-                                    depTrack.name, dt.name, depGrade, MaxSpawnInclineGrade));
-                            }
-                            continue; // Skip this track, search for a flat track or decline!
-                        }
-
-                        routePath = path;
-                        return depTrack;
-                    }
-                }
-            }
-
-            return null;
         }
 
         private static System.Collections.IEnumerator FindClearDepartureTrackCoroutine(
@@ -2490,6 +2589,13 @@ namespace AITraffic.Core
                 var depTrack = depTracks[i];
                 if (depTrack == null || depTrack.curve == null || depTrack.curve.length < minLength) continue;
 
+                // Ensure departure track makes forward progress toward destination (not located far in the opposite direction)
+                Vector3 depMid = depTrack.curve.GetPointAt(0.5f);
+                if (destStation != null && Vector3.Distance(depMid, destStation.transform.position) > directStationDist + 250f)
+                {
+                    continue;
+                }
+
                 for (int d = 0; d < maxDest; d++)
                 {
                     var dt = destTracks[d];
@@ -2507,7 +2613,7 @@ namespace AITraffic.Core
                     {
                         // Check if candidate route traverses any strictly avoided loading tracks ([L]) or turntables ([T])
                         bool traversesStrictlyAvoided = false;
-                        for (int t = 0; t < path.Tracks.Count; t++)
+                        for (int t = 1; t < path.Tracks.Count - 1; t++)
                         {
                             if (AITraffic.Navigation.Pathfinder.IsStrictlyAvoidedThroughTrack(path.Tracks[t]))
                             {
@@ -2517,9 +2623,10 @@ namespace AITraffic.Core
                         }
                         if (traversesStrictlyAvoided || path.TotalDistance >= 500000f)
                         {
-                            if (Main.ModEntry != null && Main.ModEntry.Logger != null)
+                            // CRITICAL INVARIANT [LOG-01]: Zero Un-Gated Production Logging (See GRAVEYARD.md)
+                            if (Main.IsDebugLoggingEnabled)
                             {
-                                Main.ModEntry.Logger.Log(string.Format("Skipping spawn track '{0}' to '{1}': Route traverses strictly avoided loading track or has excessive penalty distance ({2:F0}m).",
+                                Main.LogDebug(string.Format("Skipping spawn track '{0}' to '{1}': Route traverses strictly avoided loading track or has excessive penalty distance ({2:F0}m).",
                                     depTrack.name, dt.name, path.TotalDistance));
                             }
                             continue;
@@ -2529,9 +2636,10 @@ namespace AITraffic.Core
                         float depGrade = CalculateDepartureGrade(path);
                         if (depGrade > MaxSpawnInclineGrade)
                         {
-                            if (Main.ModEntry != null && Main.ModEntry.Logger != null)
+                            // CRITICAL INVARIANT [LOG-01]: Zero Un-Gated Production Logging (See GRAVEYARD.md)
+                            if (Main.IsDebugLoggingEnabled)
                             {
-                                Main.ModEntry.Logger.Log(string.Format("Skipping spawn track '{0}' to '{1}': Departure has steep incline (+{2:F2}% grade > {3:F2}% threshold).",
+                                Main.LogDebug(string.Format("Skipping spawn track '{0}' to '{1}': Departure has steep incline (+{2:F2}% grade > {3:F2}% threshold).",
                                     depTrack.name, dt.name, depGrade, MaxSpawnInclineGrade));
                             }
                             continue; // Skip this track, search for a flat track or decline!

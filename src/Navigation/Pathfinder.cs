@@ -4,8 +4,81 @@ using System.Linq;
 using System.Threading.Tasks;
 using UnityEngine;
 
+namespace DV.UserLicenses
+{
+    [Flags]
+    public enum JobLicenses
+    {
+        Basic = 0,
+        Hazmat1 = 1,
+        Hazmat2 = 2,
+        Hazmat3 = 4,
+        Military1 = 8,
+        Military2 = 16,
+        Military3 = 32,
+        FreightHaul = 512,
+        Shunting = 1024,
+        LogisticalHaul = 2048,
+        TrainLength1 = 16384,
+        TrainLength2 = 32768,
+        Fragile = 262144
+    }
+}
+
 namespace AITraffic.Navigation
 {
+    /// <summary>
+    /// License manager compatibility wrapper for career progression gating.
+    /// </summary>
+    public static class LicenseManager
+    {
+        public static global::LicenseManager Instance
+        {
+            get { return global::LicenseManager.Instance; }
+        }
+
+        public static bool IsLicenseAcquired(DV.UserLicenses.JobLicenses license)
+        {
+            return IsLicenseAcquired((DV.ThingTypes.JobLicenses)license);
+        }
+
+        public static bool IsLicenseAcquired(DV.ThingTypes.JobLicenses license)
+        {
+            try
+            {
+                var lm = global::LicenseManager.Instance;
+                if (lm == null) return false;
+                var acquired = lm.GetAcquiredJobLicenses();
+                if (acquired != null)
+                {
+                    foreach (var lic in acquired)
+                    {
+                        if (lic != null && (lic.v1 == license || (lic.id != null && lic.id.Equals(license.ToString(), StringComparison.OrdinalIgnoreCase))))
+                        {
+                            return true;
+                        }
+                    }
+                }
+            }
+            catch (Exception)
+            {
+            }
+            return false;
+        }
+    }
+
+    public static class LicenseManagerExtensions
+    {
+        public static bool IsLicenseAcquired(this global::LicenseManager manager, DV.UserLicenses.JobLicenses license)
+        {
+            return LicenseManager.IsLicenseAcquired(license);
+        }
+
+        public static bool IsLicenseAcquired(this global::LicenseManager manager, DV.ThingTypes.JobLicenses license)
+        {
+            return LicenseManager.IsLicenseAcquired(license);
+        }
+    }
     /// <summary>
     /// Configuration options for A* rail pathfinding.
     /// </summary>
@@ -128,6 +201,11 @@ namespace AITraffic.Navigation
         public Vector3 PlayerPosition { get; set; }
 
         /// <summary>
+        /// Main-thread snapshot of whether the Military 1 career license is acquired.
+        /// </summary>
+        public bool? HasMilitaryLicenseSnapshot { get; set; }
+
+        /// <summary>
         /// Total physical length of the consist in meters. Used to prune loops too short for the train to fit.
         /// </summary>
         public float ConsistLength { get; set; }
@@ -135,8 +213,8 @@ namespace AITraffic.Navigation
         public PathfinderOptions()
         {
             AllowWrongDirection = true;
-            WrongDirectionFlatPenalty = 1500f;
-            WrongDirectionMultiplier = 3.0f;
+            WrongDirectionFlatPenalty = 5000f;
+            WrongDirectionMultiplier = 2.0f;
             AvoidOccupiedTracks = true;
             OccupiedTrackPenalty = 10000000f;
             StrictlyAvoidOccupied = true;
@@ -152,8 +230,9 @@ namespace AITraffic.Navigation
             OccupiedTracksSnapshot = null;
             PlayerOccupiedTracksSnapshot = null;
             PlayerPosition = Vector3.zero;
+            HasMilitaryLicenseSnapshot = null;
             TurnoutDivergingPenalty = 40f;
-            CrossoverPenalty = 0f;
+            CrossoverPenalty = 1500f;
             YardTrackPenaltyPerMeter = 1.5f;
             PreferSpeedOverDistance = true;
             MaxSearchDistance = 5000000f;
@@ -181,6 +260,7 @@ namespace AITraffic.Navigation
                 OccupiedTracksSnapshot = this.OccupiedTracksSnapshot,
                 PlayerOccupiedTracksSnapshot = this.PlayerOccupiedTracksSnapshot != null ? new HashSet<RailTrack>(this.PlayerOccupiedTracksSnapshot) : null,
                 PlayerPosition = this.PlayerPosition,
+                HasMilitaryLicenseSnapshot = this.HasMilitaryLicenseSnapshot,
                 TurnoutDivergingPenalty = this.TurnoutDivergingPenalty,
                 CrossoverPenalty = this.CrossoverPenalty,
                 YardTrackPenaltyPerMeter = this.YardTrackPenaltyPerMeter,
@@ -373,12 +453,23 @@ namespace AITraffic.Navigation
 
         private static void LogWarning(string msg)
         {
-            Debug.LogWarning("[AITraffic] " + msg);
+            Main.LogWarning("[AITraffic] " + msg);
         }
 
+        private static readonly object s_logLock = new object();
+
+        // CRITICAL INVARIANT [RGR-03] & [LOG-01]: Thread-safe debug logging gated by Main.IsDebugLoggingEnabled.
+        private static void SafeLog(string msg)
+        {
+            if (!Main.IsDebugLoggingEnabled) return;
+            Main.LogDebug(msg);
+        }
+
+        // CRITICAL INVARIANT [RGR-03]: All live Unity state must be snapshotted on the Main Thread before dispatching background pathfinding tasks (See GRAVEYARD.md)
         private static void EnsureOptionsSnapshots(PathfinderOptions options, RailGraph graph)
         {
             if (options == null) return;
+            InitializeStationYardCache();
             if (options.OccupiedTracksSnapshot == null && graph != null)
             {
                 options.OccupiedTracksSnapshot = RailGraph.BuildOccupiedTracksSnapshot(options.RequesterTrainset);
@@ -390,6 +481,74 @@ namespace AITraffic.Navigation
             if (options.PlayerPosition == Vector3.zero)
             {
                 options.PlayerPosition = SignalRegistry.GetPlayerPosition();
+            }
+            if (!options.HasMilitaryLicenseSnapshot.HasValue)
+            {
+                options.HasMilitaryLicenseSnapshot = LicenseManager.IsLicenseAcquired(DV.UserLicenses.JobLicenses.Military1);
+            }
+        }
+
+        // CRITICAL INVARIANT [RGR-09]: Scheduler-scoped negative-result cache. A start/destination pair whose async search returned
+        // no valid path is skipped for UnreachablePairCacheTtlMs. Keys are computed on the Main Thread only; expiry uses
+        // Environment.TickCount (thread-safe, no Unity API on background threads per [RGR-03]). Never apply to synchronous FindPath.
+        private const int UnreachablePairCacheTtlMs = 30000;
+        private const int UnreachablePairCacheMaxEntries = 512;
+        private static readonly Dictionary<long, int> s_unreachablePairExpiry = new Dictionary<long, int>();
+        private static readonly object s_unreachablePairLock = new object();
+
+        // Main Thread only (GetInstanceID).
+        private static long GetUnreachablePairKey(RailTrack startTrack, RailTrack destinationTrack)
+        {
+            return ((long)startTrack.GetInstanceID() << 32) | (uint)destinationTrack.GetInstanceID();
+        }
+
+        private static bool IsUnreachablePairCached(long pairKey)
+        {
+            lock (s_unreachablePairLock)
+            {
+                int expiry;
+                if (s_unreachablePairExpiry.TryGetValue(pairKey, out expiry))
+                {
+                    if (unchecked(expiry - Environment.TickCount) > 0) return true;
+                    s_unreachablePairExpiry.Remove(pairKey);
+                }
+                return false;
+            }
+        }
+
+        private static void CacheUnreachablePair(long pairKey)
+        {
+            lock (s_unreachablePairLock)
+            {
+                if (s_unreachablePairExpiry.Count >= UnreachablePairCacheMaxEntries)
+                {
+                    int now = Environment.TickCount;
+                    var expired = new List<long>();
+                    foreach (var kvp in s_unreachablePairExpiry)
+                    {
+                        if (unchecked(kvp.Value - now) <= 0) expired.Add(kvp.Key);
+                    }
+                    for (int i = 0; i < expired.Count; i++)
+                    {
+                        s_unreachablePairExpiry.Remove(expired[i]);
+                    }
+                    if (s_unreachablePairExpiry.Count >= UnreachablePairCacheMaxEntries)
+                    {
+                        s_unreachablePairExpiry.Clear();
+                    }
+                }
+                s_unreachablePairExpiry[pairKey] = unchecked(Environment.TickCount + UnreachablePairCacheTtlMs);
+            }
+        }
+
+        /// <summary>
+        /// Flushes the scheduler negative-result cache. Must be called on scene unload (VISION §5.2 static collection hygiene).
+        /// </summary>
+        public static void ClearUnreachablePairCache()
+        {
+            lock (s_unreachablePairLock)
+            {
+                s_unreachablePairExpiry.Clear();
             }
         }
 
@@ -414,13 +573,25 @@ namespace AITraffic.Navigation
             {
                 graph.Initialize();
             }
+            // [RGR-09]: Skip pairs proven unreachable within the last 30 s (key computed on Main Thread)
+            long pairKey = GetUnreachablePairKey(startTrack, destinationTrack);
+            if (IsUnreachablePairCached(pairKey))
+            {
+                return Task.FromResult<RailPath>(null);
+            }
+
             EnsureOptionsSnapshots(opts, graph);
 
             return Task.Run(() =>
             {
                 if (cancellationToken.IsCancellationRequested) return null;
                 var pf = new Pathfinder(graph);
-                return pf.FindPath(startTrack, destinationTrack, opts);
+                var result = pf.FindPath(startTrack, destinationTrack, opts);
+                if (result == null || !result.IsValid)
+                {
+                    CacheUnreachablePair(pairKey);
+                }
+                return result;
             }, cancellationToken);
         }
 
@@ -618,6 +789,7 @@ namespace AITraffic.Navigation
             }
 
             options = options ?? PathfinderOptions.Default;
+            EnsureOptionsSnapshots(options, _graph);
             return RunAStar(null, startNode, destinationNode, options);
         }
 
@@ -908,7 +1080,8 @@ namespace AITraffic.Navigation
 
                     float traversalCost;
                     byte requiredBranch;
-                    if (!EvaluateEdgeCost(edge, current.Node, nextNode, current.IncomingEdge, initialEdge, destEdge, options, occupiedSnapshot, requesterTracks, out traversalCost, out requiredBranch))
+                    if (!EvaluateEdgeCost(edge, current.Node, nextNode, current.IncomingEdge, initialEdge, destEdge, options, occupiedSnapshot, requesterTracks, out traversalCost, out requiredBranch) ||
+                        float.IsPositiveInfinity(traversalCost))
                     {
                         continue;
                     }
@@ -975,41 +1148,39 @@ namespace AITraffic.Navigation
 #if DEBUG
             stopwatch.Stop();
             long searchDurationMs = stopwatch.ElapsedMilliseconds;
-            string startTrackName = initialEdge != null && initialEdge.Track != null ? initialEdge.Track.name : "null";
-            string destTrackName = destEdge != null && destEdge.Track != null ? destEdge.Track.name : "null";
+            string startTrackName = initialEdge != null ? initialEdge.TrackName : "null";
+            string destTrackName = destEdge != null ? destEdge.TrackName : "null";
             AITraffic.Diagnostics.PerformanceProfiler.RecordPathSearch(searchDurationMs, exploredNodes, startTrackName, destTrackName, goalNode != null);
 
-            if (searchDurationMs > 15 && AITraffic.Main.ModEntry != null && AITraffic.Main.ModEntry.Logger != null)
+            if (searchDurationMs > 15)
             {
-                AITraffic.Main.ModEntry.Logger.Log(string.Format("[AITraffic-Perf] SLOW PathSearch: {0}ms ({1} nodes explored) '{2}' -> '{3}' (Found: {4})",
+                SafeLog(string.Format("[AITraffic-Perf] SLOW PathSearch: {0}ms ({1} nodes explored) '{2}' -> '{3}' (Found: {4})",
                     searchDurationMs, exploredNodes, startTrackName, destTrackName, goalNode != null));
             }
 #endif
 
             if (goalNode == null)
             {
-                if (AITraffic.Main.ModEntry != null && AITraffic.Main.ModEntry.Logger != null)
-                {
-                    string startTrk = initialEdge != null && initialEdge.Track != null ? initialEdge.Track.name : "null";
-                    string destTrk = destEdge != null && destEdge.Track != null ? destEdge.Track.name : "null";
-                    AITraffic.Main.ModEntry.Logger.Log(string.Format("[Pathfinder] Route search failed: '{0}' -> '{1}'. Explored: {2}, OpenRemaining: {3}, MaxG: {4:F0}, PrunedDist: {5}, PrunedBestG: {6}.",
-                        startTrk, destTrk, exploredNodes, openSet.Count, maxGScoreReached, prunedByDist, prunedByBestG));
-                }
+                string startTrk = initialEdge != null ? initialEdge.TrackName : "null";
+                string destTrk = destEdge != null ? destEdge.TrackName : "null";
+                SafeLog(string.Format("[Pathfinder] Route search failed: '{0}' -> '{1}'. Explored: {2}, OpenRemaining: {3}, MaxG: {4:F0}, PrunedDist: {5}, PrunedBestG: {6}.",
+                    startTrk, destTrk, exploredNodes, openSet.Count, maxGScoreReached, prunedByDist, prunedByBestG));
                 return null;
             }
 
             var resultPath = ReconstructPath(goalNode, initialEdge);
-            if (resultPath != null && AITraffic.Main.ModEntry != null && AITraffic.Main.ModEntry.Logger != null)
+
+            if (resultPath != null && Main.IsDebugLoggingEnabled)
             {
-                string startTrk = initialEdge != null && initialEdge.Track != null ? initialEdge.Track.name : "null";
-                string destTrk = destEdge != null && destEdge.Track != null ? destEdge.Track.name : "null";
-                AITraffic.Main.ModEntry.Logger.Log(string.Format("[Pathfinder] Route search succeeded: '{0}' -> '{1}'. Explored: {2}, Dist: {3:F0}m, Tracks: {4}.",
+                string startTrk = initialEdge != null ? initialEdge.TrackName : "null";
+                string destTrk = destEdge != null ? destEdge.TrackName : "null";
+                SafeLog(string.Format("[Pathfinder] Route search succeeded: '{0}' -> '{1}'. Explored: {2}, Dist: {3:F0}m, Tracks: {4}.",
                     startTrk, destTrk, exploredNodes, resultPath.TotalDistance, resultPath.Tracks != null ? resultPath.Tracks.Count : 0));
             }
             return resultPath;
         }
 
-        private bool EvaluateEdgeCost(
+        internal bool EvaluateEdgeCost(
             RailEdge edge,
             RailNode fromNode,
             RailNode toNode,
@@ -1031,6 +1202,30 @@ namespace AITraffic.Navigation
             if (options.ExcludedTracks != null && options.ExcludedTracks.Contains(edge.Track))
             {
                 return false;
+            }
+
+            // Career License Gating for all 3 military bases:
+            // Check LicenseManager.IsLicenseAcquired(DV.UserLicenses.JobLicenses.Military1).
+            // If military license is NOT acquired:
+            // In EvaluateEdgeCost, assign float.PositiveInfinity edge cost to all gated military track segments in:
+            // - Military Base ("MB")
+            // - Harbor Town ("HB") military spur tracks
+            // - Machine Factory ("MF") northeast military section tracks
+            // This guarantees no AI train ever routes through closed military gates.
+            // CRITICAL INVARIANT [RGR-03]: Use main-thread license snapshot and precomputed edge flag on worker threads (See GRAVEYARD.md)
+            // CRITICAL INVARIANT [FLT-11]: Gate all three military bases (MB, HMB, MFMB) behind Military1 license (See GRAVEYARD.md)
+            bool hasMilitaryLicense = options.HasMilitaryLicenseSnapshot.HasValue
+                ? options.HasMilitaryLicenseSnapshot.Value
+                : LicenseManager.IsLicenseAcquired(DV.UserLicenses.JobLicenses.Military1);
+            if (!hasMilitaryLicense)
+            {
+                if (edge.IsGatedMilitaryTrack ||
+                    (initialEdge != null && initialEdge.IsGatedMilitaryTrack) ||
+                    (destEdge != null && destEdge.IsGatedMilitaryTrack))
+                {
+                    cost = float.PositiveInfinity;
+                    return false;
+                }
             }
 
             // Junction branch alignment
@@ -1113,12 +1308,102 @@ namespace AITraffic.Navigation
                 cost += baseDistance * (speedFactor - 1f) * 0.5f;
             }
 
-            string trackName = edge.Track.name ?? string.Empty;
+            // CRITICAL INVARIANT [RGR-03]: Read pre-cached TrackName instead of Unity native Object.name getter on worker threads (See GRAVEYARD.md)
+            string trackName = edge.TrackName ?? string.Empty;
+
+            // CRITICAL INVARIANT [RGR-07]: Universal Right-Hand Running (Rechtsfahrgebot) corridor state.
+            bool hasParallelCorridor = (edge != null && edge.IsDoubleTrackMainline && edge.ParallelEdge != null && !edge.IsIndustrialYardOrStorageTrack);
+            bool isRightHandCorridorTrack = hasParallelCorridor && (edge.IsForward(fromNode, toNode) == edge.PreferredForward);
+            bool isLeftHandCorridorTrack = hasParallelCorridor && (edge.IsForward(fromNode, toNode) != edge.PreferredForward);
+
+            // Diverging Split & Lateral Track Geometry Analysis:
+            // CRITICAL INVARIANT [RGR-07]: Evaluate precomputed 18m lookahead directions (GetLookaheadDirection)
+            // instead of t=0 tangential blade vectors so right-hand vs left-hand turnout branches are deterministically resolved on background threads [RGR-03].
+            bool isDivergingSplit = (incomingEdge != null && fromNode.IncidentEdges != null && fromNode.IncidentEdges.Count > 2);
+            bool isRightHandDivergingBranch = false;
+            bool isLeftHandDivergingBranch = false;
+
+            if (isDivergingSplit)
+            {
+                Vector3 inDir = -incomingEdge.GetDirection(fromNode);
+                inDir.y = 0f;
+                if (inDir.sqrMagnitude > 0.0001f) inDir.Normalize();
+                Vector3 rightNormal = Vector3.Cross(Vector3.up, inDir).normalized;
+
+                Vector3 candidateDir = edge.GetLookaheadDirection(fromNode);
+                candidateDir.y = 0f;
+                if (candidateDir.sqrMagnitude > 0.0001f) candidateDir.Normalize();
+                float candidateLateral = Vector3.Dot(candidateDir, rightNormal);
+
+                float maxLateral = float.MinValue;
+                float minLateral = float.MaxValue;
+                int validForwardBranchCount = 0;
+                bool hasRightHandCorridorAlternative = false;
+
+                for (int b = 0; b < fromNode.IncidentEdges.Count; b++)
+                {
+                    var altEdge = fromNode.IncidentEdges[b];
+                    if (altEdge == null || altEdge == incomingEdge) continue;
+
+                    // Forward continuity: skip acute hairpin turnbacks (> 90 degrees)
+                    Vector3 altOriginDir = altEdge.GetDirection(fromNode);
+                    altOriginDir.y = 0f;
+                    if (altOriginDir.sqrMagnitude > 0.0001f) altOriginDir.Normalize();
+                    if (Vector3.Dot(inDir, altOriginDir) <= 0.0f) continue;
+
+                    Vector3 altDir = altEdge.GetLookaheadDirection(fromNode);
+                    altDir.y = 0f;
+                    if (altDir.sqrMagnitude > 0.0001f) altDir.Normalize();
+
+                    // Exclude station yard tracks and strictly avoided tracks from acting as preferred through-tracks,
+                    // but NEVER exclude passing loops or through sidings outside stations!
+                    if (altEdge.IsYardTrack || altEdge.IsStrictlyAvoidedThroughTrack || altEdge.IsIndustrialYardOrStorageTrack)
+                    {
+                        if (!altEdge.IsPassingLoopOrSiding && !altEdge.IsDoubleTrackMainline)
+                            continue;
+                    }
+
+                    if (altEdge != edge && (DoesEdgeEnterCorridorWithHandedness(altEdge, fromNode, true) || altEdge.IsPassingLoopOrSiding))
+                    {
+                        hasRightHandCorridorAlternative = true;
+                    }
+
+                    validForwardBranchCount++;
+                    float altLat = Vector3.Dot(altDir, rightNormal);
+                    if (altLat > maxLateral) maxLateral = altLat;
+                    if (altLat < minLateral) minLateral = altLat;
+                }
+
+                if (validForwardBranchCount >= 2 && (maxLateral - minLateral > 0.01f))
+                {
+                    bool candidateEntersRightCorridor = isRightHandCorridorTrack || DoesEdgeEnterCorridorWithHandedness(edge, fromNode, true);
+                    bool candidateEntersLeftCorridor = isLeftHandCorridorTrack || DoesEdgeEnterCorridorWithHandedness(edge, fromNode, false);
+
+                    if (Mathf.Abs(candidateLateral - maxLateral) <= 0.005f)
+                    {
+                        isRightHandDivergingBranch = true;
+                    }
+                    else if (candidateLateral < maxLateral - 0.005f &&
+                             !candidateEntersRightCorridor &&
+                             hasRightHandCorridorAlternative &&
+                             (candidateEntersLeftCorridor || edge.IsPassingLoopOrSiding))
+                    {
+                        isLeftHandDivergingBranch = true;
+                    }
+                }
+            }
 
             // Station Ladders, Passing Sidings & Industrial Yard Handling:
             Vector3 edgeMid = edge.GetMidPoint();
-            bool isApproachingDest = (destEdge != null && Vector3.Distance(edgeMid, destEdge.GetMidPoint()) < 2500f);
-            bool isLeavingOrigin = (initialEdge != null && Vector3.Distance(edgeMid, initialEdge.GetMidPoint()) < 2500f);
+            string edgeYardId = GetEdgeYardId(edge);
+            string destYardId = GetEdgeYardId(destEdge);
+            string initYardId = GetEdgeYardId(initialEdge);
+            bool sameDestYard = (!string.IsNullOrEmpty(edgeYardId) && !string.IsNullOrEmpty(destYardId) &&
+                                 string.Equals(edgeYardId, destYardId, StringComparison.OrdinalIgnoreCase));
+            bool sameInitYard = (!string.IsNullOrEmpty(edgeYardId) && !string.IsNullOrEmpty(initYardId) &&
+                                 string.Equals(edgeYardId, initYardId, StringComparison.OrdinalIgnoreCase));
+            bool isApproachingDest = (destEdge != null && (sameDestYard || Vector3.Distance(edgeMid, destEdge.GetMidPoint()) < 600f));
+            bool isLeavingOrigin = (initialEdge != null && (sameInitYard || Vector3.Distance(edgeMid, initialEdge.GetMidPoint()) < 600f));
             bool isImmediateLadder = isApproachingDest || isLeavingOrigin;
 
             // City West (CW / CSW) Station Avoidance:
@@ -1145,19 +1430,23 @@ namespace AITraffic.Navigation
             }
 
             // Passing loops and sidings [S]: valid secondary through-tracks.
-            // Apply a modest preference penalty (+350m) when not approaching origin/destination,
-            // so through-trains prefer the mainline [#] when clear, but will seamlessly take
-            // the passing siding if the mainline is occupied, reserved, or blocked.
-            bool isPassingLoop = (edge != null && edge.IsPassingLoopOrSiding) || IsPassingOrSidingTrack(edge.Track);
+            // When traversing the preferred right-hand track outside stations, zero out both the passing loop penalty and low-speed siding penalty.
+            bool isPassingLoop = edge != null && edge.IsPassingLoopOrSiding;
             if (isPassingLoop && !isStartOrDest && !isImmediateLadder)
             {
-                bool isPreferredRightHandCorridorTrack = edge != null &&
-                    edge.IsDoubleTrackMainline &&
-                    edge.ParallelEdge != null &&
-                    (edge.IsForward(fromNode, toNode) == edge.PreferredForward) &&
-                    !IsIndustrialYardOrStorageTrack(edge.Track);
+                bool isContinuingOnRightSiding = (incomingEdge != null && incomingEdge.IsPassingLoopOrSiding && !isLeftHandCorridorTrack && !isLeftHandDivergingBranch);
+                bool isPreferredRightHandCorridorTrack = (isRightHandDivergingBranch && !edge.IsIndustrialYardOrStorageTrack && !isLeftHandCorridorTrack) ||
+                    isRightHandCorridorTrack ||
+                    isContinuingOnRightSiding;
 
-                if (!isPreferredRightHandCorridorTrack)
+                if (isPreferredRightHandCorridorTrack)
+                {
+                    if (cost > baseDistance)
+                    {
+                        cost = baseDistance;
+                    }
+                }
+                else
                 {
                     cost += 350f;
                 }
@@ -1166,18 +1455,19 @@ namespace AITraffic.Navigation
             // Intermediate Loading, Transfer, Turntable, and Yard Storage/Shunting Track Avoidance:
             // Through-trains must NEVER cut through intermediate loading [L], transfer [I]/[O],
             // turntable [T], caboose [C], or yard storage/shunting [Y] tracks by default.
-            bool isStrictlyAvoided = (edge != null && edge.IsStrictlyAvoidedThroughTrack) || IsStrictlyAvoidedThroughTrack(edge.Track);
+            bool isStrictlyAvoided = edge != null && edge.IsStrictlyAvoidedThroughTrack;
             if (isStrictlyAvoided && !isStartOrDest)
             {
-                if (options.AllowShuntingDetour && IsShuntingOrStorageTrack(edge))
+                if (isImmediateLadder || (options.AllowShuntingDetour && edge.IsShuntingOrStorageTrack))
                 {
-                    // Allow heavily penalized emergency detour through empty yard shunting/storage tracks
+                    // Allow station approach/departure ladder or emergency shunting detour with a moderate preference penalty
+                    // so dedicated through-leads are favored when available, without exceeding MaxSearchDistance (5,000,000f).
                     cost += 5000f + (baseDistance * 2f);
                 }
                 else
                 {
                     // Massive through-transit penalty to strictly force through-trains onto mainline bypasses
-                    cost += 500000f + (baseDistance * 20f);
+                    cost += 10000000f + (baseDistance * 20f);
                 }
             }
             else
@@ -1185,7 +1475,7 @@ namespace AITraffic.Navigation
                 // Industrial Yard & Storage Track Avoidance for Through-Trains:
                 // General yard storage tracks [Y] are heavily penalized for valley through-transit,
                 // but permitted with a modest per-meter penalty when actively entering or leaving a station ladder.
-                bool isIndustrialYard = (edge != null && edge.IsYardTrack) || IsIndustrialYardOrStorageTrack(edge.Track);
+                bool isIndustrialYard = edge != null && (edge.IsYardTrack || edge.IsIndustrialYardOrStorageTrack);
                 if (isIndustrialYard && !isStartOrDest)
                 {
                     if (!isImmediateLadder)
@@ -1202,16 +1492,13 @@ namespace AITraffic.Navigation
                 }
             }
 
-            // Mainline Through-Track Preference Discount (favors [#], DT-, Platform [P], and mainlines)
-            bool isMainline = trackName.Contains("[#]") ||
-                              trackName.IndexOf("DT-", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                              trackName.IndexOf("Main", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                              trackName.IndexOf("ML", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                              trackName.StartsWith("[P]", StringComparison.OrdinalIgnoreCase);
-
-            if (isMainline)
+            // CRITICAL INVARIANT [RGR-07]: Never grant a 0.85f cost discount based on "DT-" or "[#]" track naming.
+            // Vanilla mainline tracks ("Road 8A", "Road 82BB") lack "DT-" prefixes; discounting "DT-" tracks creates
+            // an artificial cost incentive to cross over onto left-hand DoubleTrack splines. Grant the 0.85f discount
+            // strictly and exclusively to verified right-hand corridor tracks (isRightHandCorridorTrack).
+            if (isRightHandCorridorTrack && !isLeftHandDivergingBranch && !isLeftHandCorridorTrack && !edge.IsIndustrialYardOrStorageTrack)
             {
-                cost *= 0.85f; // 15% preference discount for mainline corridors
+                cost *= 0.85f;
             }
 
             // Prevent AI trains from taking passing sidings/loops to overtake the player in the same corridor
@@ -1219,24 +1506,13 @@ namespace AITraffic.Navigation
             {
                 if (isPassingLoop)
                 {
+                    // CRITICAL INVARIANT [RGR-03]: Rely strictly on main-thread PlayerPosition snapshot; never query live Unity Transforms on worker threads (See GRAVEYARD.md)
                     Vector3 pPos = options.PlayerPosition;
                     if (pPos != Vector3.zero)
                     {
                         if (Vector3.Distance(edge.GetMidPoint(), pPos) < 1500f)
                         {
                             cost += 500000f;
-                        }
-                    }
-                    else
-                    {
-                        Trainset pSet;
-                        float pSpeed;
-                        if (SignalRegistry.TryGetPlayerTrainInfo(out pSet, out pPos, out pSpeed))
-                        {
-                            if (Vector3.Distance(edge.GetMidPoint(), pPos) < 1500f)
-                            {
-                                cost += 500000f;
-                            }
                         }
                     }
                 }
@@ -1261,9 +1537,19 @@ namespace AITraffic.Navigation
                 }
             }
 
-            // Crossover Track Penalty:
-            // Severely disfavor unnecessary jumping across crossovers between parallel double-track mainlines
+            bool alignsToRightHandTrack = (isRightHandDivergingBranch && !edge.IsIndustrialYardOrStorageTrack && !isLeftHandCorridorTrack) ||
+                isRightHandCorridorTrack;
+
+            var state = new { Forward = incomingEdge != null && incomingEdge.ToNode == fromNode };
+            bool wasOnRightHandCorridor = (incomingEdge != null &&
+                                           incomingEdge.IsDoubleTrackMainline &&
+                                           incomingEdge.ParallelEdge != null &&
+                                           !incomingEdge.IsIndustrialYardOrStorageTrack &&
+                                           incomingEdge.IsRightHandInDirection(state.Forward));
+
             bool isCrossover = (trackName.IndexOf("CX", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                trackName.IndexOf("SX", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                (trackName.IndexOf("DTC-", StringComparison.OrdinalIgnoreCase) >= 0 && trackName.IndexOf("[track through]", StringComparison.OrdinalIgnoreCase) < 0) ||
                                 trackName.IndexOf("Cross", StringComparison.OrdinalIgnoreCase) >= 0 ||
                                 trackName.IndexOf("Xing", StringComparison.OrdinalIgnoreCase) >= 0);
 
@@ -1275,71 +1561,44 @@ namespace AITraffic.Navigation
                 }
             }
 
-            if (isCrossover && !isStartOrDest && options.CrossoverPenalty > 0f)
+            float effectiveCrossoverPenalty = Mathf.Max(options.CrossoverPenalty, 1500f);
+            float effectiveWrongDirFlatPenalty = Mathf.Max(options.WrongDirectionFlatPenalty, 5000f);
+            float effectiveWrongDirMultiplier = Mathf.Max(options.WrongDirectionMultiplier, 2.0f);
+
+            if (isCrossover)
             {
-                cost += options.CrossoverPenalty;
+                cost += effectiveCrossoverPenalty;
+            }
+
+            // CRITICAL INVARIANT [RGR-07]: Penalize abandoning an active right-hand corridor track onto a crossover, left-hand corridor track, or left-hand diverging turnout branch.
+            if (wasOnRightHandCorridor && !isRightHandCorridorTrack && (isCrossover || isLeftHandCorridorTrack || isLeftHandDivergingBranch))
+            {
+                cost += effectiveCrossoverPenalty + effectiveWrongDirFlatPenalty;
             }
 
             // Diverging turnout penalty
             if (fromNode.Junction != null && requiredBranch > 0)
             {
                 // Zero out turnout diverging penalty when aligning onto the preferred right-hand track outside stations
-                bool alignsToRightHandTrack = edge != null &&
-                    edge.IsDoubleTrackMainline &&
-                    edge.ParallelEdge != null &&
-                    (edge.IsForward(fromNode, toNode) == edge.PreferredForward) &&
-                    !IsIndustrialYardOrStorageTrack(edge.Track);
-
                 if (!alignsToRightHandTrack)
                 {
                     cost += options.TurnoutDivergingPenalty;
                 }
             }
 
-            // Right-Hand Running Preference at Diverging Junctions
-            if (incomingEdge != null && fromNode.IncidentEdges != null && fromNode.IncidentEdges.Count > 2)
+            // Right-Hand Running Preference at Diverging Junctions outside stations
+            // CRITICAL INVARIANT [RGR-07]: Left-hand turnout divergence must incur at least effectiveCrossoverPenalty + effectiveWrongDirFlatPenalty (6500m)
+            // so an outer left-hand loop is never cheaper than a single-edge wrong-direction penalty (5000m + 2.0 * L) on a straight continuation track.
+            if (!wasOnRightHandCorridor && isLeftHandDivergingBranch && !isRightHandCorridorTrack && !edge.IsIndustrialYardOrStorageTrack)
             {
-                Vector3 inDir = -incomingEdge.GetDirection(fromNode);
-                Vector3 rightNormal = Vector3.Cross(Vector3.up, inDir).normalized;
-
-                Vector3 candidateDir = edge.GetDirection(fromNode);
-                float candidateLateral = Vector3.Dot(candidateDir, rightNormal);
-
-                // Find lateral spread of alternative outgoing edges from this node
-                // Exclude yard tracks and strictly avoided tracks from acting as preferred right-hand options,
-                // but allow passing loops and through-sidings outside stations!
-                float maxLateral = float.MinValue;
-                float minLateral = float.MaxValue;
-                for (int b = 0; b < fromNode.IncidentEdges.Count; b++)
-                {
-                    var altEdge = fromNode.IncidentEdges[b];
-                    if (altEdge == null || altEdge == incomingEdge) continue;
-
-                    // Exclude station yard tracks and strictly avoided tracks from forcing a through track to be penalized
-                    if (altEdge.IsYardTrack || altEdge.IsStrictlyAvoidedThroughTrack || IsIndustrialYardOrStorageTrack(altEdge.Track) || IsStrictlyAvoidedThroughTrack(altEdge.Track))
-                    {
-                        // But do NOT exclude passing loops or through sidings outside stations!
-                        if (!altEdge.IsPassingLoopOrSiding && !IsPassingOrSidingTrack(altEdge.Track))
-                            continue;
-                    }
-
-                    Vector3 altDir = altEdge.GetDirection(fromNode);
-                    float altLat = Vector3.Dot(altDir, rightNormal);
-                    if (altLat > maxLateral) maxLateral = altLat;
-                    if (altLat < minLateral) minLateral = altLat;
-                }
-
-                if (maxLateral - minLateral > 0.05f)
-                {
-                    // If this candidate is NOT the rightmost track option, apply a non-negative penalty to left tracks
-                    if (Mathf.Abs(candidateLateral - maxLateral) >= 0.02f)
-                    {
-                        cost += 300f; // Disfavor left-hand track when a right-hand option is available
-                    }
-                }
+                // Disfavor left-hand track when a right-hand option is available outside stations.
+                // Apply a decisive penalty (effectiveCrossoverPenalty + effectiveWrongDirFlatPenalty) so the right-hand track is overwhelmingly preferred,
+                // while still allowing blocked/occupied right-hand tracks (StrictlyAvoidOccupied = true) to be bypassed via the clear left track.
+                float leftPenalty = effectiveCrossoverPenalty + effectiveWrongDirFlatPenalty;
+                cost += leftPenalty;
             }
 
-            // Double track wrong-way running penalty (non-negative)
+            // Double track & parallel passing loop wrong-way running penalty (non-negative) [RGR-07]
             if (edge.IsDoubleTrackMainline && edge.ParallelEdge != null)
             {
                 bool traversingForward = edge.IsForward(fromNode, toNode);
@@ -1350,11 +1609,117 @@ namespace AITraffic.Navigation
                     if (!options.AllowWrongDirection)
                         return false;
 
-                    cost += options.WrongDirectionFlatPenalty + (baseDistance * options.WrongDirectionMultiplier);
+                    // CRITICAL INVARIANT [RGR-07]: Do not re-charge a duplicate flat WrongDirectionFlatPenalty when continuing straight
+                    // along the exact same ParallelEdge corridor from incomingEdge or initialEdge within the origin departure throat,
+                    // preventing A* from fleeing a straight departure track onto an unpaired outer loop.
+                    bool isContinuingSameParallelCorridor = !isLeftHandDivergingBranch && !isCrossover &&
+                        ((incomingEdge != null && incomingEdge.ParallelEdge == edge.ParallelEdge) ||
+                         (isLeavingOrigin && initialEdge != null && initialEdge.ParallelEdge == edge.ParallelEdge));
+
+                    if (isContinuingSameParallelCorridor)
+                    {
+                        cost += (baseDistance * effectiveWrongDirMultiplier);
+                    }
+                    else
+                    {
+                        cost += effectiveWrongDirFlatPenalty + (baseDistance * effectiveWrongDirMultiplier);
+                    }
                 }
             }
 
             return true;
+        }
+
+        private static bool IsShortSwitchEdge(RailEdge edge)
+        {
+            if (edge == null) return false;
+            if (edge.IsJunctionTrack) return true;
+            string tName = edge.TrackName;
+            return !string.IsNullOrEmpty(tName) && tName.StartsWith("[track ", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static bool IsCrossoverName(string tName)
+        {
+            if (string.IsNullOrEmpty(tName)) return false;
+            return tName.IndexOf("CX", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                   tName.IndexOf("SX", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                   (tName.IndexOf("DTC-", StringComparison.OrdinalIgnoreCase) >= 0 && tName.IndexOf("[track through]", StringComparison.OrdinalIgnoreCase) < 0) ||
+                   tName.IndexOf("Cross", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                   tName.IndexOf("Xing", StringComparison.OrdinalIgnoreCase) >= 0;
+        }
+
+        private static bool DoesEdgeEnterCorridorWithHandedness(RailEdge branchEdge, RailNode fromNode, bool wantRightHand)
+        {
+            if (branchEdge == null || fromNode == null) return false;
+
+            RailEdge currEdge = branchEdge;
+            RailNode currFrom = fromNode;
+
+            for (int hop = 0; hop <= 3; hop++)
+            {
+                RailNode currTo = currEdge.GetOtherNode(currFrom);
+                if (currTo == null) return false;
+
+                if (currEdge.IsDoubleTrackMainline && currEdge.ParallelEdge != null && !currEdge.IsIndustrialYardOrStorageTrack)
+                {
+                    bool forward = (currEdge.ToNode == currTo);
+                    bool isRight = currEdge.IsRightHandInDirection(forward);
+                    return wantRightHand ? isRight : !isRight;
+                }
+
+                if (!IsShortSwitchEdge(currEdge) || hop == 3 || currTo.IncidentEdges == null)
+                    return false;
+
+                Vector3 inDir = -currEdge.GetDirection(currTo);
+                inDir.y = 0f;
+                if (inDir.sqrMagnitude > 0.0001f) inDir.Normalize();
+
+                RailEdge bestCont = null;
+                float bestDot = 0.85f;
+
+                for (int i = 0; i < currTo.IncidentEdges.Count; i++)
+                {
+                    RailEdge cand = currTo.IncidentEdges[i];
+                    if (cand == null || cand == currEdge || cand.IsIndustrialYardOrStorageTrack) continue;
+                    if (IsCrossoverName(cand.TrackName)) continue;
+
+                    Vector3 outDir = cand.GetDirection(currTo);
+                    outDir.y = 0f;
+                    if (outDir.sqrMagnitude > 0.0001f) outDir.Normalize();
+
+                    float dot = Vector3.Dot(inDir, outDir);
+                    if (dot >= bestDot)
+                    {
+                        bestDot = dot;
+                        bestCont = cand;
+                    }
+                }
+
+                if (bestCont == null) return false;
+                currFrom = currTo;
+                currEdge = bestCont;
+            }
+
+            return false;
+        }
+
+        private static string GetEdgeYardId(RailEdge edge)
+        {
+            if (edge == null) return null;
+            if (edge.LogicTrack != null && edge.LogicTrack.ID != null && !string.IsNullOrEmpty(edge.LogicTrack.ID.yardId))
+            {
+                return edge.LogicTrack.ID.yardId;
+            }
+            string tName = edge.TrackName;
+            if (!string.IsNullOrEmpty(tName) && tName.StartsWith("[Y]_[", StringComparison.OrdinalIgnoreCase))
+            {
+                int endBracket = tName.IndexOf(']', 5);
+                if (endBracket > 5)
+                {
+                    return tName.Substring(5, endBracket - 5);
+                }
+            }
+            return null;
         }
 
         private RailPath ReconstructPath(SearchNode goalNode, RailEdge initialEdge)
@@ -1418,6 +1783,12 @@ namespace AITraffic.Navigation
         private static HashSet<string> s_cachedStationYardGONames = null;
         private static readonly object s_yardGONamesLock = new object();
 
+        // CRITICAL INVARIANT [RGR-03]: Eagerly populate station yard cache on the Unity Main Thread (See GRAVEYARD.md)
+        public static void InitializeStationYardCache()
+        {
+            GetStationYardGONames();
+        }
+
         private static HashSet<string> GetStationYardGONames()
         {
             if (s_cachedStationYardGONames != null) return s_cachedStationYardGONames;
@@ -1454,6 +1825,107 @@ namespace AITraffic.Navigation
         }
 
         /// <summary>
+        /// Determines whether a track is a gated military track segment in Military Base ("MB"),
+        /// Harbor Military Base ("HMB") / Harbor Town ("HB") military spur tracks, or
+        /// Machine Factory Military Base ("MFMB") / Machine Factory ("MF") northeast military section.
+        /// </summary>
+        // CRITICAL INVARIANT [FLT-11]: Gate all three military bases (MB, HMB, MFMB) and generic "Road ... MA/MB" tracks behind Military1 license (See GRAVEYARD.md)
+        public static bool IsGatedMilitaryTrack(RailTrack track)
+        {
+            if (track == null) return false;
+            if (AITraffic.Fleet.TrainSpawner.IsMilitaryTrack(track))
+                return true;
+
+            string tName = (track.name ?? string.Empty).Trim();
+
+            // 1. Check game LogicTrack ID classification if available
+            var logicTrack = AITraffic.Compat.ModCompatManager.GetLogicTrack(track);
+            if (logicTrack != null && logicTrack.ID != null)
+            {
+                string yard = logicTrack.ID.yardId ?? string.Empty;
+                string subYard = logicTrack.ID.SignIDSubYardPart ?? string.Empty;
+
+                // Military Base ("MB" / "MA")
+                if (string.Equals(yard, "MB", StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(yard, "MA", StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(subYard, "MB", StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(subYard, "MA", StringComparison.OrdinalIgnoreCase))
+                    return true;
+
+                // Harbor Military Base ("HMB") & Harbor Town ("HB") military spur tracks
+                if (string.Equals(yard, "HMB", StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(yard, "HBMB", StringComparison.OrdinalIgnoreCase) ||
+                    (string.Equals(yard, "HB", StringComparison.OrdinalIgnoreCase) && string.Equals(subYard, "MB", StringComparison.OrdinalIgnoreCase)))
+                    return true;
+
+                // Machine Factory Military Base ("MFMB") & Machine Factory ("MF") northeast military section tracks
+                if (string.Equals(yard, "MFMB", StringComparison.OrdinalIgnoreCase) ||
+                    (string.Equals(yard, "MF", StringComparison.OrdinalIgnoreCase) && string.Equals(subYard, "MB", StringComparison.OrdinalIgnoreCase)))
+                    return true;
+
+                // Any sub-yard ending with MB
+                if (yard.EndsWith("MB", StringComparison.OrdinalIgnoreCase) && !string.Equals(yard, "MB", StringComparison.OrdinalIgnoreCase))
+                    return true;
+            }
+
+            // 2. Track GameObject name heuristics
+            // Military Base ("MB" / "MA") including generic "Road 6 MA" / "Road 6b MB" tracks
+            if (tName.StartsWith("[MB", StringComparison.OrdinalIgnoreCase) ||
+                tName.IndexOf("_[MB]_", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                tName.IndexOf("[MA", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                tName.IndexOf("_[MA]_", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                tName.IndexOf("MilitaryBase", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                tName.IndexOf("Military", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                tName.IndexOf("[MB-", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                tName.EndsWith(" MB", StringComparison.OrdinalIgnoreCase) ||
+                tName.EndsWith("-MB", StringComparison.OrdinalIgnoreCase) ||
+                tName.EndsWith("_MB", StringComparison.OrdinalIgnoreCase) ||
+                tName.EndsWith(" MA", StringComparison.OrdinalIgnoreCase) ||
+                tName.EndsWith("-MA", StringComparison.OrdinalIgnoreCase) ||
+                tName.EndsWith("_MA", StringComparison.OrdinalIgnoreCase) ||
+                tName.IndexOf(" MB ", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                tName.IndexOf(" MB]", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                tName.IndexOf(" MA ", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                tName.IndexOf(" MA]", StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                return true;
+            }
+
+            // Harbor Military Base ("HMB") & Harbor Town ("HB") military spur tracks
+            if (tName.IndexOf("HMB", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                tName.IndexOf("HB-MB", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                tName.IndexOf("HBMB", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                tName.IndexOf("HB_MB", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                tName.IndexOf("HB-D", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                tName.IndexOf("HB_D", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                (tName.StartsWith("[HB", StringComparison.OrdinalIgnoreCase) && tName.IndexOf("MB", StringComparison.OrdinalIgnoreCase) >= 0) ||
+                (tName.StartsWith("[HB", StringComparison.OrdinalIgnoreCase) && tName.IndexOf("Military", StringComparison.OrdinalIgnoreCase) >= 0))
+            {
+                return true;
+            }
+
+            // Machine Factory Military Base ("MFMB") & Machine Factory ("MF") northeast military section tracks
+            if (tName.IndexOf("MFMB", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                tName.IndexOf("MF-MB", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                tName.IndexOf("MF_MB", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                tName.IndexOf("MF-C", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                tName.IndexOf("MF_C", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                (tName.StartsWith("[MF", StringComparison.OrdinalIgnoreCase) && tName.IndexOf("MB", StringComparison.OrdinalIgnoreCase) >= 0) ||
+                (tName.StartsWith("[MF", StringComparison.OrdinalIgnoreCase) && tName.IndexOf("Military", StringComparison.OrdinalIgnoreCase) >= 0))
+            {
+                return true;
+            }
+
+            return false;
+        }
+
+        public static bool IsGatedMilitaryTrack(RailEdge edge)
+        {
+            if (edge == null || edge.Track == null) return false;
+            return edge.IsGatedMilitaryTrack || IsGatedMilitaryTrack(edge.Track);
+        }
+
+        /// <summary>
         /// Determines whether a track is an industrial or station yard storage/shunting track (e.g. [Y]_[OWN]_[A-01-S]).
         /// </summary>
         public static bool IsShuntingOrStorageTrack(RailTrack track)
@@ -1461,14 +1933,22 @@ namespace AITraffic.Navigation
             if (track == null) return false;
             string tName = track.name ?? string.Empty;
 
-            // Mainline tracks and passenger platforms are never shunting/storage tracks
-            if (tName.Contains("[#]") ||
+            // Mainline tracks, open-country Road tracks, DoubleTrack corridors/sidings, and passenger platforms are never shunting/storage tracks
+            if (tName.StartsWith("Road ", StringComparison.OrdinalIgnoreCase) ||
+                tName.Contains("[#]") ||
+                tName.IndexOf("doubletrack", StringComparison.OrdinalIgnoreCase) >= 0 ||
                 tName.IndexOf("DT-", StringComparison.OrdinalIgnoreCase) >= 0 ||
                 tName.IndexOf("Main", StringComparison.OrdinalIgnoreCase) >= 0 ||
                 tName.IndexOf("ML", StringComparison.OrdinalIgnoreCase) >= 0 ||
                 tName.StartsWith("[P]", StringComparison.OrdinalIgnoreCase) ||
                 tName.IndexOf("Platform", StringComparison.OrdinalIgnoreCase) >= 0 ||
                 tName.IndexOf("Pax", StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                return false;
+            }
+
+            // Station central running/bypass lines (ending in [--]) are through-tracks, NOT shunting/storage tracks
+            if (tName.Contains("[--]") || tName.EndsWith("--", StringComparison.OrdinalIgnoreCase) || tName.EndsWith("--]", StringComparison.OrdinalIgnoreCase))
             {
                 return false;
             }
@@ -1493,12 +1973,11 @@ namespace AITraffic.Navigation
                 }
             }
 
-            // Yard & siding prefix and keyword heuristics
-            if (tName.StartsWith("[Y]", StringComparison.OrdinalIgnoreCase) ||
-                tName.StartsWith("[yard", StringComparison.OrdinalIgnoreCase) ||
-                tName.IndexOf("_[Y]", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                tName.IndexOf("_Y_", StringComparison.OrdinalIgnoreCase) >= 0 ||
+            // CRITICAL INVARIANT [RGR-07]: Never classify tracks by leading [Y] namespace prefix; classify strictly by track type suffix and StationController registry.
+            if (tName.StartsWith("[yard", StringComparison.OrdinalIgnoreCase) ||
                 tName.EndsWith("-S]", StringComparison.OrdinalIgnoreCase) ||
+                tName.EndsWith("-P]", StringComparison.OrdinalIgnoreCase) ||
+                tName.EndsWith("-C]", StringComparison.OrdinalIgnoreCase) ||
                 tName.IndexOf("Shunt", StringComparison.OrdinalIgnoreCase) >= 0 ||
                 tName.IndexOf("Storage", StringComparison.OrdinalIgnoreCase) >= 0 ||
                 tName.IndexOf("Stub", StringComparison.OrdinalIgnoreCase) >= 0 ||
@@ -1526,7 +2005,7 @@ namespace AITraffic.Navigation
             if (track == null) return false;
             string tName = track.name ?? string.Empty;
 
-            // Mainline [#], doubletrack, and platform tracks are not sidings
+            // Mainline [#], DT-, and platform tracks are not sidings
             if (tName.Contains("[#]") ||
                 tName.IndexOf("DT-", StringComparison.OrdinalIgnoreCase) >= 0 ||
                 tName.IndexOf("Main", StringComparison.OrdinalIgnoreCase) >= 0 ||
@@ -1536,6 +2015,13 @@ namespace AITraffic.Navigation
                 tName.IndexOf("Pax", StringComparison.OrdinalIgnoreCase) >= 0)
             {
                 return false;
+            }
+
+            // DoubleTrack mod passing sidings (e.g. "[y]_[doubletrack]_[Siding-8-T]")
+            if (tName.IndexOf("doubletrack", StringComparison.OrdinalIgnoreCase) >= 0 &&
+                tName.IndexOf("Siding", StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                return true;
             }
 
             // Yard storage, shunting, loading, and transfer tracks are NEVER passing sidings
@@ -1565,29 +2051,24 @@ namespace AITraffic.Navigation
                 }
             }
 
-            // DoubleTrack mod passing sidings (e.g. "[y]_[doubletrack]_[Siding-8-T]")
-            if (tName.IndexOf("doubletrack", StringComparison.OrdinalIgnoreCase) >= 0 &&
-                tName.IndexOf("Siding", StringComparison.OrdinalIgnoreCase) >= 0)
-            {
-                return true;
-            }
-
-            // Siding / passing loop keywords
+            // Siding / passing loop keywords (never blocked by leading [Y] namespace prefix, but strictly excluding storage/loading/transfer suffixes)
             if (tName.StartsWith("[S]", StringComparison.OrdinalIgnoreCase) ||
                 tName.IndexOf("_[S]", StringComparison.OrdinalIgnoreCase) >= 0 ||
                 tName.IndexOf("_S_", StringComparison.OrdinalIgnoreCase) >= 0 ||
                 tName.IndexOf("Siding", StringComparison.OrdinalIgnoreCase) >= 0 ||
                 tName.IndexOf("Loop", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                tName.IndexOf("Bypass", StringComparison.OrdinalIgnoreCase) >= 0 ||
                 tName.IndexOf("Pass", StringComparison.OrdinalIgnoreCase) >= 0)
             {
                 if (!tName.StartsWith("[L]", StringComparison.OrdinalIgnoreCase) &&
                     !tName.StartsWith("[I]", StringComparison.OrdinalIgnoreCase) &&
                     !tName.StartsWith("[O]", StringComparison.OrdinalIgnoreCase) &&
-                    !tName.StartsWith("[Y]", StringComparison.OrdinalIgnoreCase) &&
                     !tName.EndsWith("-L]", StringComparison.OrdinalIgnoreCase) &&
                     !tName.EndsWith("-I]", StringComparison.OrdinalIgnoreCase) &&
                     !tName.EndsWith("-O]", StringComparison.OrdinalIgnoreCase) &&
                     !tName.EndsWith("-C]", StringComparison.OrdinalIgnoreCase) &&
+                    !tName.EndsWith("-T]", StringComparison.OrdinalIgnoreCase) &&
+                    !tName.EndsWith("-P]", StringComparison.OrdinalIgnoreCase) &&
                     !tName.EndsWith("-S]", StringComparison.OrdinalIgnoreCase))
                 {
                     return true;
@@ -1613,8 +2094,10 @@ namespace AITraffic.Navigation
             if (track == null) return false;
             string tName = track.name ?? string.Empty;
 
-            // Mainline through tracks and passenger platforms are never strictly avoided
-            if (tName.Contains("[#]") ||
+            // Mainline through tracks, open-country Road tracks, DoubleTrack corridors/sidings, and passenger platforms are never strictly avoided
+            if (tName.StartsWith("Road ", StringComparison.OrdinalIgnoreCase) ||
+                tName.Contains("[#]") ||
+                tName.IndexOf("doubletrack", StringComparison.OrdinalIgnoreCase) >= 0 ||
                 tName.IndexOf("DT-", StringComparison.OrdinalIgnoreCase) >= 0 ||
                 tName.IndexOf("Main", StringComparison.OrdinalIgnoreCase) >= 0 ||
                 tName.IndexOf("ML", StringComparison.OrdinalIgnoreCase) >= 0 ||
@@ -1625,13 +2108,19 @@ namespace AITraffic.Navigation
                 return false;
             }
 
+            // Station central running/bypass lines (ending in [--]) are through-tracks, NOT avoided tracks
+            if (tName.Contains("[--]") || tName.EndsWith("--", StringComparison.OrdinalIgnoreCase) || tName.EndsWith("--]", StringComparison.OrdinalIgnoreCase))
+            {
+                return false;
+            }
+
             // Passing loops and station sidings are valid through-tracks, NOT avoided tracks
             if (IsPassingOrSidingTrack(track))
             {
                 return false;
             }
 
-            // 1. Check game LogicTrack ID classification (strictly Loading tracks)
+            // 1. Check game LogicTrack ID classification (strictly Loading, Transfer, Storage, and Parking tracks)
             var logicTrack = AITraffic.Compat.ModCompatManager.GetLogicTrack(track);
             if (logicTrack != null && logicTrack.ID != null)
             {
@@ -1643,21 +2132,40 @@ namespace AITraffic.Navigation
                     return false;
 
                 if (signPart.EndsWith(DV.Logic.Job.TrackID.LOADING_TYPE, StringComparison.OrdinalIgnoreCase) ||
-                    part.EndsWith(DV.Logic.Job.TrackID.LOADING_TYPE, StringComparison.OrdinalIgnoreCase))
+                    signPart.EndsWith(DV.Logic.Job.TrackID.REGULAR_OUT_TYPE, StringComparison.OrdinalIgnoreCase) ||
+                    signPart.EndsWith(DV.Logic.Job.TrackID.REGULAR_IN_TYPE, StringComparison.OrdinalIgnoreCase) ||
+                    signPart.EndsWith(DV.Logic.Job.TrackID.STORAGE_TYPE, StringComparison.OrdinalIgnoreCase) ||
+                    signPart.EndsWith(DV.Logic.Job.TrackID.PARKING_TYPE, StringComparison.OrdinalIgnoreCase) ||
+                    part.EndsWith(DV.Logic.Job.TrackID.LOADING_TYPE, StringComparison.OrdinalIgnoreCase) ||
+                    part.EndsWith(DV.Logic.Job.TrackID.REGULAR_OUT_TYPE, StringComparison.OrdinalIgnoreCase) ||
+                    part.EndsWith(DV.Logic.Job.TrackID.REGULAR_IN_TYPE, StringComparison.OrdinalIgnoreCase) ||
+                    part.EndsWith(DV.Logic.Job.TrackID.STORAGE_TYPE, StringComparison.OrdinalIgnoreCase) ||
+                    part.EndsWith(DV.Logic.Job.TrackID.PARKING_TYPE, StringComparison.OrdinalIgnoreCase))
                 {
                     return true;
                 }
             }
 
             // 2. Track name keyword heuristics:
-            // Strict avoidance applies specifically to Loading ([L], -L]) and Turntable ([T], -T]) tracks
-            // as they lack proper governing main signals and cannot show an Hp 1 clear aspect.
+            // Strict avoidance applies to Loading ([L] / -L]), Turntable ([T] / -T]), Outbound ([O] / -O]), Inbound ([I] / -I]),
+            // Caboose ([C] / -C]), Parking (-P]), and Yard Storage (-S]) tracks which must never be traversed by through-trains.
             if (tName.StartsWith("[L]", StringComparison.OrdinalIgnoreCase) ||
                 tName.StartsWith("[T]", StringComparison.OrdinalIgnoreCase) ||
+                tName.StartsWith("[O]", StringComparison.OrdinalIgnoreCase) ||
+                tName.StartsWith("[I]", StringComparison.OrdinalIgnoreCase) ||
+                tName.StartsWith("[C]", StringComparison.OrdinalIgnoreCase) ||
                 tName.IndexOf("_[L]", StringComparison.OrdinalIgnoreCase) >= 0 ||
                 tName.IndexOf("_[T]", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                tName.IndexOf("_[O]", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                tName.IndexOf("_[I]", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                tName.IndexOf("_[C]", StringComparison.OrdinalIgnoreCase) >= 0 ||
                 tName.EndsWith("-L]", StringComparison.OrdinalIgnoreCase) ||
                 tName.EndsWith("-T]", StringComparison.OrdinalIgnoreCase) ||
+                tName.EndsWith("-O]", StringComparison.OrdinalIgnoreCase) ||
+                tName.EndsWith("-I]", StringComparison.OrdinalIgnoreCase) ||
+                tName.EndsWith("-S]", StringComparison.OrdinalIgnoreCase) ||
+                tName.EndsWith("-C]", StringComparison.OrdinalIgnoreCase) ||
+                tName.EndsWith("-P]", StringComparison.OrdinalIgnoreCase) ||
                 tName.IndexOf("_L_", StringComparison.OrdinalIgnoreCase) >= 0 ||
                 tName.IndexOf("Turntable", StringComparison.OrdinalIgnoreCase) >= 0)
             {
@@ -1682,14 +2190,22 @@ namespace AITraffic.Navigation
             if (track == null) return false;
             string tName = track.name ?? string.Empty;
 
-            // Mainline through tracks and passenger platforms are exempt
-            if (tName.Contains("[#]") ||
+            // Mainline through tracks, open-country Road tracks, DoubleTrack corridors/sidings, and passenger platforms are exempt
+            if (tName.StartsWith("Road ", StringComparison.OrdinalIgnoreCase) ||
+                tName.Contains("[#]") ||
+                tName.IndexOf("doubletrack", StringComparison.OrdinalIgnoreCase) >= 0 ||
                 tName.IndexOf("DT-", StringComparison.OrdinalIgnoreCase) >= 0 ||
                 tName.IndexOf("Main", StringComparison.OrdinalIgnoreCase) >= 0 ||
                 tName.IndexOf("ML", StringComparison.OrdinalIgnoreCase) >= 0 ||
                 tName.StartsWith("[P]", StringComparison.OrdinalIgnoreCase) ||
                 tName.IndexOf("Platform", StringComparison.OrdinalIgnoreCase) >= 0 ||
                 tName.IndexOf("Pax", StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                return false;
+            }
+
+            // Station central running/bypass lines (ending in [--]) are through-tracks, NOT industrial yard tracks
+            if (tName.Contains("[--]") || tName.EndsWith("--", StringComparison.OrdinalIgnoreCase) || tName.EndsWith("--]", StringComparison.OrdinalIgnoreCase))
             {
                 return false;
             }
@@ -1735,25 +2251,24 @@ namespace AITraffic.Navigation
             if (GetStationYardGONames().Contains(tName))
                 return true;
 
-            // Yard & siding prefix and keyword heuristics:
-            // [Y] (Yard Storage), [L] (Loading), [C] (Caboose/Storage),
-            // [I] (Inbound Transfer), [O] (Outbound Transfer), [E] (Engine), [B] (Service), [T] (Turntable)
-            if (tName.StartsWith("[Y]", StringComparison.OrdinalIgnoreCase) ||
-                tName.StartsWith("[L]", StringComparison.OrdinalIgnoreCase) ||
+            // CRITICAL INVARIANT [RGR-07]: Classify strictly by track type suffix (-L], -I], -O], -S], -C], -T], -P]), never by leading [Y] namespace prefix.
+            if (tName.StartsWith("[L]", StringComparison.OrdinalIgnoreCase) ||
                 tName.StartsWith("[C]", StringComparison.OrdinalIgnoreCase) ||
                 tName.StartsWith("[I]", StringComparison.OrdinalIgnoreCase) ||
                 tName.StartsWith("[O]", StringComparison.OrdinalIgnoreCase) ||
                 tName.StartsWith("[E]", StringComparison.OrdinalIgnoreCase) ||
                 tName.StartsWith("[B]", StringComparison.OrdinalIgnoreCase) ||
                 tName.StartsWith("[T]", StringComparison.OrdinalIgnoreCase) ||
-                tName.IndexOf("_[Y]", StringComparison.OrdinalIgnoreCase) >= 0 ||
                 tName.IndexOf("_[L]", StringComparison.OrdinalIgnoreCase) >= 0 ||
                 tName.IndexOf("_[I]", StringComparison.OrdinalIgnoreCase) >= 0 ||
                 tName.IndexOf("_[O]", StringComparison.OrdinalIgnoreCase) >= 0 ||
                 tName.EndsWith("-L]", StringComparison.OrdinalIgnoreCase) ||
                 tName.EndsWith("-I]", StringComparison.OrdinalIgnoreCase) ||
                 tName.EndsWith("-O]", StringComparison.OrdinalIgnoreCase) ||
-                tName.IndexOf("_Y_", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                tName.EndsWith("-S]", StringComparison.OrdinalIgnoreCase) ||
+                tName.EndsWith("-C]", StringComparison.OrdinalIgnoreCase) ||
+                tName.EndsWith("-T]", StringComparison.OrdinalIgnoreCase) ||
+                tName.EndsWith("-P]", StringComparison.OrdinalIgnoreCase) ||
                 tName.IndexOf("Spur", StringComparison.OrdinalIgnoreCase) >= 0 ||
                 tName.IndexOf("Storage", StringComparison.OrdinalIgnoreCase) >= 0 ||
                 tName.IndexOf("Stub", StringComparison.OrdinalIgnoreCase) >= 0 ||

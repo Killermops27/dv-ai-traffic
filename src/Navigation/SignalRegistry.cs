@@ -100,6 +100,33 @@ namespace AITraffic.Navigation
                 else if (PlayerManager.PlayerTransform != null)
                 {
                     playerPosition = PlayerManager.PlayerTransform.position;
+                    if (PlayerManager.LastLoco != null && PlayerManager.LastLoco.trainset != null && !AITraffic.Compat.ModCompatManager.IsAITrain(PlayerManager.LastLoco))
+                    {
+                        bool isNearPlayerTrain = false;
+                        if (Vector3.Distance(playerPosition, PlayerManager.LastLoco.transform.position) <= 250f)
+                        {
+                            isNearPlayerTrain = true;
+                        }
+                        else if (PlayerManager.LastLoco.trainset.cars != null)
+                        {
+                            for (int i = 0; i < PlayerManager.LastLoco.trainset.cars.Count; i++)
+                            {
+                                var car = PlayerManager.LastLoco.trainset.cars[i];
+                                if (car != null && Vector3.Distance(playerPosition, car.transform.position) <= 250f)
+                                {
+                                    isNearPlayerTrain = true;
+                                    break;
+                                }
+                            }
+                        }
+
+                        if (isNearPlayerTrain)
+                        {
+                            playerTrainset = PlayerManager.LastLoco.trainset;
+                            playerSpeedKmh = Mathf.Abs(PlayerManager.LastLoco.GetForwardSpeed()) * 3.6f;
+                        }
+                    }
+
                     // Player is on foot, not in a train
                     return true;
                 }
@@ -257,6 +284,8 @@ namespace AITraffic.Navigation
             var bogiesComp = GetBogiesOnTrack(track);
             if (bogiesComp != null && bogiesComp.bogiesOnTrack != null)
             {
+                Trainset lastLocoTrainset = (PlayerManager.LastLoco != null && !AITraffic.Compat.ModCompatManager.IsAITrain(PlayerManager.LastLoco)) ? PlayerManager.LastLoco.trainset : null;
+
                 foreach (var bogie in bogiesComp.bogiesOnTrack)
                 {
                     if (bogie == null || bogie.Car == null) continue;
@@ -274,6 +303,12 @@ namespace AITraffic.Navigation
 
                     // If player is currently boarded in this car/trainset
                     if (PlayerManager.Car == bogie.Car || (PlayerManager.Car != null && PlayerManager.Car.trainset == bogie.Car.trainset))
+                    {
+                        return true;
+                    }
+
+                    // If this car is the player's last operated loco or part of that consist/trainset
+                    if (bogie.Car == PlayerManager.LastLoco || (lastLocoTrainset != null && bogie.Car.trainset == lastLocoTrainset))
                     {
                         return true;
                     }
@@ -688,7 +723,11 @@ namespace AITraffic.Navigation
             if (signal.Controller != null)
             {
                 if (signal.Controller.Type == Signals.Game.SignalType.Exit ||
-                    signal.Controller.PrefabType == Signals.Game.PrefabType.Exit)
+                    signal.Controller.Type == Signals.Game.SignalType.ExitPax ||
+                    signal.Controller.Type == Signals.Game.SignalType.ExitMainline ||
+                    signal.Controller.PrefabType == Signals.Game.PrefabType.Exit ||
+                    signal.Controller.PrefabType == Signals.Game.PrefabType.ExitPax ||
+                    signal.Controller.PrefabType == Signals.Game.PrefabType.ExitMainline)
                 {
                     return true;
                 }
@@ -722,15 +761,52 @@ namespace AITraffic.Navigation
         }
 
         /// <summary>
-        /// Checks whether a DVSignal acts as a line-authorizing departure signal (Main Signal or Station Exit Signal)
+        /// Checks whether a DVSignal acts as a line-authorizing governing Hauptsignal (Main/Exit/Entry/Block signal)
         /// capable of transitioning an AI movement from Slow Shunting Mode into full Line Speed.
-        /// Filters out pure dwarf shunting signals (Sperrsignale).
+        /// Filters out pure dwarf shunting signals (Sperrsignale) and distant repeaters (Vorsignale).
         /// </summary>
         public static bool IsLineSpeedAuthorizingSignal(DVSignal signal)
         {
             if (signal == null) return false;
             if (signal.Parent != null) signal = signal.Parent;
-            return IsMainSignal(signal) || IsExitSignal(signal);
+            if (signal.IsShunting) return false;
+            return IsGoverningSignal(signal);
+        }
+
+        /// <summary>
+        /// Checks whether a DVSignal (or any main signal head on its controller) is displaying a proceed/GO aspect (!DisallowPassing).
+        /// </summary>
+        public static bool IsSignalDisplayingClear(DVSignal signal)
+        {
+            if (signal == null || !ModCompatManager.IsDVSignalsLoaded) return false;
+            var effSig = (signal.Parent != null) ? signal.Parent : signal;
+
+            if (effSig.IsOn && effSig.CurrentAspect != null)
+            {
+                var def = effSig.CurrentAspect.GetDefinition();
+                if (!effSig.CurrentAspect.DisallowPassing && (def == null || !def.DisallowPassing))
+                {
+                    return true;
+                }
+            }
+
+            if (effSig.Controller != null && effSig.Controller.Signals != null)
+            {
+                for (int i = 0; i < effSig.Controller.Signals.Length; i++)
+                {
+                    var s = effSig.Controller.Signals[i];
+                    if (s != null && s.IsOn && s.CurrentAspect != null)
+                    {
+                        var def = s.CurrentAspect.GetDefinition();
+                        if (!s.CurrentAspect.DisallowPassing && (def == null || !def.DisallowPassing))
+                        {
+                            return true;
+                        }
+                    }
+                }
+            }
+
+            return false;
         }
 
         /// <summary>
@@ -1029,6 +1105,34 @@ namespace AITraffic.Navigation
         }
 
         /// <summary>
+        /// Retrieves the track and placement span for a DVSignal or its parent/controller.
+        /// </summary>
+        public static bool TryGetSignalPlacement(DVSignal signal, out RailTrack track, out double span)
+        {
+            track = null;
+            span = 0.0;
+            if (signal == null || !ModCompatManager.IsDVSignalsLoaded) return false;
+
+            if (signal.Controller != null && signal.Controller.PlacementInfo.HasValue)
+            {
+                var p = signal.Controller.PlacementInfo.Value;
+                track = p.Track;
+                span = p.Span;
+                if (track != null) return true;
+            }
+
+            if (signal.Parent != null && signal.Parent.Controller != null && signal.Parent.Controller.PlacementInfo.HasValue)
+            {
+                var p = signal.Parent.Controller.PlacementInfo.Value;
+                track = p.Track;
+                span = p.Span;
+                if (track != null) return true;
+            }
+
+            return false;
+        }
+
+        /// <summary>
         /// Checks whether a DVSignal reservation is held by an active AI train.
         /// </summary>
         public static bool IsSignalReservedByAI(DVSignal signal)
@@ -1184,6 +1288,46 @@ namespace AITraffic.Navigation
         /// - Block 2: From S1 to subsequent downstream Main Signal (S2), up to 1500m ahead.
         /// Extracts all switches inside each block and computes clearance state.
         /// </summary>
+        private sealed class UpcomingSignalDistanceComparer : IComparer<UpcomingSignal>
+        {
+            public int Compare(UpcomingSignal a, UpcomingSignal b)
+            {
+                return a.Distance.CompareTo(b.Distance);
+            }
+        }
+
+        private static readonly UpcomingSignalDistanceComparer s_signalDistanceComparer = new UpcomingSignalDistanceComparer();
+        private static readonly List<UpcomingSignal> s_aheadSignalsScratch = new List<UpcomingSignal>(16);
+
+        // CRITICAL INVARIANT [RGR-11]: Per-train SignalBlockInfo isolation; never share static SignalBlockInfo instances across trains
+        private static SignalBlockInfo GetOrCreatePooledBlock(List<SignalBlockInfo> results, int poolIdx, int blockIndex, DVSignal entrySignal, float distToEntry)
+        {
+            while (results.Count <= poolIdx)
+            {
+                results.Add(new SignalBlockInfo());
+            }
+
+            var blk = results[poolIdx];
+            if (blk == null)
+            {
+                blk = new SignalBlockInfo();
+                results[poolIdx] = blk;
+            }
+            blk.BlockIndex = blockIndex;
+            blk.EntrySignal = entrySignal;
+            blk.ExitSignal = null;
+            blk.DistanceToEntry = distToEntry;
+            blk.DistanceToExit = 0f;
+            blk.BlockLength = 0f;
+            blk.Tracks.Clear();
+            blk.Switches.Clear();
+            blk.IsClear = true;
+            blk.IsPlayerOccupied = false;
+            blk.AspectName = null;
+            blk.AspectColor = Color.white;
+            return blk;
+        }
+
         public static bool CalculateUpcomingSignalBlocks(
             RailTrack currentTrack,
             double currentSpan,
@@ -1194,23 +1338,20 @@ namespace AITraffic.Navigation
             float maxHorizon = 1500f)
         {
             if (results == null) return false;
-            results.Clear();
 
-            if (currentTrack == null) return false;
+            if (currentTrack == null)
+            {
+                results.Clear();
+                return false;
+            }
 
             if (!s_isInitialized || s_trackSignals.Count == 0)
             {
                 Initialize();
             }
 
-            var currentBlock = new SignalBlockInfo
-            {
-                BlockIndex = 1,
-                EntrySignal = null,
-                DistanceToEntry = 0f,
-                IsClear = true
-            };
-            results.Add(currentBlock);
+            int poolIdx = 0;
+            var currentBlock = GetOrCreatePooledBlock(results, poolIdx++, 1, null, 0f);
 
             float accumulatedDist = 0.0f;
             RailTrack prevTrack = currentTrack;
@@ -1243,7 +1384,8 @@ namespace AITraffic.Navigation
             List<DVSignal> curSignals;
             if (s_trackSignals.TryGetValue(currentTrack, out curSignals) && curSignals != null)
             {
-                var aheadSignals = new List<UpcomingSignal>();
+                var aheadSignals = s_aheadSignalsScratch;
+                aheadSignals.Clear();
                 for (int i = 0; i < curSignals.Count; i++)
                 {
                     var sig = curSignals[i];
@@ -1262,7 +1404,7 @@ namespace AITraffic.Navigation
 
                 if (aheadSignals.Count > 1)
                 {
-                    aheadSignals.Sort((a, b) => a.Distance.CompareTo(b.Distance));
+                    aheadSignals.Sort(s_signalDistanceComparer);
                 }
 
                 for (int i = 0; i < aheadSignals.Count; i++)
@@ -1281,14 +1423,7 @@ namespace AITraffic.Navigation
                             currentBlock.AspectName = GetAspectDisplayName(sig);
                             currentBlock.AspectColor = GetAspectColor(sig);
 
-                            currentBlock = new SignalBlockInfo
-                            {
-                                BlockIndex = 2,
-                                EntrySignal = sig,
-                                DistanceToEntry = dist,
-                                IsClear = true
-                            };
-                            results.Add(currentBlock);
+                            currentBlock = GetOrCreatePooledBlock(results, poolIdx++, 2, sig, dist);
                         }
                         else if (currentBlock.BlockIndex == 2)
                         {
@@ -1366,7 +1501,8 @@ namespace AITraffic.Navigation
                     List<DVSignal> rSignals;
                     if (s_trackSignals.TryGetValue(rTrack, out rSignals) && rSignals != null)
                     {
-                        var trackAheadSignals = new List<UpcomingSignal>();
+                        var trackAheadSignals = s_aheadSignalsScratch;
+                        trackAheadSignals.Clear();
                         for (int i = 0; i < rSignals.Count; i++)
                         {
                             var sig = rSignals[i];
@@ -1383,7 +1519,7 @@ namespace AITraffic.Navigation
 
                         if (trackAheadSignals.Count > 1)
                         {
-                            trackAheadSignals.Sort((a, b) => a.Distance.CompareTo(b.Distance));
+                            trackAheadSignals.Sort(s_signalDistanceComparer);
                         }
 
                         for (int i = 0; i < trackAheadSignals.Count; i++)
@@ -1404,14 +1540,7 @@ namespace AITraffic.Navigation
                                 int nextIdx = currentBlock.BlockIndex + 1;
                                 if (nextIdx <= 4 && accumulatedDist < maxHorizon)
                                 {
-                                    currentBlock = new SignalBlockInfo
-                                    {
-                                        BlockIndex = nextIdx,
-                                        EntrySignal = sig,
-                                        DistanceToEntry = sigDist,
-                                        IsClear = true
-                                    };
-                                    results.Add(currentBlock);
+                                    currentBlock = GetOrCreatePooledBlock(results, poolIdx++, nextIdx, sig, sigDist);
                                 }
                                 else
                                 {
@@ -1430,6 +1559,11 @@ namespace AITraffic.Navigation
                         break;
                     }
                 }
+            }
+
+            while (results.Count > poolIdx)
+            {
+                results.RemoveAt(results.Count - 1);
             }
 
             // Finalize open blocks
@@ -1617,11 +1751,42 @@ namespace AITraffic.Navigation
             TrainCar myLoco,
             out RailTrack obstacleTrack)
         {
+            TrainCar unusedCar;
+            Vector3 unusedDir;
+            return TryFindUpcomingObstacle(
+                currentTrack,
+                currentSpan,
+                direction,
+                upcomingRoute,
+                myTrainset,
+                out distanceToObstacle,
+                myLoco,
+                out obstacleTrack,
+                out unusedCar,
+                out unusedDir);
+        }
+
+        // CRITICAL INVARIANT [AIE-15]: Output obstacleCar and local ourDirectionAtObstacle tangent so AIEngineer can distinguish same-direction traffic from head-on or stationary obstacles.
+        public static bool TryFindUpcomingObstacle(
+            RailTrack currentTrack,
+            double currentSpan,
+            float direction,
+            IList<RailTrack> upcomingRoute,
+            Trainset myTrainset,
+            out float distanceToObstacle,
+            TrainCar myLoco,
+            out RailTrack obstacleTrack,
+            out TrainCar obstacleCar,
+            out Vector3 ourDirectionAtObstacle)
+        {
             distanceToObstacle = float.PositiveInfinity;
             obstacleTrack = null;
+            obstacleCar = null;
+            ourDirectionAtObstacle = Vector3.zero;
             if (currentTrack == null) return false;
 
             float accumulatedDist = 0.0f;
+            double trackLen = currentTrack.curve != null ? currentTrack.curve.length : 100.0;
 
             // 1. Check current track for other cars ahead
             var curBogiesComp = GetBogiesOnTrack(currentTrack);
@@ -1647,6 +1812,14 @@ namespace AITraffic.Navigation
                         {
                             distanceToObstacle = dist;
                             obstacleTrack = currentTrack;
+                            obstacleCar = bogie.Car;
+                            if (currentTrack.curve != null)
+                            {
+                                float tNorm = (trackLen > 1.0) ? Mathf.Clamp01((float)(bSpan / trackLen)) : 0.5f;
+                                Vector3 p0 = currentTrack.curve.GetPointAt(Mathf.Max(0.0f, tNorm - 0.05f));
+                                Vector3 p1 = currentTrack.curve.GetPointAt(Mathf.Min(1.0f, tNorm + 0.05f));
+                                ourDirectionAtObstacle = ((p1 - p0).sqrMagnitude > 0.0001f) ? (p1 - p0).normalized : Vector3.zero;
+                            }
                         }
                     }
                     else if (direction < 0.0f && bSpan < currentSpan)
@@ -1656,6 +1829,14 @@ namespace AITraffic.Navigation
                         {
                             distanceToObstacle = dist;
                             obstacleTrack = currentTrack;
+                            obstacleCar = bogie.Car;
+                            if (currentTrack.curve != null)
+                            {
+                                float tNorm = (trackLen > 1.0) ? Mathf.Clamp01((float)(bSpan / trackLen)) : 0.5f;
+                                Vector3 p0 = currentTrack.curve.GetPointAt(Mathf.Max(0.0f, tNorm - 0.05f));
+                                Vector3 p1 = currentTrack.curve.GetPointAt(Mathf.Min(1.0f, tNorm + 0.05f));
+                                ourDirectionAtObstacle = ((p1 - p0).sqrMagnitude > 0.0001f) ? (p0 - p1).normalized : Vector3.zero;
+                            }
                         }
                     }
                 }
@@ -1666,7 +1847,6 @@ namespace AITraffic.Navigation
                 return true;
             }
 
-            double trackLen = currentTrack.curve != null ? currentTrack.curve.length : 100.0;
             accumulatedDist += (direction >= 0.0f) ? Mathf.Max(0.0f, (float)(trackLen - currentSpan)) : Mathf.Max(0.0f, (float)currentSpan);
 
             // 2. Scan upcoming route tracks (up to 1500m lookahead) with geometric direction tracking
@@ -1715,6 +1895,12 @@ namespace AITraffic.Navigation
                             {
                                 distanceToObstacle = dist;
                                 obstacleTrack = rTrack;
+                                obstacleCar = bogie.Car;
+                                float tNorm = (rTrackLen > 1.0) ? Mathf.Clamp01((float)(bSpan / rTrackLen)) : 0.5f;
+                                Vector3 p0 = rTrack.curve.GetPointAt(Mathf.Max(0.0f, tNorm - 0.05f));
+                                Vector3 p1 = rTrack.curve.GetPointAt(Mathf.Min(1.0f, tNorm + 0.05f));
+                                Vector3 segDir = ((p1 - p0).sqrMagnitude > 0.0001f) ? (p1 - p0).normalized : (endPos - startPos).normalized;
+                                ourDirectionAtObstacle = (routeDir >= 0.0f) ? segDir : -segDir;
                             }
                         }
 

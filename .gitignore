@@ -31,3 +31,18 @@
 .DS_Store
 Thumbs.db
 [Dd]esktop.ini
+
+# Agent Handoff & Temporary Planning Files
+SCOUT_REPORT.md
+SPEC.md
+
+# Python Caches
+__pycache__/
+*.pyc
+
+# Internal Planning & Architecture Documents
+GRAVEYARD.md
+VISION_AND_ARCHITECTURE.md
+docs/issues/
+docs/artifacts/
+

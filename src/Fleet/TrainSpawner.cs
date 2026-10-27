@@ -53,9 +53,10 @@ namespace AITraffic.Fleet
             lock (s_spawningCarsLock)
             {
                 s_spawningCars.Add(car);
-                if (!string.IsNullOrEmpty(car.ID))
+                string cId = ModCompatManager.GetCarId(car);
+                if (!string.IsNullOrEmpty(cId))
                 {
-                    s_spawningCarIds.Add(car.ID);
+                    s_spawningCarIds.Add(cId);
                 }
             }
         }
@@ -70,9 +71,10 @@ namespace AITraffic.Fleet
                     if (c != null)
                     {
                         s_spawningCars.Remove(c);
-                        if (!string.IsNullOrEmpty(c.ID))
+                        string cId = ModCompatManager.GetCarId(c);
+                        if (!string.IsNullOrEmpty(cId))
                         {
-                            s_spawningCarIds.Remove(c.ID);
+                            s_spawningCarIds.Remove(cId);
                         }
                     }
                 }
@@ -139,6 +141,141 @@ namespace AITraffic.Fleet
         /// Instantly verifies mathematically (&lt;0.05ms) if a consist of the given liveries can physically fit
         /// on the target track without colliding with track buffer limits.
         /// </summary>
+        /// <summary>
+        /// Checks if the player has acquired the Military 1 job license.
+        /// </summary>
+        public static bool IsMilitaryLicenseAcquired()
+        {
+            try
+            {
+                if (LicenseManager.Instance == null) return false;
+                var acquired = LicenseManager.Instance.GetAcquiredJobLicenses();
+                if (acquired != null)
+                {
+                    foreach (var lic in acquired)
+                    {
+                        if (lic != null && (lic.v1 == DV.ThingTypes.JobLicenses.Military1 || string.Equals(lic.id, "Military1", StringComparison.OrdinalIgnoreCase)))
+                        {
+                            return true;
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                if (Main.ModEntry != null && Main.ModEntry.Logger != null)
+                    Main.ModEntry.Logger.Warning("[TrainSpawner] Error checking military license: " + ex.Message);
+            }
+            return false;
+        }
+
+        /// <summary>
+        /// Identifies whether a rail track belongs to a military installation:
+        /// 1. Military Base (MB)
+        /// 2. Harbor Military Base (HMB) / Harbor Town (HB) military spur
+        /// 3. Machine Factory Military Base (MFMB) / Machine Factory (MF) gated military section
+        /// </summary>
+        // CRITICAL INVARIANT [FLT-11]: Gate all three military bases (MB, HMB, MFMB) and generic "Road ... MA/MB" tracks behind Military1 license (See GRAVEYARD.md)
+        public static bool IsMilitaryTrack(RailTrack track)
+        {
+            if (track == null) return false;
+
+            var logicTrack = ModCompatManager.GetLogicTrack(track);
+            if (logicTrack != null && logicTrack.ID != null)
+            {
+                string yard = logicTrack.ID.yardId ?? string.Empty;
+                string subYard = logicTrack.ID.SignIDSubYardPart ?? string.Empty;
+                if (string.Equals(yard, "MB", StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(yard, "MA", StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(yard, "HMB", StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(yard, "HBMB", StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(yard, "MFMB", StringComparison.OrdinalIgnoreCase) ||
+                    yard.EndsWith("MB", StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(subYard, "MB", StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(subYard, "MA", StringComparison.OrdinalIgnoreCase))
+                {
+                    return true;
+                }
+
+                string trackPart = logicTrack.ID.TrackPartOnly ?? string.Empty;
+                string display = logicTrack.ID.FullDisplayID ?? string.Empty;
+
+                if (string.Equals(yard, "HB", StringComparison.OrdinalIgnoreCase) &&
+                    (trackPart.StartsWith("D", StringComparison.OrdinalIgnoreCase) || display.IndexOf("HB-D", StringComparison.OrdinalIgnoreCase) >= 0))
+                {
+                    return true;
+                }
+
+                if (string.Equals(yard, "MF", StringComparison.OrdinalIgnoreCase) &&
+                    (trackPart.StartsWith("C", StringComparison.OrdinalIgnoreCase) || display.IndexOf("MF-C", StringComparison.OrdinalIgnoreCase) >= 0))
+                {
+                    return true;
+                }
+            }
+
+            string name = (track.name ?? string.Empty).Trim();
+            if (name.IndexOf("Military", StringComparison.OrdinalIgnoreCase) >= 0) return true;
+            if (name.IndexOf("[#MB", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                name.IndexOf("[MB", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                name.IndexOf("_[MB]_", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                name.IndexOf("[MA", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                name.IndexOf("_[MA]_", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                name.IndexOf("MB-", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                name.IndexOf("-MB-", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                name.IndexOf("_MB_", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                name.IndexOf("-MA-", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                name.IndexOf("_MA_", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                name.EndsWith(" MB", StringComparison.OrdinalIgnoreCase) ||
+                name.EndsWith("-MB", StringComparison.OrdinalIgnoreCase) ||
+                name.EndsWith("_MB", StringComparison.OrdinalIgnoreCase) ||
+                name.EndsWith(" MA", StringComparison.OrdinalIgnoreCase) ||
+                name.EndsWith("-MA", StringComparison.OrdinalIgnoreCase) ||
+                name.EndsWith("_MA", StringComparison.OrdinalIgnoreCase) ||
+                name.IndexOf(" MB ", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                name.IndexOf(" MB]", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                name.IndexOf(" MA ", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                name.IndexOf(" MA]", StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                return true;
+            }
+            if (name.IndexOf("HMB", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                name.IndexOf("HBMB", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                name.IndexOf("HB-MB", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                name.IndexOf("HB_MB", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                name.IndexOf("HB-D", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                name.IndexOf("HB_D", StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                return true;
+            }
+            if (name.IndexOf("MFMB", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                name.IndexOf("MF-MB", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                name.IndexOf("MF_MB", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                name.IndexOf("MF-C", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                name.IndexOf("MF_C", StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                return true;
+            }
+
+            return false;
+        }
+
+        /// <summary>
+        /// Filters a collection of candidate tracks, excluding military tracks if the player lacks Military 1 license.
+        /// </summary>
+        public static List<RailTrack> FilterCandidateSpawnTracks(IEnumerable<RailTrack> tracks)
+        {
+            var result = new List<RailTrack>();
+            if (tracks == null) return result;
+            bool militaryAllowed = IsMilitaryLicenseAcquired();
+            foreach (var t in tracks)
+            {
+                if (t == null) continue;
+                if (!militaryAllowed && IsMilitaryTrack(t)) continue;
+                result.Add(t);
+            }
+            return result;
+        }
+
         public static bool CanConsistFitOnTrack(
             List<TrainCarLivery> liveries,
             RailTrack track,
@@ -146,6 +283,10 @@ namespace AITraffic.Fleet
             bool flipTrainConsist = false)
         {
             if (track == null || track.curve == null || liveries == null || liveries.Count == 0)
+                return false;
+
+            // Military track gating: exclude military tracks if player lacks Military 1 license
+            if (IsMilitaryTrack(track) && !IsMilitaryLicenseAcquired())
                 return false;
 
             float totalLength = CarSpawner.Instance != null
@@ -206,10 +347,17 @@ namespace AITraffic.Fleet
             bool flipTrainConsist = false,
             System.Random rng = null)
         {
-            if (track == null)
+            if (track == null || track.curve == null)
             {
                 if (Main.ModEntry != null && Main.ModEntry.Logger != null)
-                    Main.ModEntry.Logger.Error("TrainSpawner.SpawnAITrain failed: Target track is null.");
+                    Main.ModEntry.Logger.Error("TrainSpawner.SpawnAITrain failed: Target track or track curve lookup is null.");
+                return null;
+            }
+
+            if (IsMilitaryTrack(track) && !IsMilitaryLicenseAcquired())
+            {
+                if (Main.ModEntry != null && Main.ModEntry.Logger != null)
+                    Main.ModEntry.Logger.Warning(string.Format("TrainSpawner: Cannot spawn on military track '{0}' without Military 1 license.", track.name));
                 return null;
             }
 
@@ -238,10 +386,18 @@ namespace AITraffic.Fleet
             System.Random rng = null,
             Action<AIEngineer> onComplete = null)
         {
-            if (track == null)
+            if (track == null || track.curve == null)
             {
                 if (Main.ModEntry != null && Main.ModEntry.Logger != null)
-                    Main.ModEntry.Logger.Error("TrainSpawner.SpawnAITrainCoroutine failed: Target track is null.");
+                    Main.ModEntry.Logger.Error("TrainSpawner.SpawnAITrainCoroutine failed: Target track or track curve lookup is null.");
+                if (onComplete != null) onComplete(null);
+                yield break;
+            }
+
+            if (IsMilitaryTrack(track) && !IsMilitaryLicenseAcquired())
+            {
+                if (Main.ModEntry != null && Main.ModEntry.Logger != null)
+                    Main.ModEntry.Logger.Warning(string.Format("TrainSpawner.SpawnAITrainCoroutine: Target track '{0}' is in a military installation and player lacks Military 1 license. Aborting spawn.", track.name));
                 if (onComplete != null) onComplete(null);
                 yield break;
             }
@@ -289,10 +445,18 @@ namespace AITraffic.Fleet
             ConsistType consistType = ConsistType.RegionalFreight,
             bool startInShuntingMode = false)
         {
-            if (track == null || specs == null || specs.Count == 0)
+            if (track == null || track.curve == null || specs == null || specs.Count == 0)
             {
                 if (Main.ModEntry != null && Main.ModEntry.Logger != null)
-                    Main.ModEntry.Logger.Error("TrainSpawner.SpawnAITrainCoroutine failed: Invalid arguments.");
+                    Main.ModEntry.Logger.Error("TrainSpawner.SpawnAITrainCoroutine failed: Target track or track curve lookup is null, or invalid arguments.");
+                if (onComplete != null) onComplete(null);
+                yield break;
+            }
+
+            if (IsMilitaryTrack(track) && !IsMilitaryLicenseAcquired())
+            {
+                if (Main.ModEntry != null && Main.ModEntry.Logger != null)
+                    Main.ModEntry.Logger.Warning(string.Format("TrainSpawner.SpawnAITrainCoroutine: Target track '{0}' is in a military installation and player lacks Military 1 license. Aborting spawn.", track.name));
                 if (onComplete != null) onComplete(null);
                 yield break;
             }
@@ -341,10 +505,17 @@ namespace AITraffic.Fleet
         /// <returns>The attached AIEngineer controller on the lead locomotive, or null if spawn failed.</returns>
         public static AIEngineer SpawnAITrain(RailTrack track, List<ConsistCarSpec> specs, double startSpan = 15.0, bool flipTrainConsist = false)
         {
-            if (track == null || specs == null || specs.Count == 0)
+            if (track == null || track.curve == null || specs == null || specs.Count == 0)
             {
                 if (Main.ModEntry != null && Main.ModEntry.Logger != null)
-                    Main.ModEntry.Logger.Error("TrainSpawner.SpawnAITrain failed: Invalid arguments.");
+                    Main.ModEntry.Logger.Error("TrainSpawner.SpawnAITrain failed: Target track or track curve lookup is null, or invalid arguments.");
+                return null;
+            }
+
+            if (IsMilitaryTrack(track) && !IsMilitaryLicenseAcquired())
+            {
+                if (Main.ModEntry != null && Main.ModEntry.Logger != null)
+                    Main.ModEntry.Logger.Warning(string.Format("TrainSpawner: Cannot spawn on military track '{0}' without Military 1 license.", track.name));
                 return null;
             }
 
@@ -370,10 +541,17 @@ namespace AITraffic.Fleet
         /// <returns>The attached AIEngineer controller on the lead locomotive, or null if spawn failed.</returns>
         public static AIEngineer SpawnAITrain(RailTrack track, List<TrainCarLivery> liveries, double startSpan = 15.0, bool flipTrainConsist = false)
         {
-            if (track == null || liveries == null || liveries.Count == 0)
+            if (track == null || track.curve == null || liveries == null || liveries.Count == 0)
             {
                 if (Main.ModEntry != null && Main.ModEntry.Logger != null)
-                    Main.ModEntry.Logger.Error("TrainSpawner.SpawnAITrain failed: Invalid arguments.");
+                    Main.ModEntry.Logger.Error("TrainSpawner.SpawnAITrain failed: Target track or track curve lookup is null, or invalid arguments.");
+                return null;
+            }
+
+            if (IsMilitaryTrack(track) && !IsMilitaryLicenseAcquired())
+            {
+                if (Main.ModEntry != null && Main.ModEntry.Logger != null)
+                    Main.ModEntry.Logger.Warning(string.Format("TrainSpawner: Cannot spawn on military track '{0}' without Military 1 license.", track.name));
                 return null;
             }
 
@@ -396,10 +574,18 @@ namespace AITraffic.Fleet
             ConsistType consistType = ConsistType.RegionalFreight,
             bool startInShuntingMode = false)
         {
-            if (track == null || liveries == null || liveries.Count == 0)
+            if (track == null || track.curve == null || liveries == null || liveries.Count == 0)
             {
                 if (Main.ModEntry != null && Main.ModEntry.Logger != null)
-                    Main.ModEntry.Logger.Error("TrainSpawner.SpawnAITrainInternalCoroutine failed: Invalid arguments.");
+                    Main.ModEntry.Logger.Error("TrainSpawner.SpawnAITrainInternalCoroutine failed: Target track or track curve lookup is null, or invalid arguments.");
+                if (onComplete != null) onComplete(null);
+                yield break;
+            }
+
+            if (IsMilitaryTrack(track) && !IsMilitaryLicenseAcquired())
+            {
+                if (Main.ModEntry != null && Main.ModEntry.Logger != null)
+                    Main.ModEntry.Logger.Warning(string.Format("TrainSpawner.SpawnAITrainInternalCoroutine: Target track '{0}' is in a military installation and player lacks Military 1 license. Aborting spawn.", track.name));
                 if (onComplete != null) onComplete(null);
                 yield break;
             }
@@ -455,10 +641,29 @@ namespace AITraffic.Fleet
                     Main.ModEntry.Logger.Error(string.Format("TrainSpawner: GetTrackMiddleBasedSpawnData exception: {0}", ex));
             }
 
-            if (!dataGenerated || spawnData.carData == null || spawnData.carData.Length == 0)
+            if (!dataGenerated || spawnData.carData == null || spawnData.carData.Length == 0 || spawnData.track == null || spawnData.track.curve == null)
             {
                 if (Main.ModEntry != null && Main.ModEntry.Logger != null)
-                    Main.ModEntry.Logger.Error(string.Format("TrainSpawner: Failed to compute spawn data (result: {0}) on track '{1}'.", spawnData.result, track.name));
+                    Main.ModEntry.Logger.Error(string.Format("TrainSpawner: Failed to compute valid spawn data (result: {0}) or track curve lookup is null on track '{1}'.", spawnData.result, track != null ? track.name : "null"));
+                if (onComplete != null) onComplete(null);
+                yield break;
+            }
+
+            // CRITICAL INVARIANT [FLT-03]: Sea-Level Ocean Spawning at Vector3.Zero (See GRAVEYARD.md)
+            bool invalidPositionFound = false;
+            for (int pIdx = 0; pIdx < spawnData.carData.Length; pIdx++)
+            {
+                Vector3 pos = spawnData.carData[pIdx].position;
+                if (pos == Vector3.zero || pos.sqrMagnitude < 0.0001f)
+                {
+                    if (Main.ModEntry != null && Main.ModEntry.Logger != null)
+                        Main.ModEntry.Logger.Error(string.Format("TrainSpawner: Car {0} computed spawn position is Vector3.zero on track '{1}'. Aborting spawn cleanly to prevent spawning in ocean.", pIdx, track.name));
+                    invalidPositionFound = true;
+                    break;
+                }
+            }
+            if (invalidPositionFound)
+            {
                 if (onComplete != null) onComplete(null);
                 yield break;
             }
@@ -472,7 +677,7 @@ namespace AITraffic.Fleet
             for (int i = 0; i < spawnData.carData.Length; i++)
             {
                 // Safety check: if scene is unloading or world tracks are destroyed, abort immediately
-                if (!WorldStreamingInit.IsLoaded || track == null || spawnData.track == null || CarSpawner.Instance == null)
+                if (!Main.IsWorldFullyLoaded || track == null || spawnData.track == null || spawnData.track.curve == null || CarSpawner.Instance == null)
                 {
                     if (Main.ModEntry != null && Main.ModEntry.Logger != null)
                         Main.ModEntry.Logger.Warning(string.Format("TrainSpawner: Aborting spawn loop at car {0}/{1} due to world unload or invalid track.", i, spawnData.carData.Length));
@@ -482,6 +687,15 @@ namespace AITraffic.Fleet
 
                 var cData = spawnData.carData[i];
                 if (cData.prefab == null) continue;
+
+                // Validate position before calling CarSpawner
+                if (cData.position == Vector3.zero || cData.position.sqrMagnitude < 0.0001f)
+                {
+                    if (Main.ModEntry != null && Main.ModEntry.Logger != null)
+                        Main.ModEntry.Logger.Error(string.Format("TrainSpawner: Aborting spawn: car {0} computed position is Vector3.zero on track '{1}'.", i, track.name));
+                    spawnFailed = true;
+                    break;
+                }
 
                 TrainCar car = null;
                 try
@@ -511,9 +725,9 @@ namespace AITraffic.Fleet
                     break;
                 }
 
-                // Tag IMMEDIATELY so car is registered in AI collections and never left as an untracked ghost
-                ModCompatManager.TagCarAsAITraffic(car);
+                // Register in spawning registry immediately so subsequent tagging recognizes it as newly instantiated AI equipment
                 RegisterSpawningCar(car);
+                ModCompatManager.TagCarAsAITraffic(car);
                 spawnedCars.Add(car);
                 AITraffic.Diagnostics.PerformanceProfiler.RecordSpawnCar(spawnedCars.Count, spawnData.carData.Length);
 
@@ -546,12 +760,13 @@ namespace AITraffic.Fleet
                     Main.ModEntry.Logger.Error(string.Format("TrainSpawner: Consist spawn failed or incomplete ({0}/{1} cars spawned) on track '{2}'. Rolling back and cleaning up partial consist.",
                         spawnedCars.Count, spawnData.carData.Length, track != null ? track.name : "null"));
 
+                // CRITICAL INVARIANT [FLT-04]: Atomic consist rollback via SafeDeleteCars (See GRAVEYARD.md)
                 UnregisterSpawningCars(spawnedCars);
                 if (CarSpawner.Instance != null && spawnedCars.Count > 0)
                 {
                     try
                     {
-                        CarSpawner.Instance.DeleteTrainCars(spawnedCars, forceInstantDestroy: true);
+                        TrainDespawner.SafeDeleteCars(spawnedCars, true);
                     }
                     catch (Exception delEx)
                     {
@@ -689,10 +904,7 @@ namespace AITraffic.Fleet
                     if (existingDebt != null)
                     {
                         DV.ServicePenalty.LocoDebtController.Instance.trackedLocosDebts.Remove(existingDebt);
-                        if (DV.ServicePenalty.CareerManagerDebtController.Instance != null)
-                        {
-                            DV.ServicePenalty.CareerManagerDebtController.Instance.UnregisterDebt(existingDebt);
-                        }
+                        AITraffic.Compat.AIDebtPatches.SafeUnregisterDebt(existingDebt);
                     }
                 }
 
@@ -712,7 +924,8 @@ namespace AITraffic.Fleet
                 var car = spawnedCars[i];
                 if (car != null && car.IsLoco)
                 {
-                    InitializeLocomotive(car);
+                    bool isLead = (car == leadLoco);
+                    InitializeLocomotive(car, isLead);
                     yield return null;
                 }
             }
@@ -750,10 +963,10 @@ namespace AITraffic.Fleet
             // Yield 1 final frame so AIEngineer Awake/Start complete before caller accesses the engineer
             yield return null;
 
-            if (Main.ModEntry != null && Main.ModEntry.Logger != null)
+            if (Main.IsDebugLoggingEnabled)
             {
-                Main.ModEntry.Logger.Log(string.Format("[TrainSpawner] Successfully time-sliced spawned AI train ({0} cars, Lead Loco: {1}) on track '{2}'.",
-                    spawnedCars.Count, leadLoco.ID, track.name));
+                Main.LogDebug(string.Format("[TrainSpawner] Successfully time-sliced spawned AI train ({0} cars, Lead Loco: {1}) on track '{2}'.",
+                    spawnedCars.Count, ModCompatManager.GetCarId(leadLoco), track.name));
             }
 
             float spawnDuration = Time.realtimeSinceStartup - spawnStartTime;
@@ -772,10 +985,17 @@ namespace AITraffic.Fleet
             double startSpan,
             bool flipTrainConsist)
         {
-            if (track == null || liveries == null || liveries.Count == 0)
+            if (track == null || track.curve == null || liveries == null || liveries.Count == 0)
             {
                 if (Main.ModEntry != null && Main.ModEntry.Logger != null)
-                    Main.ModEntry.Logger.Error("TrainSpawner.SpawnAITrain failed: Invalid arguments.");
+                    Main.ModEntry.Logger.Error("TrainSpawner.SpawnAITrain failed: Target track or track curve lookup is null, or invalid arguments.");
+                return null;
+            }
+
+            if (IsMilitaryTrack(track) && !IsMilitaryLicenseAcquired())
+            {
+                if (Main.ModEntry != null && Main.ModEntry.Logger != null)
+                    Main.ModEntry.Logger.Warning(string.Format("TrainSpawner: Cannot spawn on military track '{0}' without Military 1 license.", track.name));
                 return null;
             }
 
@@ -813,6 +1033,32 @@ namespace AITraffic.Fleet
                     orientationList.Add(false);
                 }
 
+                // CRITICAL INVARIANT [FLT-03]: Validate all computed car positions against Vector3.zero BEFORE calling CarSpawner (See GRAVEYARD.md)
+                CarSpawner.SpawnData preCheckData = CarSpawner.GetTrackMiddleBasedSpawnData(
+                    liveries,
+                    orientationList,
+                    track,
+                    startSpan,
+                    flipTrainConsist);
+
+                if (preCheckData.result != CarSpawner.SpawnDataResult.OK || preCheckData.carData == null || preCheckData.carData.Length == 0)
+                {
+                    if (Main.ModEntry != null && Main.ModEntry.Logger != null)
+                        Main.ModEntry.Logger.Error(string.Format("TrainSpawner: Failed to compute valid spawn data (result: {0}) on track '{1}'. Aborting synchronous spawn.", preCheckData.result, track.name));
+                    return null;
+                }
+
+                for (int pIdx = 0; pIdx < preCheckData.carData.Length; pIdx++)
+                {
+                    Vector3 pos = preCheckData.carData[pIdx].position;
+                    if (pos == Vector3.zero || pos.sqrMagnitude < 0.0001f)
+                    {
+                        if (Main.ModEntry != null && Main.ModEntry.Logger != null)
+                            Main.ModEntry.Logger.Error(string.Format("TrainSpawner: Car {0} computed spawn position is Vector3.zero on track '{1}'. Aborting synchronous spawn to prevent ocean spawning.", pIdx, track.name));
+                        return null;
+                    }
+                }
+
                 // 1. Spawn cars on track with playerSpawnedCars = true so SimController natively skips debt tracking
                 IsSpawningAmbientConsist = true;
                 spawnedCars = CarSpawner.Instance.SpawnCarTypesOnTrack(
@@ -839,6 +1085,15 @@ namespace AITraffic.Fleet
                     var c = spawnedCars[i];
                     if (c != null)
                     {
+                        if (c.transform.position == Vector3.zero || c.transform.position.sqrMagnitude < 0.0001f)
+                        {
+                            if (Main.ModEntry != null && Main.ModEntry.Logger != null)
+                                Main.ModEntry.Logger.Error(string.Format("TrainSpawner: Car {0} spawned at Vector3.zero on track '{1}'. Rolling back consist to prevent ocean spawning.", i, track.name));
+                            // CRITICAL INVARIANT [FLT-04]: Roll back consist via SafeDeleteCars on invalid position (See GRAVEYARD.md)
+                            TrainDespawner.SafeDeleteCars(spawnedCars, true);
+                            IsSpawningAmbientConsist = false;
+                            return null;
+                        }
                         RegisterSpawningCar(c);
                         c.playerSpawnedCar = true;
                         c.preventDebtDisplay = true;
@@ -895,10 +1150,7 @@ namespace AITraffic.Fleet
                         if (existingDebt != null)
                         {
                             DV.ServicePenalty.LocoDebtController.Instance.trackedLocosDebts.Remove(existingDebt);
-                            if (DV.ServicePenalty.CareerManagerDebtController.Instance != null)
-                            {
-                                DV.ServicePenalty.CareerManagerDebtController.Instance.UnregisterDebt(existingDebt);
-                            }
+                            AITraffic.Compat.AIDebtPatches.SafeUnregisterDebt(existingDebt);
                         }
                     }
 
@@ -925,7 +1177,8 @@ namespace AITraffic.Fleet
                     var car = spawnedCars[i];
                     if (car != null && car.IsLoco)
                     {
-                        InitializeLocomotive(car);
+                        bool isLead = (car == leadLoco);
+                        InitializeLocomotive(car, isLead);
                     }
                 }
 
@@ -965,7 +1218,7 @@ namespace AITraffic.Fleet
                 if (Main.ModEntry != null && Main.ModEntry.Logger != null)
                 {
                     Main.ModEntry.Logger.Log(string.Format("[TrainSpawner] Successfully spawned AI train ({0} cars, Lead Loco: {1}) on track '{2}'.",
-                        spawnedCars.Count, leadLoco.ID, track.name));
+                        spawnedCars.Count, ModCompatManager.GetCarId(leadLoco), track.name));
                 }
 
                 return engineer;
@@ -990,12 +1243,31 @@ namespace AITraffic.Fleet
             int loadedCarCount = 0;
             string sampleCargoName = "None";
 
-            for (int i = 0; i < spawnedCars.Count && i < specs.Count; i++)
+            // CRITICAL INVARIANT [FLT-08]: Base game CarSpawner.GetUninitializedSpawnData reverses car order when flipTrainConsist is false.
+            // Detect whether spawnedCars is inverted relative to specs so each physical wagon receives its own matching cargo spec.
+            int count = Mathf.Min(spawnedCars.Count, specs.Count);
+            int forwardMatches = 0;
+            int reverseMatches = 0;
+            for (int m = 0; m < count; m++)
+            {
+                var c = spawnedCars[m];
+                if (c == null) continue;
+                if (c.carLivery == specs[m].Livery) forwardMatches++;
+                if (c.carLivery == specs[count - 1 - m].Livery) reverseMatches++;
+            }
+            bool isReversed = reverseMatches > forwardMatches;
+            if (forwardMatches == reverseMatches && count > 1 && spawnedCars[0] != null && spawnedCars[count - 1] != null)
+            {
+                isReversed = !spawnedCars[0].IsLoco && spawnedCars[count - 1].IsLoco;
+            }
+
+            for (int i = 0; i < count; i++)
             {
                 var car = spawnedCars[i];
                 if (car == null || car.IsLoco) continue;
 
-                CargoType cargoToLoad = specs[i].Cargo;
+                int specIndex = isReversed ? (count - 1 - i) : i;
+                CargoType cargoToLoad = specs[specIndex].Cargo;
                 if (cargoToLoad != CargoType.None && car.logicCar != null)
                 {
                     try
@@ -1008,7 +1280,7 @@ namespace AITraffic.Fleet
                     catch (Exception ex)
                     {
                         if (Main.ModEntry != null && Main.ModEntry.Logger != null)
-                            Main.ModEntry.Logger.Warning(string.Format("Failed loading cargo '{0}' onto car '{1}': {2}", cargoToLoad, car.ID, ex.Message));
+                            Main.ModEntry.Logger.Warning(string.Format("Failed loading cargo '{0}' onto car '{1}': {2}", cargoToLoad, ModCompatManager.GetCarId(car), ex.Message));
                     }
 
                     // Stagger: yield 0.10s (~6 frames at 60 FPS) between loaded cars to distribute 3D mesh instantiation and texture uploads smoothly
@@ -1016,9 +1288,9 @@ namespace AITraffic.Fleet
                 }
             }
 
-            if (Main.ModEntry != null && Main.ModEntry.Logger != null && loadedCarCount > 0)
+            if (Main.IsDebugLoggingEnabled && loadedCarCount > 0)
             {
-                Main.ModEntry.Logger.Log(string.Format("[TrainSpawner] Completed cargo loading for {0} cars ({1}).", loadedCarCount, sampleCargoName));
+                Main.LogDebug(string.Format("[TrainSpawner] Completed cargo loading for {0} cars ({1}).", loadedCarCount, sampleCargoName));
             }
         }
 
@@ -1136,7 +1408,7 @@ namespace AITraffic.Fleet
                 catch (Exception ex)
                 {
                     if (Main.ModEntry != null && Main.ModEntry.Logger != null)
-                        Main.ModEntry.Logger.Warning(string.Format("Warning coupling cars '{0}' and '{1}': {2}", carA.ID, carB.ID, ex.Message));
+                        Main.ModEntry.Logger.Warning(string.Format("Warning coupling cars '{0}' and '{1}': {2}", ModCompatManager.GetCarId(carA), ModCompatManager.GetCarId(carB), ex.Message));
                 }
             }
         }
@@ -1196,11 +1468,11 @@ namespace AITraffic.Fleet
                 try
                 {
                     cableA.Connect(cableB, playAudio: false);
-                    if (Main.ModEntry != null && Main.ModEntry.Logger != null)
+                    if (Main.IsDebugLoggingEnabled)
                     {
-                        Main.ModEntry.Logger.Log(string.Format("[TrainSpawner] Successfully connected MU cable between '{0}' ({1}) and '{2}' ({3}).",
-                            carA.ID, cA.isFrontCoupler ? "Front" : "Rear",
-                            carB.ID, cB.isFrontCoupler ? "Front" : "Rear"));
+                        Main.LogDebug(string.Format("[TrainSpawner] Successfully connected MU cable between '{0}' ({1}) and '{2}' ({3}).",
+                            ModCompatManager.GetCarId(carA), cA.isFrontCoupler ? "Front" : "Rear",
+                            ModCompatManager.GetCarId(carB), cB.isFrontCoupler ? "Front" : "Rear"));
                     }
                 }
                 catch (Exception ex)
@@ -1208,13 +1480,13 @@ namespace AITraffic.Fleet
                     if (Main.ModEntry != null && Main.ModEntry.Logger != null)
                     {
                         Main.ModEntry.Logger.Warning(string.Format("[TrainSpawner] Failed to connect MU cable between '{0}' and '{1}': {2}",
-                            carA.ID, carB.ID, ex.Message));
+                            ModCompatManager.GetCarId(carA), ModCompatManager.GetCarId(carB), ex.Message));
                     }
                 }
             }
         }
 
-        public static void InitializeLocomotive(TrainCar loco)
+        public static void InitializeLocomotive(TrainCar loco, bool isLead = true)
         {
             if (loco == null) return;
 
@@ -1228,7 +1500,7 @@ namespace AITraffic.Fleet
                 catch (Exception stEx)
                 {
                     if (Main.ModEntry != null && Main.ModEntry.Logger != null)
-                        Main.ModEntry.Logger.Warning(string.Format("StartupHelper for loco '{0}' warning: {1}", loco.ID, stEx.Message));
+                        Main.ModEntry.Logger.Warning(string.Format("StartupHelper for loco '{0}' warning: {1}", ModCompatManager.GetCarId(loco), stEx.Message));
                 }
 
                 var controls = loco.GetComponent<BaseControlsOverrider>();
@@ -1251,13 +1523,29 @@ namespace AITraffic.Fleet
 
                 if (controls != null)
                 {
-                    if (controls.Handbrake != null) controls.Handbrake.Set(0f);
-                    if (controls.Brake != null) controls.Brake.Set(0.5f); // Hold service brake until AI takes control
-                    if (controls.IndependentBrake != null) controls.IndependentBrake.Set(1.0f); // Solidly clamp locomotive independent brake
-                    if (controls.DynamicBrake != null) controls.DynamicBrake.Set(0f);
-                    if (controls.Reverser != null) controls.Reverser.Set(1f);
-                    if (controls.HeadlightsFront != null) controls.HeadlightsFront.Set(2f);
-                    if (controls.BrakeCutout != null) controls.BrakeCutout.Set(1f);
+                    if (isLead)
+                    {
+                        if (controls.Handbrake != null) controls.Handbrake.Set(0f);
+                        if (controls.Brake != null) controls.Brake.Set(0.5f); // Hold service brake until AI takes control
+                        if (controls.IndependentBrake != null) controls.IndependentBrake.Set(0f);
+                        if (controls.DynamicBrake != null) controls.DynamicBrake.Set(0f);
+                        if (controls.Reverser != null) controls.Reverser.Set(1f);
+                        if (controls.HeadlightsFront != null) controls.HeadlightsFront.Set(1.0f); // White headlight
+                        if (controls.HeadlightsRear != null) controls.HeadlightsRear.Set(0.4f); // Off (neutral)
+                        if (controls.BrakeCutout != null) controls.BrakeCutout.Set(1f);
+                    }
+                    else
+                    {
+                        // Trailing helper units: cut out brake valve, release independent/train/hand brakes
+                        if (controls.BrakeCutout != null) controls.BrakeCutout.Set(0f);
+                        if (controls.IndependentBrake != null) controls.IndependentBrake.Set(0f);
+                        if (controls.Brake != null) controls.Brake.Set(0f);
+                        if (controls.Handbrake != null) controls.Handbrake.Set(0f);
+                        if (controls.DynamicBrake != null) controls.DynamicBrake.Set(0f);
+                        if (controls.Reverser != null) controls.Reverser.Set(1f);
+                        if (controls.HeadlightsFront != null) controls.HeadlightsFront.Set(0.4f); // Off (neutral)
+                        if (controls.HeadlightsRear != null) controls.HeadlightsRear.Set(0.4f); // Off (neutral)
+                    }
 
                     // Ensure engine starter was primed if not already on
                     if (controls.EngineOnReader != null && !controls.EngineOnReader.IsOn && controls.Starter != null)
@@ -1267,11 +1555,21 @@ namespace AITraffic.Fleet
                 }
                 // Remove career license blockers and colliders so moving AI trains never trigger position-fix lag spikes
                 RemoveLocoZoneBlockers(loco);
+                ApplyAIDamageImmunity(loco, true);
+
+                if (isLead)
+                {
+                    try
+                    {
+                        AITraffic.Driver.AILocomotiveLighting.GetOrCreate(loco, null);
+                    }
+                    catch { }
+                }
             }
             catch (Exception ex)
             {
                 if (Main.ModEntry != null && Main.ModEntry.Logger != null)
-                    Main.ModEntry.Logger.Warning(string.Format("Warning initializing locomotive '{0}': {1}", loco.ID, ex.Message));
+                    Main.ModEntry.Logger.Warning(string.Format("Warning initializing locomotive '{0}': {1}", ModCompatManager.GetCarId(loco), ex.Message));
             }
         }
 
@@ -1315,7 +1613,7 @@ namespace AITraffic.Fleet
             catch (Exception ex)
             {
                 if (Main.ModEntry != null && Main.ModEntry.Logger != null)
-                    Main.ModEntry.Logger.Warning(string.Format("Warning clearing LocoZoneBlockers on '{0}': {1}", loco.ID, ex.Message));
+                    Main.ModEntry.Logger.Warning(string.Format("Warning clearing LocoZoneBlockers on '{0}': {1}", ModCompatManager.GetCarId(loco), ex.Message));
             }
         }
 
@@ -1357,11 +1655,21 @@ namespace AITraffic.Fleet
                 {
                     dc.IgnoreDamage(immune);
                 }
+
+                // 3. LocoSim drivetrain component immunity (breaker trips & traction motor blowouts)
+                if (immune)
+                {
+                    AITraffic.Compat.AIDamageImmunityPatches.RegisterAISimComponents(car);
+                }
+                else
+                {
+                    AITraffic.Compat.AIDamageImmunityPatches.UnregisterAISimComponents(car);
+                }
             }
             catch (Exception ex)
             {
                 if (Main.ModEntry != null && Main.ModEntry.Logger != null)
-                    Main.ModEntry.Logger.Warning(string.Format("Error setting AI damage immunity on '{0}': {1}", car.ID, ex.Message));
+                    Main.ModEntry.Logger.Warning(string.Format("Error setting AI damage immunity on '{0}': {1}", ModCompatManager.GetCarId(car), ex.Message));
             }
         }
 

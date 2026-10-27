@@ -1,0 +1,98 @@
+[center][size=5][b][color=#FFB833]Derail Valley AI Traffic (AITraffic)[/color][/b][/size]
+[size=3][i]Autonomous AI Train Traffic, Timetable Dispatching & Player-Employed AI Workers[/i][/size]
+[size=2]Author: [b]Killermops27[/b] | Version: [b][color=#55DD55]0.2.8 (Alpha)[/color][/b][/size]
+
+[url=https://github.com/Killermops27/dv-ai-traffic][b]GitHub Repository[/b][/url] • [url=https://github.com/Killermops27/dv-ai-traffic/releases/tag/v0.2.8][b]Latest Release[/b][/url] • [url=https://github.com/Killermops27/dv-ai-traffic/issues][b]Report a Bug[/b][/url] • [url=https://www.nexusmods.com/derailvalley/mods/1685][b]Nexus Mods #1685[/b][/url]
+[/center]
+
+[hr]
+
+[quote]
+[center][size=3][color=#FF5555][b]⚠️ EXPERIMENTAL EARLY ALPHA — ALWAYS BACK UP YOUR SAVES![/b][/color][/size][/center]
+This mod is in [b]active early alpha development[/b]. You will encounter quirks, routing edge cases, or potential single-track bottlenecks.
+[b]Always make a backup copy of your save files before playing with this mod.[/b]
+If you find reproducible bugs, please report them on our [url=https://github.com/Killermops27/dv-ai-traffic/issues][b]GitHub Issues[/b][/url] page or under the Nexus Bugs tab!
+[/quote]
+
+[hr]
+
+[size=4][b][color=#FFB833]✦ What's New in Version 0.2.8[/color][/b][/size]
+
+[list]
+[*][b]30-Minute Vanilla Job Desync CTD Fix:[/b] Replaced broad station destruction zone locks with track-specific protection ([i]Yard.IsTrackOccupied[/i]). Vanilla DV cleanly cleans and refreshes unoccupied yard tracks every 30 minutes without PhysX overlapping explosions, NaN coordinates, or crashes.
+[*][b]Stack Overflow & Patch Optimization:[/b] Replaced nested recursive [i]StationController.IsPlayerInJobGenerationZone[/i] calls with direct distance comparisons, eliminating recursive stack overflow crashes.
+[*][b]Debounced Signal Wakeup Calls:[/b] Eliminated per-frame synchronous DVSignals graph traversal storms with a 0.5s per-signal cooldown debounce, triggered strictly on turnout realignment or fresh block reservations.
+[*][b]Wet-Weather Physics & 5-Stage Hill-Start Architecture:[/b] Introduced 6-second cumulative ground progress tracking to eliminate the DE2 slip-grip oscillation trap, immediate Stage 2 sanding in rain, and an automated controlled rollback descent mechanism.
+[*][b]Active Wheel Slide Protection (WSP):[/b] Consist-wide brake slide detection modulates brake authority ([i]0.55[/i]), cuts dynamic brakes on locomotive slide, scales wet service deceleration ([i]0.45 -> 0.27 m/s²[/i]), and triggers continuous sanding within 250m of stop targets.
+[*][b]Multiple Unit (MU) Helper Automation:[/b] Trailing helper locomotives automatically configure double-heading cut-outs closed ([i]BrakeCutout = 0.0f[/i]), release independent brakes ([i]0.0f[/i]), and couple MU air lines.
+[*][b]Demonstrator Loco Preservation & Spawn Validation:[/b] Protects museum demonstrator locomotives at City South from false AI ghost purges, and validates spawn coordinates against [i]Vector3.zero[/i] to prevent ocean spawns.
+[*][b]Atomic Single-Track Corridor Tokens & Diegetic Reverse Protocol:[/b] Atomic tokens prevent opposing corridor entries; if an unavoidable standoff occurs, the AI sounds 3 horn blasts, illuminates front red marker lights, and backs up at ≤ 15 km/h into the nearest trailing siding.
+[*][b]Destination Siding Search & Station Throat Hold:[/b] Diverts to clear alternate sidings when the scheduled destination track is occupied, or safely holds outside the station throat and releases turnout locks to preserve player shunting freedom.
+[*][b]Siding Shunting Handover & Mainline Speed Restoration:[/b] Implemented a 4-layer mast crossing check and multi-head clearance latching, ending the bug where trains leaving sidings crawled at 15 km/h across the mainline.
+[*][b]Yard Through-Transit Elimination & Running Line Protection:[/b] Applies a +500,000m routing penalty to station yard tracks ([i]-O], -I], -S][/i], etc.) while protecting central running lines ([i][--][/i]) at full line speed.
+[*][b]Persistent Jobs Suspended Car Visibility:[/b] Integrates with [i]FarCarOpt.TracksToSpaceOccupiedBySuspendedCars[/i] so lightweight suspended cars are fully recognized by AI dispatching and pathfinding.
+[*][b]Military Base License Gating:[/b] Gated AI access across Military Base ([i]MB[/i]), Harbor Town ([i]HB[/i] military spur), and Machine Factory ([i]MF[/i] military yard) behind the [i]Military 1[/i] career license.
+[*][b]Advanced INI Configuration ([i]settings.ini[/i]):[/b] Full runtime control over physics PID gains, dispatcher safety buffers, economics, and lighting modes, with an in-game UMM [i]Apply & Reload INI[/i] button.
+[*][b]AI Lighting Modes & EOT Markers:[/b] 4-mode locomotive headlight selector (Automatic, Always High, Always Low, Off) and diegetic rear End-of-Train (EOT) marker lanterns on freight consists and cabooses.
+[/list]
+
+[hr]
+
+[size=4][b][color=#FFB833]✦ Known Issues & Compatibility Notes[/color][/b][/size]
+
+[list]
+[*][b]Modded Locomotives & Trainsets (Future Goal):[/b] Currently, [b]no modded locomotives, custom railcars, or third-party trainsets are officially supported[/b]. Only vanilla base-game rolling stock is supported at this time. Supporting modded locomotives and custom consists is a planned future goal.
+[/list]
+
+[hr]
+
+[size=4][b][color=#FFB833]✦ Core Features & Systems[/color][/b][/size]
+
+[b][color=#55DD55]1. Player-Employed AI Worker System (Phase 2)[/color][/b]
+[list]
+[*][b]Point-to-Point AI Hauls:[/b] Hire AI engineers to haul your assembled consists from station to station across the valley map.
+[*][b]Diegetic Comms Radio Dispatch:[/b] Cycle to [b]AI Worker[/b] mode (cyan laser beam). Aim at any locomotive to inspect train car count, total length (meters), and mass (metric tons), cycle destination stations and arrival tracks via the scroll wheel, and pull the trigger to dispatch!
+[*][b]Dynamic Clear Siding Auto-Selection:[/b] Evaluates candidate receiving ([i]transferIn[/i]) and yard storage tracks at the destination station, verifying length (>= consist + 25m), clearance ([i]!IsTrackOccupied[/i]), and path navigability before selecting.
+[*][b]Dynamic Economy & Driver Wages:[/b] Computes realistic driver compensation based on distance and ton-mileage (Base $300 + $0.06/meter + $0.35/ton), deducting fees directly from the player wallet with a cash register chime.
+[*][b]Consist Automation & Despawn Immunity:[/b] Automatically locks couplers, connects air hoses, sets cock levers, releases handbrakes across the consist, and starts prime movers. Flagged with despawn immunity ([i]IsWorkerDriven = true[/i]).
+[*][b]Arrival Handover:[/b] Halts on the target destination track, applies parking handbrake, removes AI driver, and displays an on-screen toast banner returning 100% manual control to the player.
+[/list]
+
+[b][color=#55DD55]2. Autonomous Virtual Engineer (AIEngineer)[/color][/b]
+[list]
+[*][b]Closed-Loop Speed Regulation:[/b] Custom PID controllers modulate throttle, dynamic braking, and independent/train air brakes to track dynamic target velocities smoothly across varying terrain and gradients.
+[*][b]Speed Profile Calculation:[/b] Generates realistic deceleration and braking curves based on upcoming track speed limits, curves (evaluated in the 2D horizontal plane), red/yellow signal aspects, and station stopping points.
+[*][b]Powertrain Thermal Protection:[/b] Proactive throttle derating between 95°C and 105°C prevents engine explosions on steep grades; pneumatic grade anti-rollback clamp holds trains if power is lost.
+[*][b]Hill-Start Pre-Charge Sequence:[/b] Prime mover throttles up and builds tractive effort before brakes release on grades (>= 0.15%), eliminating rollback stalls.
+[*][b]DM3 Mechanical Shunter Automation:[/b] Specialized automatic gear-shifting controller ([i]DM3TransmissionController[/i]), neutral gear-shift brake hold, and high-power fluid coupling launches.
+[*][b]Traction Motor Over-Current Protection:[/b] Fast amperage derating (>380A) and automatic stationary fuse reset for diesel-electrics.
+[/list]
+
+[b][color=#55DD55]3. Signaling, Corridor Holding & Safety Interlocking[/color][/b]
+[list]
+[*][b]DVSignals Integration & Remote Keep-Alive:[/b] Interacts directly with DVSignals for physical signal aspect resolution, block reservation, and headway control down to the 0m stop line, keeping distant signal controllers active within 1500m of AI trains.
+[*][b]Periodic Signal Wait Retry:[/b] Automatically re-requests switch alignment and wakes DVSignals controllers every 20s when halted at red signals.
+[*][b]Player Corridor Right-of-Way:[/b] AI respects player DVSignals reservations, immediately yielding switch alignment requests to give player consists right-of-way.
+[*][b]In-Block Switch Protection:[/b] Turnouts inside an active signal block or within 250m of a moving AI train remain locked against unauthorized throwing.
+[*][b]Tail Speed Protection:[/b] Evaluates consist-wide bogie positions, ensuring entire trainsets clear restrictive curves and turnout ladders before accelerating.
+[/list]
+
+[hr]
+
+[size=4][b][color=#FFB833]✦ Requirements[/color][/b][/size]
+[list=1]
+[*][b]Derail Valley[/b] (Latest PC / Steam release)
+[*][b]Unity Mod Manager (UMM)[/b] v0.27.0+
+[*][b]DV Signals[/b] (Required for block occupancy and physical signal logic)
+[*][b]CommsRadioAPI[/b] (Required for Comms Radio AI Worker dispatch mode)
+[*][b]Double Track[/b] ([i]STRONGLY RECOMMENDED[/i] to prevent single-line gridlock)
+[/list]
+
+[hr]
+
+[size=4][b][color=#FFB833]✦ Installation[/color][/b][/size]
+[list=1]
+[*]Download [b]AITraffic-v0.2.8.zip[/b].
+[*]Drag and drop into Unity Mod Manager, or extract into [i]Derail Valley/Mods/[/i].
+[*]Verify that AI Traffic, DVSignals, and CommsRadioAPI show green status indicators in UMM ([i]Ctrl + F10[/i]).
+[/list]

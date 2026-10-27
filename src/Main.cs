@@ -14,11 +14,94 @@ namespace AITraffic
         public static UnityModManager.ModEntry ModEntry { get; private set; }
         public static AITrafficSettings Settings { get; private set; }
         public static bool Enabled { get; private set; }
+        public static int MainThreadId { get; private set; }
+
+        private static readonly object s_logLock = new object();
+
+        // CRITICAL INVARIANT [LOG-01]: Build-aware diagnostic logging gate & background-thread-safe logger ([RGR-03]).
+        public static bool IsDebugLoggingEnabled
+        {
+            get
+            {
+                if (Settings != null) return Settings.VerboseLogging;
+#if DEBUG
+                return true;
+#else
+                return false;
+#endif
+            }
+        }
+
+        public static void LogDebug(string msg)
+        {
+            if (!IsDebugLoggingEnabled || string.IsNullOrEmpty(msg)) return;
+            WriteLogInternal(msg, 0);
+        }
+
+        public static void Log(string msg)
+        {
+            if (string.IsNullOrEmpty(msg)) return;
+            WriteLogInternal(msg, 0);
+        }
+
+        public static void LogWarning(string msg)
+        {
+            if (string.IsNullOrEmpty(msg)) return;
+            WriteLogInternal(msg, 1);
+        }
+
+        public static void LogError(string msg)
+        {
+            if (string.IsNullOrEmpty(msg)) return;
+            WriteLogInternal(msg, 2);
+        }
+
+        private static void WriteLogInternal(string msg, int level)
+        {
+            lock (s_logLock)
+            {
+                try
+                {
+                    // CRITICAL INVARIANT [RGR-03]: Background worker threads must fall back to UnityEngine.Debug.Log*.
+                    bool isBackgroundThread = MainThreadId != 0 && System.Threading.Thread.CurrentThread.ManagedThreadId != MainThreadId;
+                    if (!isBackgroundThread && ModEntry != null && ModEntry.Logger != null)
+                    {
+                        if (level == 2) ModEntry.Logger.Error(msg);
+                        else if (level == 1) ModEntry.Logger.Warning(msg);
+                        else ModEntry.Logger.Log(msg);
+                        return;
+                    }
+                }
+                catch { }
+
+                try
+                {
+                    if (level == 2) UnityEngine.Debug.LogError(msg);
+                    else if (level == 1) UnityEngine.Debug.LogWarning(msg);
+                    else UnityEngine.Debug.Log(msg);
+                }
+                catch { }
+            }
+        }
+
+        /// <summary>
+        /// In Derail Valley, WorldStreamingInit.IsLoaded returns true when SingletonBehaviour<WorldStreamingInit>.Instance
+        /// is null (which occurs at the Main Menu before the world has ever loaded!).
+        /// IsWorldFullyLoaded guarantees that WorldStreamingInit is active AND finished loading.
+        /// </summary>
+        public static bool IsWorldFullyLoaded
+        {
+            get
+            {
+                return WorldStreamingInit.Instance != null && WorldStreamingInit.IsLoaded;
+            }
+        }
 
         public static bool Load(UnityModManager.ModEntry modEntry)
         {
             try
             {
+                MainThreadId = System.Threading.Thread.CurrentThread.ManagedThreadId;
                 ModEntry = modEntry;
                 modEntry.OnToggle = OnToggle;
 
@@ -26,6 +109,16 @@ namespace AITraffic
                 Settings = UnityModManager.ModSettings.Load<AITrafficSettings>(modEntry);
                 modEntry.OnGUI = entry => Settings.Draw(entry);
                 modEntry.OnSaveGUI = entry => Settings.Save(entry);
+
+                // Initialize Advanced INI Configuration (auto-generates Mods/AITraffic/settings.ini if missing)
+                try
+                {
+                    IniConfigManager.Instance.Load();
+                }
+                catch (Exception ex)
+                {
+                    modEntry.Logger.Warning(string.Format("Failed to initialize IniConfigManager: {0}", ex));
+                }
 
                 // Initialize Compatibility Layer
                 ModCompatManager.Initialize();
@@ -40,7 +133,8 @@ namespace AITraffic
                 // Register Comms Radio mode via CommsRadioAPI
                 try
                 {
-                    CommsRadioAPI.ControllerAPI.Ready += AITraffic.Workers.Radio.WorkerRadioMode.Register;
+                    // CRITICAL INVARIANT [WRK-01]: Hook OnControllerReady so newly spawned CommsRadioController instances always receive the AI WORKER mode.
+                    CommsRadioAPI.ControllerAPI.Ready += AITraffic.Workers.Radio.WorkerRadioMode.OnControllerReady;
                 }
                 catch (Exception ex)
                 {
@@ -49,8 +143,8 @@ namespace AITraffic
 
                 Enabled = true;
 
-                // If world is already loaded, start manager immediately
-                if (WorldStreamingInit.IsLoaded)
+                // If world is already loaded (e.g. mod reload in-game), start manager immediately
+                if (IsWorldFullyLoaded)
                 {
                     OnWorldLoaded();
                 }
@@ -70,7 +164,7 @@ namespace AITraffic
         {
             try
             {
-                if (!Enabled) return;
+                if (!Enabled || !IsWorldFullyLoaded) return;
 
                 if (ModEntry != null && ModEntry.Logger != null)
                     ModEntry.Logger.Log("World streaming finished. Starting AI Traffic Manager and Rail Graph...");
@@ -122,7 +216,7 @@ namespace AITraffic
             {
                 if (value)
                 {
-                    if (WorldStreamingInit.IsLoaded)
+                    if (IsWorldFullyLoaded)
                     {
                         RailGraph.Instance.Initialize();
                         TrafficManager.Instance.Settings = Settings;

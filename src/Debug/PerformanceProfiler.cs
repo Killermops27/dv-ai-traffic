@@ -174,6 +174,8 @@ namespace AITraffic.Diagnostics
                 }
             }
 
+            HitchWatchdog.DrawHitchGUI();
+
             GUILayout.EndArea();
         }
     }

@@ -3,6 +3,7 @@ using System.Collections;
 using System.Collections.Generic;
 using UnityEngine;
 using LocoSim.Implementations;
+using AITraffic.Compat;
 
 namespace AITraffic.Driver
 {
@@ -55,6 +56,7 @@ namespace AITraffic.Driver
 
         private Port _portGearboxA;
         private Port _portGearboxB;
+        private bool _initialized = false;
 
         private float _shiftCooldown = 0.0f;
         private float _shiftPhaseTimer = 0.0f;
@@ -84,6 +86,9 @@ namespace AITraffic.Driver
 
             IsDM3 = liveryId.IndexOf("DM3", StringComparison.OrdinalIgnoreCase) >= 0 || hasGearController;
             if (!IsDM3) return;
+
+            // CRITICAL INVARIANT [LOG-01]: Single-attempt initialization latch prevents 60 Hz retry & log spam in Update().
+            _initialized = true;
 
             try
             {
@@ -124,14 +129,13 @@ namespace AITraffic.Driver
                 ApplyGearsInstant(0, 0);
                 IsInNeutral = true;
 
-                if (Main.ModEntry != null && Main.ModEntry.Logger != null)
-                    Main.ModEntry.Logger.Log(string.Format("[DM3Transmission] Initialized DM3 loco '{0}' (PortA: {1}, PortB: {2}) in Neutral.", 
-                        _trainCar.ID, _portGearboxA != null ? _portGearboxA.id : "null", _portGearboxB != null ? _portGearboxB.id : "null"));
+                if (Main.IsDebugLoggingEnabled)
+                    Main.LogDebug(string.Format("[DM3Transmission] Initialized DM3 loco '{0}' (PortA: {1}, PortB: {2}) in Neutral.", 
+                        ModCompatManager.GetCarId(_trainCar), _portGearboxA != null ? _portGearboxA.id : "null", _portGearboxB != null ? _portGearboxB.id : "null"));
             }
             catch (Exception ex)
             {
-                if (Main.ModEntry != null && Main.ModEntry.Logger != null)
-                    Main.ModEntry.Logger.Warning(string.Format("[DM3Transmission] Error initializing DM3: {0}", ex.Message));
+                Main.LogWarning(string.Format("[DM3Transmission] Error initializing DM3: {0}", ex.Message));
             }
         }
 
@@ -139,7 +143,8 @@ namespace AITraffic.Driver
         {
             if (!IsDM3 || _trainCar == null) return;
 
-            if (_portGearboxA == null || _portGearboxB == null)
+            // Lazy initialization retry (single-attempt latch)
+            if (!_initialized && (_portGearboxA == null || _portGearboxB == null))
             {
                 Initialize();
             }

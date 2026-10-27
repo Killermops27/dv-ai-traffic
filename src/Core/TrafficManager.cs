@@ -96,11 +96,51 @@ namespace AITraffic.Core
         {
             try
             {
+                if (string.IsNullOrEmpty(scene.name))
+                    return;
+
+                // In Derail Valley, terrain tiles (Far__x..._z..., Near__x..._z...) and UI/bootstrap scenes
+                // are dynamically loaded and unloaded during normal gameplay as the player moves or teleports.
+                // We MUST NEVER treat background terrain streaming or UI transitions as a world unload!
+                if (scene.name.StartsWith("Far_", StringComparison.OrdinalIgnoreCase) ||
+                    scene.name.StartsWith("Near_", StringComparison.OrdinalIgnoreCase) ||
+                    scene.name.StartsWith("bootstrap", StringComparison.OrdinalIgnoreCase) ||
+                    scene.name.IndexOf("MainMenu", StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    return;
+                }
+
+                // If the world is still loaded (e.g. WorldStreamingInit is active), do not teardown traffic.
+                bool isCoreWorldScene = scene.name.IndexOf("railway", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                       scene.name.IndexOf("game_content", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                       scene.name.IndexOf("terrains_w3", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                       scene.name.IndexOf("game_w3", StringComparison.OrdinalIgnoreCase) >= 0;
+
+                if (!isCoreWorldScene && Main.IsWorldFullyLoaded)
+                {
+                    return;
+                }
+
                 if (Main.ModEntry != null && Main.ModEntry.Logger != null)
-                    Main.ModEntry.Logger.Log(string.Format("[TrafficManager] Scene '{0}' unloaded. Aborting active spawn coroutines and resetting spawner state.", scene.name));
+                    Main.ModEntry.Logger.Log(string.Format("[TrafficManager] Core world scene '{0}' unloaded (Main.IsWorldFullyLoaded={1}). Aborting active spawn coroutines and resetting spawner state.",
+                        scene.name, Main.IsWorldFullyLoaded));
 
                 StopAllCoroutines();
                 TrainSpawner.ResetSpawningState();
+
+                // CRITICAL INVARIANT [FLT-05]: Scene Unload Dispatching Coroutine Leak (See GRAVEYARD.md)
+                if (TrafficScheduler.Instance != null)
+                {
+                    TrafficScheduler.Instance.ResetSpawningState();
+                }
+                AITraffic.Navigation.Pathfinder.ClearUnreachablePairCache(); // [RGR-09] static cache hygiene
+                _activeEngineers.Clear();
+                // CRITICAL INVARIANT [QUIRK-04]: Reset static signal wakeup cooldowns on scene unload (See GRAVEYARD.md)
+                AIEngineer.ClearSignalWakeupCooldowns();
+                // CRITICAL INVARIANT [WRK-01]: Reset Comms Radio registration latch on scene unload.
+                AITraffic.Workers.Radio.WorkerRadioMode.Reset();
+
+                s_stationLocationCache.Clear();
             }
             catch (Exception ex)
             {
@@ -114,6 +154,7 @@ namespace AITraffic.Core
             try
             {
                 DespawnAllAITrains();
+                ModCompatManager.ShutdownThirdPartyNetworkListeners();
             }
             catch {}
         }
@@ -128,6 +169,7 @@ namespace AITraffic.Core
             catch {}
 
             DespawnAllAITrains();
+            ModCompatManager.ShutdownThirdPartyNetworkListeners();
 
             try
             {
@@ -162,6 +204,13 @@ namespace AITraffic.Core
 
         private void FixedUpdate()
         {
+            if (!Main.IsWorldFullyLoaded)
+                return;
+
+#if DEBUG
+            long __wdPhysStart = AITraffic.Diagnostics.HitchWatchdog.GetTimestamp();
+#endif
+
             if (_settings != null && _settings.Density == TrafficDensity.Off)
                 return;
 
@@ -177,10 +226,22 @@ namespace AITraffic.Core
 
                 // AI Engineer handles its own FixedUpdate internal regulation
             }
+#if DEBUG
+            AITraffic.Diagnostics.HitchWatchdog.RecordFixedUpdateTick(__wdPhysStart);
+#endif
         }
 
         private void Update()
         {
+            if (!Main.IsWorldFullyLoaded)
+                return;
+
+#if DEBUG
+            AITraffic.Diagnostics.HitchWatchdog.OnUpdatePhaseStart();
+            long __wdTmStart = AITraffic.Diagnostics.HitchWatchdog.GetTimestamp();
+            long __wdTmMem = AITraffic.Diagnostics.HitchWatchdog.GetCurrentMemory();
+            try {
+#endif
             float deltaTime = Time.deltaTime;
 
             // Check floating origin shift
@@ -215,11 +276,26 @@ namespace AITraffic.Core
             }
 
             // 3. Update player-employed AI worker tasks
+#if DEBUG
+            long __wdWorkerStart = AITraffic.Diagnostics.HitchWatchdog.GetTimestamp();
+            long __wdWorkerMem = AITraffic.Diagnostics.HitchWatchdog.GetCurrentMemory();
+            try {
+                AITraffic.Workers.WorkerManager.Instance.Update(deltaTime);
+            } finally {
+                AITraffic.Diagnostics.HitchWatchdog.RecordWorker(__wdWorkerStart, __wdWorkerMem);
+            }
+#else
             AITraffic.Workers.WorkerManager.Instance.Update(deltaTime);
+#endif
 
             // 4. Update traffic scheduler to maintain active train density
             int maxAllowed = _settings != null ? (int)_settings.MaxActiveTrains : 4;
             TrafficScheduler.Instance.UpdateScheduler(deltaTime, _activeEngineers.Count, maxAllowed, _settings);
+#if DEBUG
+            } finally {
+                AITraffic.Diagnostics.HitchWatchdog.RecordTrafficManager(__wdTmStart, __wdTmMem);
+            }
+#endif
         }
 
         #endregion
@@ -234,9 +310,9 @@ namespace AITraffic.Core
             if (engineer != null && !_activeEngineers.Contains(engineer))
             {
                 _activeEngineers.Add(engineer);
-                if (Main.ModEntry != null && Main.ModEntry.Logger != null)
-                    Main.ModEntry.Logger.Log(string.Format("[TrafficManager] Registered AI Engineer for loco '{0}'. Active AI trains: {1}",
-                        engineer.TrainCar != null ? engineer.TrainCar.ID : "Unknown", _activeEngineers.Count));
+                if (Main.IsDebugLoggingEnabled)
+                    Main.LogDebug(string.Format("[TrafficManager] Registered AI Engineer for loco '{0}'. Active AI trains: {1}",
+                        !string.IsNullOrEmpty(engineer.LocoId) ? engineer.LocoId : (engineer.TrainCar != null && engineer.TrainCar.logicCar != null ? ModCompatManager.GetCarId(engineer.TrainCar) : "Unknown"), _activeEngineers.Count));
             }
         }
 
@@ -248,9 +324,9 @@ namespace AITraffic.Core
             if (engineer != null && _activeEngineers.Remove(engineer))
             {
                 UnregisterStalledAmbientEngineer(engineer);
-                if (Main.ModEntry != null && Main.ModEntry.Logger != null)
-                    Main.ModEntry.Logger.Log(string.Format("[TrafficManager] Unregistered AI Engineer for loco '{0}'. Active AI trains: {1}",
-                        engineer.TrainCar != null ? engineer.TrainCar.ID : "Unknown", _activeEngineers.Count));
+                if (Main.IsDebugLoggingEnabled)
+                    Main.LogDebug(string.Format("[TrafficManager] Unregistered AI Engineer for loco '{0}'. Active AI trains: {1}",
+                        !string.IsNullOrEmpty(engineer.LocoId) ? engineer.LocoId : (engineer.TrainCar != null && engineer.TrainCar.logicCar != null ? ModCompatManager.GetCarId(engineer.TrainCar) : "Unknown"), _activeEngineers.Count));
             }
         }
 
@@ -290,7 +366,7 @@ namespace AITraffic.Core
                 _stalledAmbientEngineers.RemoveAt(i);
                 if (eng != null && eng.TrainCar != null)
                 {
-                    string id = eng.TrainCar.ID;
+                    string id = ModCompatManager.GetCarId(eng.TrainCar);
                     DespawnAITrain(eng);
                     if (AITraffic.Workers.WorkerManager.Instance != null)
                     {
@@ -320,6 +396,32 @@ namespace AITraffic.Core
         }
 
         private static readonly Dictionary<TrainCar, StationLocationEntry> s_stationLocationCache = new Dictionary<TrainCar, StationLocationEntry>();
+
+        /// <summary>
+        /// Removes a TrainCar entry from the station location cache to prevent memory leaks when rolling stock is despawned or destroyed.
+        /// </summary>
+        public static void PruneStationLocationCache(TrainCar car)
+        {
+            if (car == null) return;
+            try
+            {
+                car.OnDestroyCar -= PruneStationLocationCache;
+            }
+            catch { }
+            s_stationLocationCache.Remove(car);
+        }
+
+        public static void PruneStationLocationCache(IEnumerable<TrainCar> cars)
+        {
+            if (cars == null) return;
+            foreach (var c in cars)
+            {
+                if (c != null)
+                {
+                    PruneStationLocationCache(c);
+                }
+            }
+        }
 
         /// <summary>
         /// Checks whether a given TrainCar is operated by the AI Traffic mod.
@@ -377,6 +479,10 @@ namespace AITraffic.Core
             }
 
             string result = string.Format("{0} | Track: {1}", nearestStationStr, trackName);
+            if (!s_stationLocationCache.ContainsKey(trainCar))
+            {
+                trainCar.OnDestroyCar += PruneStationLocationCache;
+            }
             s_stationLocationCache[trainCar] = new StationLocationEntry { LastUpdateTime = Time.time, Description = result };
             return result;
         }
@@ -411,17 +517,124 @@ namespace AITraffic.Core
 
             try
             {
+                try
+                {
+                    AITraffic.Fleet.TrainSpawner.RemoveLocoZoneBlockers(car);
+                }
+                catch { }
+
                 PlayerManager.TeleportPlayerToCar(car);
 
+                // CRITICAL INVARIANT [FLT-09]: Instant non-VR cab teleportation can trigger VRTK SpeedZoneControlTouchBehaviour.Touch()
+                // with a null interactingObject, enabling Update() with controller == null and spamming 60Hz NullReferenceExceptions.
+                SanitizeCabTouchBehaviours(car);
+                if (s_instance != null)
+                {
+                    s_instance.StartCoroutine(SanitizeCabTouchBehavioursDelayedCoroutine(car));
+                }
+
                 if (Main.ModEntry != null && Main.ModEntry.Logger != null)
-                    Main.ModEntry.Logger.Log(string.Format("[TrafficManager] Teleported player to AI train '{0}'.", car.ID));
+                    Main.ModEntry.Logger.Log(string.Format("[TrafficManager] Teleported player to AI train '{0}'.", ModCompatManager.GetCarId(car)));
             }
             catch (Exception ex)
             {
                 if (Main.ModEntry != null && Main.ModEntry.Logger != null)
-                    Main.ModEntry.Logger.Warning(string.Format("Error teleporting player to train '{0}': {1}", car.ID, ex.Message));
+                    Main.ModEntry.Logger.Warning(string.Format("Error teleporting player to train '{0}': {1}", ModCompatManager.GetCarId(car), ex.Message));
             }
         }
+
+        private static readonly System.Reflection.FieldInfo s_szcControllerField =
+            typeof(DV.CabControls.SpeedZoneControlTouchBehaviour).GetField("controller", System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+        private static readonly System.Reflection.FieldInfo s_szcPipaField =
+            typeof(DV.CabControls.SpeedZoneControlTouchBehaviour).GetField("pipa", System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+
+        private static bool IsTouchBehaviourInvalid(DV.CabControls.SpeedZoneControlTouchBehaviour b)
+        {
+            if (b == null) return false;
+            try
+            {
+                if (s_szcControllerField != null)
+                {
+                    var ctrl = s_szcControllerField.GetValue(b) as UnityEngine.GameObject;
+                    if (ctrl == null) return true;
+                }
+                if (s_szcPipaField != null)
+                {
+                    var pipa = s_szcPipaField.GetValue(b) as UnityEngine.Transform;
+                    if (pipa == null) return true;
+                }
+            }
+            catch { }
+            return false;
+        }
+
+        private static void SanitizeCabTouchBehaviours(TrainCar car)
+        {
+            if (car == null) return;
+
+            try
+            {
+                if (car.gameObject != null)
+                {
+                    var carBehaviours = car.GetComponentsInChildren<DV.CabControls.SpeedZoneControlTouchBehaviour>(true);
+                    if (carBehaviours != null)
+                    {
+                        for (int i = 0; i < carBehaviours.Length; i++)
+                        {
+                            var b = carBehaviours[i];
+                            if (b != null && IsTouchBehaviourInvalid(b))
+                            {
+                                b.enabled = false;
+                            }
+                        }
+                    }
+                }
+
+                if (car.interior != null)
+                {
+                    var interiorBehaviours = car.interior.GetComponentsInChildren<DV.CabControls.SpeedZoneControlTouchBehaviour>(true);
+                    if (interiorBehaviours != null)
+                    {
+                        for (int i = 0; i < interiorBehaviours.Length; i++)
+                        {
+                            var b = interiorBehaviours[i];
+                            if (b != null && IsTouchBehaviourInvalid(b))
+                            {
+                                b.enabled = false;
+                            }
+                        }
+                    }
+                }
+            }
+            catch { }
+        }
+
+        private static System.Collections.IEnumerator SanitizeCabTouchBehavioursDelayedCoroutine(TrainCar car)
+        {
+            for (int frame = 0; frame < 15; frame++)
+            {
+                if (car == null) yield break;
+                SanitizeCabTouchBehaviours(car);
+                yield return null;
+            }
+        }
+
+        [HarmonyLib.HarmonyPatch(typeof(DV.CabControls.SpeedZoneControlTouchBehaviour), "Update")]
+        private static class SpeedZoneControlTouchBehaviour_Update_Patch
+        {
+            private static bool Prefix(DV.CabControls.SpeedZoneControlTouchBehaviour __instance, UnityEngine.GameObject ___controller, UnityEngine.Transform ___pipa)
+            {
+                if (__instance == null) return false;
+                if (___controller == null || ___pipa == null)
+                {
+                    __instance.enabled = false;
+                    return false;
+                }
+                return true;
+            }
+        }
+
+        private HashSet<Signals.Game.Signal> _renderedSignalsScratch = new HashSet<Signals.Game.Signal>();
 
         private void CheckDespawnEligibleTrains()
         {
@@ -463,10 +676,12 @@ namespace AITraffic.Core
 
                         if (TrainDespawner.CanDespawnSafely(engineer, minDistance: minClearDist, frustumDistance: frustumDist))
                         {
-                            if (Main.ModEntry != null && Main.ModEntry.Logger != null)
-                                Main.ModEntry.Logger.Log(string.Format("[TrafficManager] Despawning completed terminus train '{0}' (player distance: {1:F0}m >= setting {2:F0}m).",
-                                    engineer.TrainCar.ID, distToPlayer, minClearDist));
+                            if (Main.IsDebugLoggingEnabled)
+                                Main.LogDebug(string.Format("[TrafficManager] Despawning completed terminus train '{0}' (player distance: {1:F0}m >= setting {2:F0}m).",
+                                    ModCompatManager.GetCarId(engineer.TrainCar), distToPlayer, minClearDist));
 
+                            PruneStationLocationCache(engineer.TrainCar);
+                            if (engineer.RegisteredConsistCars != null) PruneStationLocationCache(engineer.RegisteredConsistCars);
                             _activeEngineers.RemoveAt(i);
                             TrainDespawner.DespawnTrain(engineer, forceInstant: true);
                             continue;
@@ -513,9 +728,11 @@ namespace AITraffic.Core
                         if (Main.ModEntry != null && Main.ModEntry.Logger != null)
                         {
                             Main.ModEntry.Logger.Warning(string.Format("[TrafficManager] Emergency despawning stuck AI train '{0}' (stationary for {1:F0}s >= timeout {2:F0}s, player distance: {3:F0}m).",
-                                engineer.TrainCar.ID, engineer.StationaryTimer, emergencyTimeoutSeconds, distToPlayer));
+                                ModCompatManager.GetCarId(engineer.TrainCar), engineer.StationaryTimer, emergencyTimeoutSeconds, distToPlayer));
                         }
 
+                        PruneStationLocationCache(engineer.TrainCar);
+                        if (engineer.RegisteredConsistCars != null) PruneStationLocationCache(engineer.RegisteredConsistCars);
                         _activeEngineers.RemoveAt(i);
                         UnregisterStalledAmbientEngineer(engineer);
                         TrainDespawner.DespawnTrain(engineer, forceInstant: true);
@@ -531,10 +748,12 @@ namespace AITraffic.Core
                     {
                         if (TrainDespawner.CanDespawnSafely(engineer, minDistance: configuredDespawnDist, frustumDistance: configuredDespawnDist))
                         {
-                            if (Main.ModEntry != null && Main.ModEntry.Logger != null)
-                                Main.ModEntry.Logger.Log(string.Format("[TrafficManager] Despawning derailed AI consist '{0}' ({1} cars, player distance: {2:F0}m >= setting {3:F0}m).",
-                                    engineer.TrainCar.ID, engineer.RegisteredConsistCars.Count, distToPlayer, configuredDespawnDist));
+                            if (Main.IsDebugLoggingEnabled)
+                                Main.LogDebug(string.Format("[TrafficManager] Despawning derailed AI consist '{0}' ({1} cars, player distance: {2:F0}m >= setting {3:F0}m).",
+                                    ModCompatManager.GetCarId(engineer.TrainCar), engineer.RegisteredConsistCars.Count, distToPlayer, configuredDespawnDist));
 
+                            PruneStationLocationCache(engineer.TrainCar);
+                            if (engineer.RegisteredConsistCars != null) PruneStationLocationCache(engineer.RegisteredConsistCars);
                             _activeEngineers.RemoveAt(i);
                             TrainDespawner.DespawnTrain(engineer, forceInstant: true);
                             continue;
@@ -565,10 +784,12 @@ namespace AITraffic.Core
                 {
                     if (TrainDespawner.CanDespawnSafely(engineer, minDistance: despawnThreshold, frustumDistance: despawnThreshold))
                     {
-                        if (Main.ModEntry != null && Main.ModEntry.Logger != null)
-                            Main.ModEntry.Logger.Log(string.Format("[TrafficManager] Despawning AI train '{0}' that passed player or moved out of encounter range ({1:F0}m from player >= setting {2:F0}m, moving away).",
-                                engineer.TrainCar.ID, distToPlayer, despawnThreshold));
+                        if (Main.IsDebugLoggingEnabled)
+                            Main.LogDebug(string.Format("[TrafficManager] Despawning AI train '{0}' that passed player or moved out of encounter range ({1:F0}m from player >= setting {2:F0}m, moving away).",
+                                ModCompatManager.GetCarId(engineer.TrainCar), distToPlayer, despawnThreshold));
 
+                        PruneStationLocationCache(engineer.TrainCar);
+                        if (engineer.RegisteredConsistCars != null) PruneStationLocationCache(engineer.RegisteredConsistCars);
                         _activeEngineers.RemoveAt(i);
                         TrainDespawner.DespawnTrain(engineer, forceInstant: true);
                         continue;
@@ -626,9 +847,10 @@ namespace AITraffic.Core
                     continue;
 
                 // Check if this car is an ambient AI car
+                // CRITICAL INVARIANT [FLT-12]: Judge live car strictly by its own physical/registered AI state in O(1).
+                // Never call IsAmbientAITrainId(carId) inside an AllCars loop (triggers nested O(N^2) AllCars scans).
                 bool isAiCar = marker != null ||
-                               ModCompatManager.IsAmbientAITrain(car) ||
-                               ModCompatManager.IsAmbientAITrainId(car.ID);
+                               ModCompatManager.IsAmbientAITrain(car);
 
                 if (!isAiCar) continue;
 
@@ -642,8 +864,12 @@ namespace AITraffic.Core
                         if (tc != null)
                         {
                             var eng = tc.GetComponent<AIEngineer>();
-                            if (eng != null && _activeEngineers.Contains(eng))
+                            if (eng != null)
                             {
+                                if (!_activeEngineers.Contains(eng))
+                                {
+                                    RegisterEngineer(eng);
+                                }
                                 hasActiveEngineer = true;
                                 break;
                             }
@@ -697,30 +923,14 @@ namespace AITraffic.Core
 
             if (orphansToDelete != null && orphansToDelete.Count > 0)
             {
-                if (Main.ModEntry != null && Main.ModEntry.Logger != null)
-                    Main.ModEntry.Logger.Log(string.Format("[TrafficManager] Cleaning up {0} orphaned ambient AI car(s) outside player range.", orphansToDelete.Count));
+                if (Main.IsDebugLoggingEnabled)
+                    Main.LogDebug(string.Format("[TrafficManager] Cleaning up {0} orphaned ambient AI car(s) outside player range.", orphansToDelete.Count));
 
-                for (int i = 0; i < orphansToDelete.Count; i++)
-                {
-                    var car = orphansToDelete[i];
-                    if (car == null) continue;
+                PruneStationLocationCache(orphansToDelete);
 
-                    try
-                    {
-                        if (car.trainset != null)
-                        {
-                            ModCompatManager.UntagTrain(car.trainset);
-                        }
-                        if (car.gameObject != null)
-                        {
-                            var marker = car.gameObject.GetComponent<AITrafficCarMarker>();
-                            if (marker != null) UnityEngine.Object.Destroy(marker);
-                        }
-                    }
-                    catch { }
-                }
-
-                CarSpawner.Instance.DeleteTrainCars(orphansToDelete, forceInstantDestroy: true);
+                // CRITICAL INVARIANT [FLT-04] & [FLT-06]: Use SafeDeleteCars BEFORE untagging or destroying AITrafficCarMarker
+                // so OnCarDestroyed debt hooks recognize the despawning AI cars, then untag inside SafeDeleteCars.
+                AITraffic.Fleet.TrainDespawner.SafeDeleteCars(orphansToDelete, true);
             }
         }
 
@@ -732,11 +942,14 @@ namespace AITraffic.Core
             if (engineer == null) return;
             try
             {
+                if (engineer.TrainCar != null) PruneStationLocationCache(engineer.TrainCar);
+                if (engineer.RegisteredConsistCars != null) PruneStationLocationCache(engineer.RegisteredConsistCars);
+
                 _activeEngineers.Remove(engineer);
                 TrainDespawner.DespawnTrain(engineer, forceInstant: true);
 
                 if (Main.ModEntry != null && Main.ModEntry.Logger != null)
-                    Main.ModEntry.Logger.Log(string.Format("[TrafficManager] Despawned selected AI train '{0}'.", engineer.TrainCar != null ? engineer.TrainCar.ID : "unknown"));
+                    Main.ModEntry.Logger.Log(string.Format("[TrafficManager] Despawned selected AI train '{0}'.", engineer.TrainCar != null ? ModCompatManager.GetCarId(engineer.TrainCar) : "unknown"));
             }
             catch (Exception ex)
             {
@@ -775,6 +988,9 @@ namespace AITraffic.Core
                     // Skip player worker trains unless forceAll is requested
                     if (engineer.IsWorkerDriven && !forceAll) continue;
 
+                    if (engineer.TrainCar != null) PruneStationLocationCache(engineer.TrainCar);
+                    if (engineer.RegisteredConsistCars != null) PruneStationLocationCache(engineer.RegisteredConsistCars);
+
                     _activeEngineers.RemoveAt(i);
                     TrainDespawner.DespawnTrain(engineer, forceInstant: true);
                 }
@@ -802,12 +1018,13 @@ namespace AITraffic.Core
                                 continue;
                         }
 
+                        // CRITICAL INVARIANT [FLT-12]: Live cars are never classified for deletion by (recycled) ID strings.
+                        string carId = ModCompatManager.GetCarId(car);
                         bool isAi = (car.gameObject != null && car.gameObject.GetComponent<AITrafficCarMarker>() != null) ||
                                     ModCompatManager.IsAmbientAITrain(car) ||
-                                    ModCompatManager.IsAmbientAITrainId(car.ID) ||
                                     car.GetComponent<AIEngineer>() != null ||
                                     TrainSpawner.IsCarSpawning(car) ||
-                                    TrainSpawner.IsCarSpawning(car.ID);
+                                    (!string.IsNullOrEmpty(carId) && TrainSpawner.IsCarSpawning(carId));
 
                         if (isAi)
                         {
@@ -818,6 +1035,7 @@ namespace AITraffic.Core
                     if (carsToDelete.Count > 0)
                     {
                         purgedCount += carsToDelete.Count;
+                        PruneStationLocationCache(carsToDelete);
                         for (int i = 0; i < carsToDelete.Count; i++)
                         {
                             var c = carsToDelete[i];
@@ -846,7 +1064,8 @@ namespace AITraffic.Core
                             }
                         }
 
-                        CarSpawner.Instance.DeleteTrainCars(carsToDelete, forceInstantDestroy: true);
+                        // CRITICAL INVARIANT [FLT-04]: Use SafeDeleteCars to prevent corrupted logicCar NREs (See GRAVEYARD.md)
+                        AITraffic.Fleet.TrainDespawner.SafeDeleteCars(carsToDelete, true);
                     }
                 }
 
@@ -903,15 +1122,11 @@ namespace AITraffic.Core
                         continue;
 
                     // Only target AI-related ghost cars that derailed:
-                    // (has AI marker, registered as ambient, has AIEngineer, active spawning, or has preventDebtDisplay
-                    // which is exclusively set on AI traffic cars, never on player/station/SelfShunt equipment)
+                    // Strictly require AITrafficCarMarker or ambient registration. Never target playerSpawnedCar heuristic so museum demonstrators are never deleted.
+                    string cId = ModCompatManager.GetCarId(car);
                     bool isAiGhost = (car.gameObject != null && car.gameObject.GetComponent<AITrafficCarMarker>() != null) ||
                                      ModCompatManager.IsAmbientAITrain(car) ||
-                                     ModCompatManager.IsAmbientAITrainId(car.ID) ||
-                                     car.GetComponent<AIEngineer>() != null ||
-                                     TrainSpawner.IsCarSpawning(car) ||
-                                     TrainSpawner.IsCarSpawning(car.ID) ||
-                                     (car.playerSpawnedCar && car.preventDebtDisplay);
+                                     (!string.IsNullOrEmpty(cId) && ModCompatManager.IsAmbientAITrainId(cId));
 
                     // Target cars that are physically derailed and identified as AI ghost cars
                     if (car.derailed && isAiGhost)
@@ -923,6 +1138,7 @@ namespace AITraffic.Core
                 if (toDelete.Count > 0)
                 {
                     purgedCount = toDelete.Count;
+                    PruneStationLocationCache(toDelete);
                     for (int i = 0; i < toDelete.Count; i++)
                     {
                         var c = toDelete[i];
@@ -934,7 +1150,8 @@ namespace AITraffic.Core
                             if (marker != null) UnityEngine.Object.Destroy(marker);
                         }
                     }
-                    CarSpawner.Instance.DeleteTrainCars(toDelete, forceInstantDestroy: true);
+                    // CRITICAL INVARIANT [FLT-04]: Use SafeDeleteCars to prevent corrupted logicCar NREs (See GRAVEYARD.md)
+                    AITraffic.Fleet.TrainDespawner.SafeDeleteCars(toDelete, true);
                 }
 
                 if (Main.ModEntry != null && Main.ModEntry.Logger != null)
@@ -1238,6 +1455,7 @@ namespace AITraffic.Core
             {
                 AITraffic.Diagnostics.TopologyMapExporter.ExportToDesktop();
             }
+            AITraffic.Diagnostics.HitchWatchdog.OnFrameEnd();
 #endif
         }
 
@@ -1905,7 +2123,7 @@ namespace AITraffic.Core
                         var eng = _activeEngineers[i];
                         if (eng == null || eng.TrainCar == null) continue;
 
-                        string locoId = eng.TrainCar.ID ?? "Unknown";
+                        string locoId = ModCompatManager.GetCarId(eng.TrainCar) ?? "Unknown";
                         string state = eng.State.ToString();
                         float speed = eng.CurrentSpeedKmh;
                         float targetSpeed = eng.TargetSpeedKmh;
@@ -1974,10 +2192,11 @@ namespace AITraffic.Core
                         string thermalStr = (eng.CurrentMaxTemperature > 0.1f) 
                             ? (eng.IsOverheated ? string.Format("<color=#FF4444><b>Temp: {0:F0}°C [OVERHEAT CUT]</b></color>", eng.CurrentMaxTemperature) : string.Format("Temp: <b>{0:F0}°C</b>", eng.CurrentMaxTemperature))
                             : "";
-                        string ampsStr = (eng.CurrentAmpsPerTM > 1.0f)
+                        string ampsStr = (!float.IsNaN(eng.CurrentAmpsPerTM) && !float.IsInfinity(eng.CurrentAmpsPerTM) && eng.CurrentAmpsPerTM > 1.0f)
                             ? (eng.OvercurrentThrottleLimit < 0.95f ? string.Format("<color=#FFA500><b>Amps: {0:F0}A [Limit {1:F0}%]</b></color>", eng.CurrentAmpsPerTM, eng.OvercurrentThrottleLimit * 100f) : string.Format("Amps: <b>{0:F0}A</b>", eng.CurrentAmpsPerTM))
                             : "";
                         string slipStr = eng.IsWheelSlipping ? " | <color=#FF5555><b>[SLIP]</b></color>" : "";
+                        string slideStr = eng.IsWheelSliding ? (eng.IsLocoWheelSliding ? " | <color=#FF3333><b>[SLIDE: Loco]</b></color>" : " | <color=#FFA500><b>[SLIDE: Consist]</b></color>") : "";
                         string rollbackStr = eng.IsRollbackDetected ? " | <color=#FF0000><b>[ROLLBACK CLAMP]</b></color>" : "";
                         string hillStr = "";
                         if (eng.HillStage == AIEngineer.HillLaunchStage.Stage1_Clean)
@@ -1993,13 +2212,14 @@ namespace AITraffic.Core
                         else if (eng.IsHillStarting)
                             hillStr = " | <color=#FFD700><b>[HILL START]</b></color>";
 
-                        if (!string.IsNullOrEmpty(thermalStr) || !string.IsNullOrEmpty(ampsStr) || eng.IsWheelSlipping || eng.IsRollbackDetected || eng.IsHillStarting || eng.HillStage != AIEngineer.HillLaunchStage.None)
+                        if (!string.IsNullOrEmpty(thermalStr) || !string.IsNullOrEmpty(ampsStr) || eng.IsWheelSlipping || eng.IsWheelSliding || eng.IsRollbackDetected || eng.IsHillStarting || eng.HillStage != AIEngineer.HillLaunchStage.None)
                         {
-                            string telemetry = string.Format("   Powertrain: {0}{1}{2}{3}{4}{5}",
+                            string telemetry = string.Format("   Powertrain: {0}{1}{2}{3}{4}{5}{6}",
                                 thermalStr,
                                 (!string.IsNullOrEmpty(thermalStr) && !string.IsNullOrEmpty(ampsStr) ? " | " : ""),
                                 ampsStr,
                                 slipStr,
+                                slideStr,
                                 rollbackStr,
                                 hillStr);
                             GUILayout.Label(telemetry);
@@ -2103,7 +2323,7 @@ namespace AITraffic.Core
                 if (_showPerformanceProfiler)
                 {
                     float profilerWidth = 380f;
-                    float profilerHeight = 440f;
+                    float profilerHeight = 560f;
                     Rect profilerRect = new Rect(Screen.width - profilerWidth - 20f, 50f, profilerWidth, profilerHeight);
                     AITraffic.Diagnostics.PerformanceProfiler.DrawProfilerGUI(profilerRect);
                 }
@@ -2132,7 +2352,7 @@ namespace AITraffic.Core
                             string locoColorHex = ColorUtility.ToHtmlStringRGB(TrainPathColors[i % TrainPathColors.Length]);
                             string encounterBadge = eng.IsEncounterTrain ? " <color=#00FFFF>[Encounter]</color>" : "";
                             string tag = string.Format("<color=#{0}><b>[AI: {1}]</b></color>{5}\n<color=white>{2:F0} km/h ({3})</color>\n<color=#98FB98>➜ {4}</color>",
-                                locoColorHex, eng.TrainCar.ID, eng.CurrentSpeedKmh, eng.State, destShort, encounterBadge);
+                                locoColorHex, ModCompatManager.GetCarId(eng.TrainCar), eng.CurrentSpeedKmh, eng.State, destShort, encounterBadge);
                             GUI.Label(new Rect(screenPos.x - 120f, guiY - 30f, 240f, 60f), tag, _nameTagStyle);
                         }
                     }
@@ -2141,7 +2361,9 @@ namespace AITraffic.Core
                 // 3. Draw 3D Floating Signal Tags at upcoming signal positions along active routes
                 if (_settings != null && _settings.ShowSignalTags)
                 {
-                    var renderedSignals = new HashSet<Signals.Game.Signal>();
+                    if (_renderedSignalsScratch == null) _renderedSignalsScratch = new HashSet<Signals.Game.Signal>();
+                    var renderedSignals = _renderedSignalsScratch;
+                    renderedSignals.Clear();
 
                     for (int i = 0; i < _activeEngineers.Count; i++)
                     {
@@ -2153,13 +2375,10 @@ namespace AITraffic.Core
                             var blk = eng.UpcomingSignalBlocks[b];
                             if (blk == null) continue;
 
-                            Signals.Game.Signal[] blockSignals = new Signals.Game.Signal[] { blk.ExitSignal, blk.EntrySignal };
-                            float[] signalDists = new float[] { blk.DistanceToExit, blk.DistanceToEntry };
-
-                            for (int s = 0; s < blockSignals.Length; s++)
+                            for (int s = 0; s < 2; s++)
                             {
-                                var sig = blockSignals[s];
-                                float dist = signalDists[s];
+                                var sig = (s == 0) ? blk.ExitSignal : blk.EntrySignal;
+                                float dist = (s == 0) ? blk.DistanceToExit : blk.DistanceToEntry;
 
                                 if (sig == null || renderedSignals.Contains(sig)) continue;
                                 if (float.IsInfinity(dist) || dist <= 0f || dist > 2000f) continue;
@@ -2185,7 +2404,7 @@ namespace AITraffic.Core
                                     string aspectHex = AITraffic.Navigation.SignalRegistry.GetAspectColorHex(sig);
 
                                     string sigTag = string.Format("<color=#00FFFF><b>[{0}]</b></color>\n<color={1}><b>{2}</b></color>\n<color=white>{3:F0}m</color> <color=#FFD700>({4})</color>",
-                                        sigName, aspectHex, aspectName, dist, eng.TrainCar.ID ?? "AI");
+                                        sigName, aspectHex, aspectName, dist, ModCompatManager.GetCarId(eng.TrainCar) ?? "AI");
 
                                     Rect tagRect = new Rect(sigScreenPos.x - 110f, sigGuiY - 32f, 220f, 64f);
                                     Color prevC = GUI.color;

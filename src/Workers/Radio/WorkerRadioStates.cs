@@ -7,6 +7,7 @@ using DV.InventorySystem;
 using AITraffic.Core;
 using AITraffic.Fleet;
 using AITraffic.Navigation;
+using AITraffic.Compat;
 
 namespace AITraffic.Workers.Radio
 {
@@ -61,7 +62,7 @@ namespace AITraffic.Workers.Radio
                 return new CommsRadioState(
                     "AI WORKER: ACTIVE",
                     string.Format("{0} -> {1}\nSpeed: {2:F0} km/h\nDist Rem: {3:F1} km",
-                        loco.ID, destName, task.CurrentSpeedKmh, task.RemainingDistance / 1000f),
+                        ModCompatManager.GetCarId(loco), destName, task.CurrentSpeedKmh, task.RemainingDistance / 1000f),
                     "DISMISS DRIVER",
                     LCDArrowState.Off,
                     LEDState.On,
@@ -77,7 +78,7 @@ namespace AITraffic.Workers.Radio
             return new CommsRadioState(
                 "AI WORKER: READY",
                 string.Format("{0} ({1})\nCars: {2} | Len: {3:F0}m\nMass: {4:F0}t",
-                    loco.ID, loco.carType, consist.Count, totalLen, totalMass),
+                    ModCompatManager.GetCarId(loco), loco.carType, consist.Count, totalLen, totalMass),
                 "SELECT TRAIN",
                 LCDArrowState.Right,
                 LEDState.On,
@@ -195,11 +196,15 @@ namespace AITraffic.Workers.Radio
             var list = new List<StationController>();
             if (StationController.allStations != null)
             {
+                // CRITICAL INVARIANT [FLT-11]: Gate all three military bases (MB, HMB, MFMB) behind Military1 license (See GRAVEYARD.md)
+                bool hasMilitary1 = AITraffic.Core.TrafficScheduler.IsLicenseAcquired(DV.ThingTypes.JobLicenses.Military1);
                 for (int i = 0; i < StationController.allStations.Count; i++)
                 {
                     var s = StationController.allStations[i];
                     if (s != null && s.stationInfo != null && !string.IsNullOrEmpty(s.stationInfo.Name))
                     {
+                        if (!hasMilitary1 && AITraffic.Core.TrafficScheduler.IsMilitaryYardId(s.stationInfo.YardID))
+                            continue;
                         list.Add(s);
                     }
                 }
@@ -280,7 +285,8 @@ namespace AITraffic.Workers.Radio
                 return new WorkerRadioSelectTrackState(_loco, _stations[_selectedIndex], 0);
             }
 
-            return this;
+            if (utility != null) utility.PlaySound(VanillaSoundCommsRadio.Cancel, utility.SignalOrigin);
+            return new WorkerRadioScanState();
         }
     }
 
@@ -385,7 +391,8 @@ namespace AITraffic.Workers.Radio
                 return new WorkerRadioConfirmState(_loco, _station, chosenTrack);
             }
 
-            return this;
+            if (utility != null) utility.PlaySound(VanillaSoundCommsRadio.Cancel, utility.SignalOrigin);
+            return new WorkerRadioScanState();
         }
     }
 
@@ -482,11 +489,17 @@ namespace AITraffic.Workers.Radio
                 MaxSearchDistance = 5000000f
             };
 
-            var routePath = pathfinder.FindPath(originTrack, destTrack, pathOptions);
+            // CRITICAL INVARIANT [WRK-02]: Enforce strict pulling-forward routing with single-switchback fallback only on dead-end spurs (See GRAVEYARD.md)
+            Junction spurSwitch;
+            RailTrack spurStemTrack;
+            byte spurMainlineBranch;
+            var routePath = WorkerManager.Instance.FindWorkerRouteWithSpurFallback(
+                pathfinder, originTrack, destTrack, loco, pathOptions,
+                out spurSwitch, out spurStemTrack, out spurMainlineBranch);
             if (routePath == null || !routePath.IsValid || routePath.Tracks == null || routePath.Tracks.Count < 2)
             {
                 res.IsValid = false;
-                res.State = CreateErrorState("No clear route found!\nSwitches may be blocked.");
+                res.State = CreateErrorState("No forward route found!\nLoco may face wrong way\nor switches blocked.");
                 return res;
             }
 
@@ -506,7 +519,7 @@ namespace AITraffic.Workers.Radio
             res.State = new CommsRadioState(
                 "DISPATCH DRIVER?",
                 string.Format("<b>{0} -> {1}</b>\nTrack: {2}\nFee: ${3:N0} (Dist: {4:F1}km)\n[Scroll: Cancel/Back]",
-                    loco.ID, stationName, destTrack.name, fee, routeDist / 1000f),
+                    ModCompatManager.GetCarId(loco), stationName, destTrack.name, fee, routeDist / 1000f),
                 "CONFIRM & PAY",
                 LCDArrowState.Right,
                 LEDState.On,

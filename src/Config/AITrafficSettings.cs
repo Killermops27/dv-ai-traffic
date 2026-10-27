@@ -36,6 +36,11 @@ namespace AITraffic.Config
         public float SpawnDistanceMax = 2500f;
         public float DespawnDistance = 3000f;
         public bool DebugVisuals = false;
+#if DEBUG
+        public bool VerboseLogging = true;
+#else
+        public bool VerboseLogging = false;
+#endif
         public bool ShowRouteVisualizer = false;
         public bool ShowSignalTags = false;
         public bool ShowLocoTags = false;
@@ -161,7 +166,38 @@ namespace AITraffic.Config
                 // --- ACTIVE TRAINS SLIDER ---
                 GUILayout.BeginHorizontal();
                 GUILayout.Label(string.Format("Max Active Trains: <b>{0}</b>", (int)MaxActiveTrains), GUILayout.Width(200));
+                float prevMaxActiveTrains = MaxActiveTrains;
                 MaxActiveTrains = Mathf.Round(GUILayout.HorizontalSlider(MaxActiveTrains, 0f, 10f));
+                if (MaxActiveTrains != prevMaxActiveTrains)
+                {
+                    // Bi-directionally synchronize density toolbar and MaxActiveTrains slider
+                    if (MaxActiveTrains == 0f)
+                    {
+                        Density = TrafficDensity.Off;
+                    }
+                    else if (Density == TrafficDensity.Off)
+                    {
+                        // If user moves the MaxActiveTrains slider to > 0 while Density == TrafficDensity.Off,
+                        // automatically promote Density = TrafficDensity.Light so TrafficManager.Update() does not early-return and kill scheduler
+                        Density = TrafficDensity.Light;
+                    }
+                    else if (MaxActiveTrains <= 2f)
+                    {
+                        Density = TrafficDensity.Light;
+                    }
+                    else if (MaxActiveTrains <= 5f)
+                    {
+                        Density = TrafficDensity.Medium;
+                    }
+                    else
+                    {
+                        Density = TrafficDensity.Dense;
+                    }
+                }
+                else if (MaxActiveTrains > 0f && Density == TrafficDensity.Off)
+                {
+                    Density = TrafficDensity.Light;
+                }
                 GUILayout.EndHorizontal();
                 GUILayout.Space(8);
 
@@ -224,6 +260,7 @@ namespace AITraffic.Config
                 ShowRouteVisualizer = GUILayout.Toggle(ShowRouteVisualizer, " Show 3D Route Visualization (Draws luminous 3D path line along tracks in world)");
                 ShowSignalTags = GUILayout.Toggle(ShowSignalTags, " Show 3D Signal Tags (Renders in-world floating status tags over upcoming signals)");
                 DebugVisuals = GUILayout.Toggle(DebugVisuals, " Debug Visuals (Render AI monitor, sensors and route gizmos) [Ctrl+Shift+D]");
+                VerboseLogging = GUILayout.Toggle(VerboseLogging, " Verbose Diagnostic Logging (Write detailed AI state transitions, routing & spawner events to log)");
                 MoreTrainEncounters = GUILayout.Toggle(MoreTrainEncounters, " More Train Encounters (Spawns passing loop trains routed via player position)");
 
                 GUILayout.Space(12);
@@ -265,6 +302,56 @@ namespace AITraffic.Config
                 GUILayout.BeginHorizontal();
                 GUILayout.Label("Reserve Arrival Track First:", GUILayout.Width(240));
                 ReserveArrivalTrackFirst = GUILayout.Toggle(ReserveArrivalTrackFirst, ReserveArrivalTrackFirst ? "Enabled (Recommended)" : "Disabled (Pure Persistence)");
+                GUILayout.EndHorizontal();
+
+                // --- AI LIGHTING & EOT TELEMETRY ---
+                GUILayout.Space(12);
+                GUILayout.Label("AI Locomotive Lighting & Consist Telemetry", subHeaderStyle);
+                GUILayout.Label("Controls locomotive headlights and rear-of-train markers for AI traffic.", descStyle);
+
+                GUILayout.BeginHorizontal();
+                GUILayout.Label("Headlights Mode:", GUILayout.Width(200));
+                if (IniConfigManager.Instance != null && IniConfigManager.Instance.Lighting != null)
+                {
+                    var currentMode = IniConfigManager.Instance.Lighting.Mode;
+                    string[] lightModes = { "Automatic", "Always High", "Always Low", "Off" };
+                    int modeIdx = (int)currentMode;
+                    int newModeIdx = GUILayout.Toolbar(modeIdx, lightModes);
+                    if (newModeIdx != modeIdx)
+                    {
+                        IniConfigManager.Instance.Lighting.Mode = (AILightingMode)newModeIdx;
+                        IniConfigManager.Instance.Save();
+                    }
+                }
+                GUILayout.EndHorizontal();
+
+                if (IniConfigManager.Instance != null && IniConfigManager.Instance.Lighting != null)
+                {
+                    bool prevEot = IniConfigManager.Instance.Lighting.EOTMarker;
+                    bool newEot = GUILayout.Toggle(prevEot, " End-of-Train (EOT) Marker Lantern (Mounts red marker lantern on rear uncoupled coupler of freight consists)");
+                    if (newEot != prevEot)
+                    {
+                        IniConfigManager.Instance.Lighting.EOTMarker = newEot;
+                        IniConfigManager.Instance.Save();
+                    }
+                }
+
+                // --- ADVANCED CONFIGURATION (SETTINGS.INI) ---
+                GUILayout.Space(12);
+                GUILayout.Label("Advanced Configuration (settings.ini)", subHeaderStyle);
+                GUILayout.Label("Physics gains, dispatch margins, driver wages, and train weights are configurable via Mods/AITraffic/settings.ini.", descStyle);
+
+                GUILayout.BeginHorizontal();
+                if (GUILayout.Button("📄 Reload settings.ini", GUILayout.Width(220)))
+                {
+                    if (IniConfigManager.Instance != null)
+                    {
+                        IniConfigManager.Instance.Reload();
+                        if (Main.ModEntry != null && Main.ModEntry.Logger != null)
+                            Main.ModEntry.Logger.Log("Reloaded configuration from settings.ini.");
+                    }
+                }
+                GUILayout.Label(string.Format("Path: {0}", IniConfigManager.GetIniFilePath()), descStyle);
                 GUILayout.EndHorizontal();
 
                 // --- CAREER FEE MAINTENANCE ---

@@ -154,22 +154,31 @@ namespace AITraffic.Compat
         {
             try
             {
-                if (Main.ModEntry != null && Main.ModEntry.Logger != null)
+                if (Main.IsDebugLoggingEnabled)
                 {
-                    Main.ModEntry.Logger.Log("Initializing AI Traffic Mod Compatibility Adapters...");
+                    Main.LogDebug("Initializing AI Traffic Mod Compatibility Adapters...");
+                    Main.LogDebug(string.Format("   • DVSignals: {0}", IsDVSignalsLoaded ? "Active [Signaling & Interlocking Enabled]" : "NOT DETECTED (Required)"));
+                    Main.LogDebug(string.Format("   • CommsRadioAPI: {0}", IsCommsRadioAPILoaded ? "Active [In-Game Dispatcher Mode Enabled]" : "NOT DETECTED (Required)"));
+                    Main.LogDebug(string.Format("   • DoubleTrack: {0}", IsDoubleTrackLoaded ? "Active [Multi-Track Mainlines Enabled]" : "Not Detected"));
+                    Main.LogDebug(string.Format("   • PersistentJobs: {0}", IsPersistentJobsLoaded ? "Active [Dynamic Car Isolation Enabled]" : "Not Detected"));
+                    Main.LogDebug(string.Format("   • SelfShunt (YardMaster): {0}", IsYardMasterLoaded ? "Active [Active Yard Protection Enabled]" : "Not Detected"));
+                    Main.LogDebug(string.Format("   • PassengerJobs: {0}", IsPassengerJobsLoaded ? "Active [Passenger Platform Routing Enabled]" : "Not Detected"));
+                    Main.LogDebug(string.Format("   • ZCouplers: {0}", IsZCouplersLoaded ? "Active [Coupler Stress Exemption Enabled]" : "Not Detected"));
+                }
 
-                    Main.ModEntry.Logger.Log(string.Format(" • DVSignals: {0}", IsDVSignalsLoaded ? "Active [Signaling & Interlocking Enabled]" : "NOT DETECTED (Required)"));
-                    Main.ModEntry.Logger.Log(string.Format(" • CommsRadioAPI: {0}", IsCommsRadioAPILoaded ? "Active [In-Game Dispatcher Mode Enabled]" : "NOT DETECTED (Required)"));
-                    Main.ModEntry.Logger.Log(string.Format(" • DoubleTrack: {0}", IsDoubleTrackLoaded ? "Active [Multi-Track Mainlines Enabled]" : "Not Detected"));
-                    Main.ModEntry.Logger.Log(string.Format(" • PersistentJobs: {0}", IsPersistentJobsLoaded ? "Active [Dynamic Car Isolation Enabled]" : "Not Detected"));
-                    Main.ModEntry.Logger.Log(string.Format(" • SelfShunt (YardMaster): {0}", IsYardMasterLoaded ? "Active [Active Yard Protection Enabled]" : "Not Detected"));
-                    Main.ModEntry.Logger.Log(string.Format(" • PassengerJobs: {0}", IsPassengerJobsLoaded ? "Active [Passenger Platform Routing Enabled]" : "Not Detected"));
-                    Main.ModEntry.Logger.Log(string.Format(" • ZCouplers: {0}", IsZCouplersLoaded ? "Active [Coupler Stress Exemption Enabled]" : "Not Detected"));
+                if (IsPersistentJobsLoaded)
+                {
+                    PersistentJobsPatches.Initialize(Main.ModEntry);
+                }
 
-                    if (IsZCouplersLoaded)
-                    {
-                        InitializeZCouplersPatch(Main.ModEntry);
-                    }
+                if (IsYardMasterLoaded)
+                {
+                    SelfShuntPatches.Initialize(Main.ModEntry);
+                }
+
+                if (IsZCouplersLoaded)
+                {
+                    InitializeZCouplersPatch(Main.ModEntry);
                 }
             }
             catch (Exception ex)
@@ -270,6 +279,23 @@ namespace AITraffic.Compat
                 if (RailTrackRegistry.RailTrackToLogicTrack.TryGetValue(track, out logicTrack))
                 {
                     return logicTrack;
+                }
+            }
+            return null;
+        }
+
+        /// <summary>
+        /// Gets the corresponding RailTrack for a given DV.Logic.Job.Track.
+        /// </summary>
+        public static RailTrack GetRailTrack(DV.Logic.Job.Track logicTrack)
+        {
+            if (logicTrack == null) return null;
+            if (RailTrackRegistry.LogicToRailTrack != null)
+            {
+                RailTrack railTrack;
+                if (RailTrackRegistry.LogicToRailTrack.TryGetValue(logicTrack, out railTrack))
+                {
+                    return railTrack;
                 }
             }
             return null;
@@ -390,7 +416,9 @@ namespace AITraffic.Compat
             return false;
         }
 
-        [MethodImpl(MethodImplOptions.NoInlining)]
+        private static MethodInfo s_pjGetRouteTrackMethod;
+        private static bool s_pjMethodSearched;
+
         private static bool CheckPassengerJobsPlatformInternal(RailTrack track)
         {
             try
@@ -406,8 +434,29 @@ namespace AITraffic.Compat
                 string fullId = logicTrack.ID.FullID;
                 if (string.IsNullOrEmpty(fullId)) return false;
 
-                var routeTrack = PassengerJobs.Generation.RouteManager.GetRouteTrackById(fullId);
-                return routeTrack.HasValue;
+                if (!s_pjMethodSearched)
+                {
+                    s_pjMethodSearched = true;
+                    var pjType = Type.GetType("PassengerJobs.Generation.RouteManager, PassengerJobs");
+                    if (pjType != null)
+                    {
+                        s_pjGetRouteTrackMethod = pjType.GetMethod("GetRouteTrackById", BindingFlags.Public | BindingFlags.Static);
+                    }
+                }
+
+                if (s_pjGetRouteTrackMethod != null)
+                {
+                    var result = s_pjGetRouteTrackMethod.Invoke(null, new object[] { fullId });
+                    if (result != null)
+                    {
+                        var prop = result.GetType().GetProperty("HasValue");
+                        if (prop != null)
+                        {
+                            return (bool)prop.GetValue(result, null);
+                        }
+                        return true;
+                    }
+                }
             }
             catch
             {
@@ -415,6 +464,32 @@ namespace AITraffic.Compat
             }
 
             return false;
+        }
+
+        #endregion
+
+        #region Safe TrainCar ID & GUID Helpers
+
+        /// <summary>
+        /// Safely retrieves the TrainCar logic ID without triggering Derail Valley's
+        /// "logicCar not set, but ID accessed! Returning empty string." LogError when cars are
+        /// suspended by PersistentJobs, uninitialized, or being destroyed.
+        /// </summary>
+        public static string GetCarId(TrainCar car)
+        {
+            if (car == null || car.logicCar == null) return string.Empty;
+            return car.logicCar.ID ?? string.Empty;
+        }
+
+        /// <summary>
+        /// Safely retrieves the TrainCar logic GUID without triggering Derail Valley's
+        /// "logicCar not set, but CarGUID accessed! Returning empty string." LogError when cars are
+        /// suspended by PersistentJobs, uninitialized, or being destroyed.
+        /// </summary>
+        public static string GetCarGuid(TrainCar car)
+        {
+            if (car == null || car.logicCar == null) return string.Empty;
+            return car.logicCar.carGuid ?? string.Empty;
         }
 
         #endregion
@@ -431,20 +506,35 @@ namespace AITraffic.Compat
             {
                 lock (s_aiCarsLock)
                 {
+                    string carId = GetCarId(car);
+                    // Ensure only cars actively being spawned by TrainSpawner are tagged
+                    if (!AITraffic.Fleet.TrainSpawner.IsCarSpawning(car) &&
+                        (string.IsNullOrEmpty(carId) || !AITraffic.Fleet.TrainSpawner.IsCarSpawning(carId)) &&
+                        !AITraffic.Fleet.TrainSpawner.IsSpawningAmbientConsist)
+                    {
+                        return;
+                    }
+
                     car.playerSpawnedCar = true;
                     car.preventDebtDisplay = true;
                     if (car.gameObject != null && car.gameObject.GetComponent<AITrafficCarMarker>() == null)
                     {
                         car.gameObject.AddComponent<AITrafficCarMarker>();
                     }
-                    if (!string.IsNullOrEmpty(car.CarGUID)) s_aiCarGuids.Add(car.CarGUID);
-                    if (!string.IsNullOrEmpty(car.ID))
+                    string carGuid = GetCarGuid(car);
+                    if (!string.IsNullOrEmpty(carGuid)) s_aiCarGuids.Add(carGuid);
+                    if (!string.IsNullOrEmpty(carId))
                     {
-                        s_aiCarIds.Add(car.ID);
-                        s_historicalAmbientCarIds.Add(car.ID);
-                        s_knownNonAiCarIds.Remove(car.ID);
+                        s_aiCarIds.Add(carId);
+                        s_historicalAmbientCarIds.Add(carId);
+                        s_knownNonAiCarIds.Remove(carId);
                     }
                     s_aiCars.Add(car);
+                    s_nonAiCarInstanceFrameCache.Remove(car.GetInstanceID());
+                    if (s_frameLiveCarsByIdFrame == Time.frameCount && !string.IsNullOrEmpty(carId))
+                    {
+                        s_frameLiveCarsById[carId] = car;
+                    }
                 }
             }
             catch (Exception ex)
@@ -468,20 +558,35 @@ namespace AITraffic.Compat
                     {
                         var car = cars[i];
                         if (car == null) continue;
+
+                        string carId = GetCarId(car);
+                        if (!AITraffic.Fleet.TrainSpawner.IsCarSpawning(car) &&
+                            (string.IsNullOrEmpty(carId) || !AITraffic.Fleet.TrainSpawner.IsCarSpawning(carId)) &&
+                            !AITraffic.Fleet.TrainSpawner.IsSpawningAmbientConsist)
+                        {
+                            continue;
+                        }
+
                         car.playerSpawnedCar = true;
                         car.preventDebtDisplay = true;
                         if (car.gameObject != null && car.gameObject.GetComponent<AITrafficCarMarker>() == null)
                         {
                             car.gameObject.AddComponent<AITrafficCarMarker>();
                         }
-                        if (!string.IsNullOrEmpty(car.CarGUID)) s_aiCarGuids.Add(car.CarGUID);
-                        if (!string.IsNullOrEmpty(car.ID))
+                        string carGuid = GetCarGuid(car);
+                        if (!string.IsNullOrEmpty(carGuid)) s_aiCarGuids.Add(carGuid);
+                        if (!string.IsNullOrEmpty(carId))
                         {
-                            s_aiCarIds.Add(car.ID);
-                            s_historicalAmbientCarIds.Add(car.ID);
-                            s_knownNonAiCarIds.Remove(car.ID);
+                            s_aiCarIds.Add(carId);
+                            s_historicalAmbientCarIds.Add(carId);
+                            s_knownNonAiCarIds.Remove(carId);
                         }
                         s_aiCars.Add(car);
+                        s_nonAiCarInstanceFrameCache.Remove(car.GetInstanceID());
+                        if (s_frameLiveCarsByIdFrame == Time.frameCount && !string.IsNullOrEmpty(carId))
+                        {
+                            s_frameLiveCarsById[carId] = car;
+                        }
                     }
                 }
             }
@@ -496,6 +601,7 @@ namespace AITraffic.Compat
         /// Tags an entire <see cref="Trainset"/> and its constituent <see cref="TrainCar"/>s as dynamic AI traffic.
         /// Sets playerSpawnedCar=true so PersistentJobs ignores them during procedural job generation,
         /// attaches <see cref="AITrafficCarMarker"/>, and registers them to be skipped by save serializers.
+        /// Strictly tags only newly instantiated AI cars from TrainSpawner, never pre-existing world equipment.
         /// </summary>
         /// <param name="trainset">The trainset to tag.</param>
         public static void TagTrainAsAITraffic(Trainset trainset)
@@ -511,6 +617,18 @@ namespace AITraffic.Compat
                         var car = trainset.cars[i];
                         if (car == null) continue;
 
+                        string carId = GetCarId(car);
+                        // Ensure it only tags newly instantiated AI cars from TrainSpawner, never pre-existing world equipment
+                        bool isNewlySpawnedAi = AITraffic.Fleet.TrainSpawner.IsCarSpawning(car) ||
+                                                (!string.IsNullOrEmpty(carId) && AITraffic.Fleet.TrainSpawner.IsCarSpawning(carId)) ||
+                                                (car.gameObject != null && car.gameObject.GetComponent<AITrafficCarMarker>() != null) ||
+                                                s_aiCars.Contains(car);
+
+                        if (!isNewlySpawnedAi)
+                        {
+                            continue;
+                        }
+
                         // 1. Tag as playerSpawned so PersistentJobs treats it as a non-job car
                         car.playerSpawnedCar = true;
 
@@ -524,17 +642,23 @@ namespace AITraffic.Compat
                         }
 
                         // 4. Register GUID and instance for fast lookup
-                        if (!string.IsNullOrEmpty(car.CarGUID))
+                        string carGuid = GetCarGuid(car);
+                        if (!string.IsNullOrEmpty(carGuid))
                         {
-                            s_aiCarGuids.Add(car.CarGUID);
+                            s_aiCarGuids.Add(carGuid);
                         }
-                        if (!string.IsNullOrEmpty(car.ID))
+                        if (!string.IsNullOrEmpty(carId))
                         {
-                            s_aiCarIds.Add(car.ID);
-                            s_historicalAmbientCarIds.Add(car.ID);
-                            s_knownNonAiCarIds.Remove(car.ID);
+                            s_aiCarIds.Add(carId);
+                            s_historicalAmbientCarIds.Add(carId);
+                            s_knownNonAiCarIds.Remove(carId);
                         }
                         s_aiCars.Add(car);
+                        s_nonAiCarInstanceFrameCache.Remove(car.GetInstanceID());
+                        if (s_frameLiveCarsByIdFrame == Time.frameCount && !string.IsNullOrEmpty(carId))
+                        {
+                            s_frameLiveCarsById[carId] = car;
+                        }
                     }
                 }
             }
@@ -571,13 +695,17 @@ namespace AITraffic.Compat
                             }
                         }
 
-                        if (!string.IsNullOrEmpty(car.CarGUID))
+                        string carGuid = GetCarGuid(car);
+                        if (!string.IsNullOrEmpty(carGuid))
                         {
-                            s_aiCarGuids.Remove(car.CarGUID);
+                            s_aiCarGuids.Remove(carGuid);
                         }
-                        if (!string.IsNullOrEmpty(car.ID))
+                        string carId = GetCarId(car);
+                        if (!string.IsNullOrEmpty(carId))
                         {
-                            s_aiCarIds.Remove(car.ID);
+                            s_historicalAmbientCarIds.Add(carId);
+                            s_knownNonAiCarIds.Remove(carId);
+                            s_aiCarIds.Remove(carId);
                         }
                         s_aiCars.Remove(car);
                     }
@@ -590,17 +718,92 @@ namespace AITraffic.Compat
             }
         }
 
+        // CRITICAL INVARIANT [FLT-06]: Post-deletion untagging helper that accepts pre-captured GUIDs and IDs
+        // because CarSpawner.DeleteCar / DeleteTrainCars sets car.logicCar = null during TrainCar.PrepareForDestroy().
+        public static void UntagCars(IList<TrainCar> cars, IList<string> preCapturedGuids = null, IList<string> preCapturedIds = null)
+        {
+            if (cars == null) return;
+
+            try
+            {
+                lock (s_aiCarsLock)
+                {
+                    for (int i = 0; i < cars.Count; i++)
+                    {
+                        var car = cars[i];
+                        string carGuid = (preCapturedGuids != null && i < preCapturedGuids.Count) ? preCapturedGuids[i] : GetCarGuid(car);
+                        if (!string.IsNullOrEmpty(carGuid))
+                        {
+                            s_aiCarGuids.Remove(carGuid);
+                        }
+
+                        string carId = (preCapturedIds != null && i < preCapturedIds.Count) ? preCapturedIds[i] : GetCarId(car);
+                        if (!string.IsNullOrEmpty(carId))
+                        {
+                            s_historicalAmbientCarIds.Add(carId);
+                            s_knownNonAiCarIds.Remove(carId);
+                            s_aiCarIds.Remove(carId);
+                        }
+
+                        if (car != null)
+                        {
+                            if (car.gameObject != null)
+                            {
+                                var marker = car.gameObject.GetComponent<AITrafficCarMarker>();
+                                if (marker != null)
+                                {
+                                    UnityEngine.Object.Destroy(marker);
+                                }
+                            }
+                            s_aiCars.Remove(car);
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                if (Main.ModEntry != null && Main.ModEntry.Logger != null)
+                    Main.ModEntry.Logger.Error(string.Format("Error untagging deleted cars: {0}", ex));
+            }
+        }
+
         /// <summary>
         /// Checks if a <see cref="TrainCar"/> belongs to an AI Traffic consist.
         /// </summary>
+        private static readonly Dictionary<int, int> s_nonAiCarInstanceFrameCache = new Dictionary<int, int>();
+
         public static bool IsAITrain(TrainCar car)
         {
             if (car == null) return false;
 
             lock (s_aiCarsLock)
             {
-                if (s_aiCars.Contains(car) || (!string.IsNullOrEmpty(car.CarGUID) && s_aiCarGuids.Contains(car.CarGUID)))
+                string carGuid = GetCarGuid(car);
+                if (s_aiCars.Contains(car) || (!string.IsNullOrEmpty(carGuid) && s_aiCarGuids.Contains(carGuid)))
                     return true;
+            }
+
+            int instId = car.GetInstanceID();
+            int curFrame = Time.frameCount;
+            int lastCheckedFrame;
+            if (s_nonAiCarInstanceFrameCache.TryGetValue(instId, out lastCheckedFrame) && (curFrame - lastCheckedFrame) < 30 && curFrame >= lastCheckedFrame)
+            {
+                return false;
+            }
+
+            if (AITraffic.Core.TrafficManager.Instance != null && AITraffic.Core.TrafficManager.Instance.ActiveEngineers != null)
+            {
+                var activeEngs = AITraffic.Core.TrafficManager.Instance.ActiveEngineers;
+                var ts = car.trainset;
+                for (int i = 0; i < activeEngs.Count; i++)
+                {
+                    var eng = activeEngs[i];
+                    if (eng != null && eng.TrainCar != null)
+                    {
+                        if (eng.TrainCar == car || (ts != null && eng.TrainCar.trainset == ts))
+                            return true;
+                    }
+                }
             }
 
             if (car.GetComponent<AITraffic.Driver.AIEngineer>() != null) return true;
@@ -618,6 +821,12 @@ namespace AITraffic.Compat
                     }
                 }
             }
+
+            if (s_nonAiCarInstanceFrameCache.Count > 1024)
+            {
+                s_nonAiCarInstanceFrameCache.Clear();
+            }
+            s_nonAiCarInstanceFrameCache[instId] = curFrame;
 
             return false;
         }
@@ -673,6 +882,8 @@ namespace AITraffic.Compat
         public static bool IsAmbientAITrain(TrainCar car)
         {
             if (car == null) return false;
+            // CRITICAL INVARIANT [FLT-12]: Never use the global IsSpawningAmbientConsist flag to classify a specific car.
+            // Spawn-time debt suppression lives in the [FLT-06] registration prefixes, which check the flag explicitly.
             if (AITraffic.Fleet.TrainSpawner.IsCarSpawning(car)) return true;
             if (IsWorkerTrain(car)) return false;
             return IsAITrain(car);
@@ -682,42 +893,100 @@ namespace AITraffic.Compat
         /// Checks if a train car ID belongs to an ambient procedural AI train (active or historical).
         /// Used by debt controllers to ensure ambient AI rolling stock never generates player fees.
         /// </summary>
+        // CRITICAL INVARIANT [FLT-06]: Never populate s_knownNonAiCarIds on transient false lookups in IsAmbientAITrainId.
+        // Querying IsAmbientAITrainId during CarSpawner.SpawnCar (before TagCarAsAITraffic) or during despawn poisons the negative cache.
+        private static int s_frameLiveCarsByIdFrame = -1;
+        private static readonly Dictionary<string, TrainCar> s_frameLiveCarsById = new Dictionary<string, TrainCar>(StringComparer.OrdinalIgnoreCase);
+
+        private static void EnsureFrameLiveCarsByIdCache()
+        {
+            int frame = Time.frameCount;
+            if (s_frameLiveCarsByIdFrame == frame)
+                return;
+
+            s_frameLiveCarsByIdFrame = frame;
+            s_frameLiveCarsById.Clear();
+
+            if (CarSpawner.Instance != null && CarSpawner.Instance.AllCars != null)
+            {
+                var allCars = CarSpawner.Instance.AllCars;
+                for (int i = 0; i < allCars.Count; i++)
+                {
+                    var car = allCars[i];
+                    if (car != null)
+                    {
+                        string id = GetCarId(car);
+                        if (!string.IsNullOrEmpty(id))
+                        {
+                            s_frameLiveCarsById[id] = car;
+                        }
+                    }
+                }
+            }
+        }
+
         public static bool IsAmbientAITrainId(string carId)
         {
             if (string.IsNullOrEmpty(carId)) return false;
             if (AITraffic.Fleet.TrainSpawner.IsCarSpawning(carId)) return true;
 
+            // CRITICAL INVARIANT [FLT-12]: DV recycles car IDs. If a LIVE car currently carries this ID, judge it strictly by its own
+            // physical/registered AI state. Historical/registry ID sets may only classify IDs of cars that no longer exist.
+            EnsureFrameLiveCarsByIdCache();
+            TrainCar liveCar;
+            if (s_frameLiveCarsById.TryGetValue(carId, out liveCar) && liveCar != null)
+            {
+                bool isAi = IsAmbientAITrain(liveCar);
+                if (isAi)
+                {
+                    lock (s_aiCarsLock)
+                    {
+                        s_aiCarIds.Add(carId);
+                        s_historicalAmbientCarIds.Add(carId);
+                        s_knownNonAiCarIds.Remove(carId);
+                    }
+                }
+                return isAi;
+            }
+
             lock (s_aiCarsLock)
             {
                 if (s_historicalAmbientCarIds.Contains(carId) || s_aiCarIds.Contains(carId))
                     return true;
-                if (s_knownNonAiCarIds.Contains(carId))
-                    return false;
-            }
-
-            if (CarSpawner.Instance != null && CarSpawner.Instance.AllCars != null)
-            {
-                var car = CarSpawner.Instance.AllCars.Find(c => c != null && c.ID == carId);
-                if (car != null)
-                {
-                    bool isAi = IsAmbientAITrain(car);
-                    lock (s_aiCarsLock)
-                    {
-                        if (isAi)
-                        {
-                            s_aiCarIds.Add(carId);
-                            s_historicalAmbientCarIds.Add(carId);
-                        }
-                        else
-                        {
-                            s_knownNonAiCarIds.Add(carId);
-                        }
-                    }
-                    return isAi;
-                }
             }
 
             return false;
+        }
+
+        public static void ShutdownThirdPartyNetworkListeners()
+        {
+            try
+            {
+                var cmlType = AccessTools.TypeByName("CommunityMapLocation.Main");
+                if (cmlType != null)
+                {
+                    var apiServerField = AccessTools.Field(cmlType, "apiServer");
+                    if (apiServerField != null)
+                    {
+                        var apiServer = apiServerField.GetValue(null);
+                        if (apiServer != null)
+                        {
+                            var stopMethod = AccessTools.Method(apiServer.GetType(), "Stop");
+                            if (stopMethod != null)
+                            {
+                                stopMethod.Invoke(apiServer, null);
+                                if (Main.ModEntry != null && Main.ModEntry.Logger != null)
+                                    Main.ModEntry.Logger.Log("[ModCompatManager] Stopped unclosed CommunityMapLocation HttpListener on exit to prevent Steam process hang.");
+                            }
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                if (Main.ModEntry != null && Main.ModEntry.Logger != null)
+                    Main.ModEntry.Logger.Warning(string.Format("[ModCompatManager] Error stopping third-party network listeners: {0}", ex));
+            }
         }
 
         #endregion
@@ -882,6 +1151,7 @@ namespace AITraffic.Compat
                 {
                     AITraffic.Core.TrafficManager.Instance.PurgeAllWorldAICars();
                 }
+                ModCompatManager.ShutdownThirdPartyNetworkListeners();
             }
             catch (Exception ex)
             {
@@ -906,6 +1176,7 @@ namespace AITraffic.Compat
                 {
                     AITraffic.Core.TrafficManager.Instance.PurgeAllWorldAICars();
                 }
+                ModCompatManager.ShutdownThirdPartyNetworkListeners();
             }
             catch (Exception ex)
             {

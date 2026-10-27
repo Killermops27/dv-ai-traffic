@@ -401,6 +401,11 @@ namespace AITraffic.Fleet
                 carCount = rng.Next(5, 8);
             }
 
+            if (AITraffic.Config.IniConfigManager.Instance != null && AITraffic.Config.IniConfigManager.Instance.Consists != null)
+            {
+                carCount = UnityEngine.Mathf.Clamp(carCount, AITraffic.Config.IniConfigManager.Instance.Consists.MinCars, AITraffic.Config.IniConfigManager.Instance.Consists.MaxCars);
+            }
+
             PopulateFreightWagons(result, freightPool, carCount, isHeavyBulk, isEmptyReturn, rng);
         }
 
@@ -447,6 +452,11 @@ namespace AITraffic.Fleet
                     carCount = rng.Next(6, 9);
                 else
                     carCount = rng.Next(7, 11);
+            }
+
+            if (AITraffic.Config.IniConfigManager.Instance != null && AITraffic.Config.IniConfigManager.Instance.Consists != null)
+            {
+                carCount = UnityEngine.Mathf.Clamp(carCount, AITraffic.Config.IniConfigManager.Instance.Consists.MinCars, AITraffic.Config.IniConfigManager.Instance.Consists.MaxCars);
             }
 
             PopulateFreightWagons(result, freightPool, carCount, isHeavyBulk, isEmptyReturn, rng);

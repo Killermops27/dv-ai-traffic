@@ -162,6 +162,192 @@ namespace AITraffic.Workers
             return null;
         }
 
+        // CRITICAL INVARIANT [WRK-02]: "Forward" for AI Workers means pulling the consist out the uncoupled end of the lead locomotive (or +transform.forward for light engines).
+        public bool IsPullingAlongLocoForward(TrainCar leadLoco)
+        {
+            if (leadLoco == null) return true;
+
+            bool frontCoupled = leadLoco.frontCoupler != null && leadLoco.frontCoupler.IsCoupled();
+            bool rearCoupled = leadLoco.rearCoupler != null && leadLoco.rearCoupler.IsCoupled();
+
+            if (frontCoupled && !rearCoupled)
+            {
+                return false;
+            }
+            if (!frontCoupled && rearCoupled)
+            {
+                return true;
+            }
+
+            if (leadLoco.trainset != null && leadLoco.trainset.cars != null && leadLoco.trainset.cars.Count > 1)
+            {
+                TrainCar otherCar = (leadLoco.trainset.cars[0] == leadLoco)
+                    ? leadLoco.trainset.cars[leadLoco.trainset.cars.Count - 1]
+                    : leadLoco.trainset.cars[0];
+                if (otherCar != null && otherCar != leadLoco)
+                {
+                    Vector3 awayFromConsist = leadLoco.transform.position - otherCar.transform.position;
+                    if (awayFromConsist.sqrMagnitude > 0.01f)
+                    {
+                        return Vector3.Dot(leadLoco.transform.forward, awayFromConsist) >= 0f;
+                    }
+                }
+            }
+
+            return true;
+        }
+
+        public bool GetPullingForwardOnTrack(TrainCar leadLoco, RailTrack track)
+        {
+            if (leadLoco == null || track == null) return true;
+
+            bool pullAlongLocoForward = IsPullingAlongLocoForward(leadLoco);
+            bool locoForwardOnTrack = true;
+
+            if (leadLoco.FrontBogie != null && leadLoco.RearBogie != null &&
+                leadLoco.FrontBogie.traveller != null && leadLoco.RearBogie.traveller != null &&
+                leadLoco.FrontBogie.track == track && leadLoco.RearBogie.track == track)
+            {
+                locoForwardOnTrack = (leadLoco.FrontBogie.traveller.Span >= leadLoco.RearBogie.traveller.Span);
+            }
+            else if (RailGraph.Instance != null)
+            {
+                if (!RailGraph.Instance.IsInitialized) RailGraph.Instance.Initialize();
+                var edge = RailGraph.Instance.GetEdge(track);
+                if (edge != null && edge.FromNode != null && edge.ToNode != null)
+                {
+                    Vector3 edgeDir = (edge.ToNode.Position - edge.FromNode.Position).normalized;
+                    locoForwardOnTrack = Vector3.Dot(leadLoco.transform.forward, edgeDir) >= 0f;
+                }
+            }
+
+            return pullAlongLocoForward ? locoForwardOnTrack : !locoForwardOnTrack;
+        }
+
+        // CRITICAL INVARIANT [WRK-02]: Worker trains must strictly search forward (pulling); reversing is only allowed to escape a dead-end spur across the first trailing switch onto a stem track with a valid forward route.
+        public RailPath FindWorkerRouteWithSpurFallback(
+            Pathfinder pathfinder,
+            RailTrack originTrack,
+            RailTrack destTrack,
+            TrainCar leadLoco,
+            PathfinderOptions pathOptions,
+            out Junction spurSwitch,
+            out RailTrack spurStemTrack,
+            out byte spurMainlineBranch)
+        {
+            spurSwitch = null;
+            spurStemTrack = null;
+            spurMainlineBranch = 0;
+
+            if (pathfinder == null || originTrack == null || destTrack == null) return null;
+
+            bool forwardOnTrack = GetPullingForwardOnTrack(leadLoco, originTrack);
+
+            // 1. Primary search: strictly in the forward pulling direction
+            var forwardPath = pathfinder.FindPath(originTrack, destTrack, forwardOnTrack, pathOptions);
+            if (forwardPath != null && forwardPath.IsValid && forwardPath.Tracks != null && forwardPath.Tracks.Count >= 2)
+            {
+                return forwardPath;
+            }
+
+            // 2. Dead-end spur check: only allow backing out if the forward direction from originTrack faces a dead-end buffer stop
+            if (RailGraph.Instance == null) return null;
+            if (!RailGraph.Instance.IsInitialized) RailGraph.Instance.Initialize();
+
+            var originEdge = RailGraph.Instance.GetEdge(originTrack);
+            if (originEdge == null) return null;
+
+            RailNode forwardNode = forwardOnTrack ? originEdge.ToNode : originEdge.FromNode;
+            RailNode rearNode = forwardOnTrack ? originEdge.FromNode : originEdge.ToNode;
+            if (forwardNode == null || rearNode == null || !forwardNode.IsDeadEnd)
+            {
+                return null;
+            }
+
+            // 3. Locate the first trailing switch behind the dead-end spur where the train can back onto a stem track and pull forward
+            // CRITICAL INVARIANT [WRK-06]: Evaluate originTrack's own end junctions first (O(1)); the full-scene
+            // FindObjectsOfType<Junction>() scan is only a fallback when neither end junction qualifies.
+            Junction RearSwitch = null;
+            Junction[] allJunctions = new Junction[] { originTrack.inJunction, originTrack.outJunction };
+            for (int pass = 0; pass < 2 && RearSwitch == null; pass++)
+            {
+                if (pass == 1)
+                {
+                    allJunctions = UnityEngine.Object.FindObjectsOfType<Junction>();
+                    if (allJunctions == null) break;
+                }
+
+                for (int i = 0; i < allJunctions.Length; i++)
+                {
+                    var j = allJunctions[i];
+                    if (j == null || j.inBranch == null || j.inBranch.track == null || j.outBranches == null || j.outBranches.Count < 2)
+                        continue;
+
+                    bool matchesOutBranch = false;
+                    for (int b = 0; b < j.outBranches.Count; b++)
+                    {
+                        if (j.outBranches[b] != null && j.outBranches[b].track == originTrack)
+                        {
+                            matchesOutBranch = true;
+                            break;
+                        }
+                    }
+
+                    if (matchesOutBranch)
+                    {
+                        float distToRear = Vector3.Distance(j.transform.position, rearNode.Position);
+                        float distToFwd = Vector3.Distance(j.transform.position, forwardNode.Position);
+                        if (distToRear <= distToFwd)
+                        {
+                            RearSwitch = j;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if (RearSwitch == null) return null;
+
+            RailTrack candidateStem = RearSwitch.inBranch.track;
+            var stemEdge = RailGraph.Instance.GetEdge(candidateStem);
+            if (stemEdge == null || stemEdge.FromNode == null || stemEdge.ToNode == null) return null;
+
+            Trainset reqTs = (leadLoco != null) ? leadLoco.trainset : null;
+            if (RailGraph.Instance.IsTrackOccupied(candidateStem, null, reqTs) ||
+                SignalRegistry.IsTrackOccupiedByPlayer(candidateStem, reqTs))
+            {
+                return null;
+            }
+
+            // Pulling forward from candidateStem across RearSwitch means heading toward RearSwitch
+            float dToNode = Vector3.Distance(stemEdge.ToNode.Position, RearSwitch.transform.position);
+            float dFromNode = Vector3.Distance(stemEdge.FromNode.Position, RearSwitch.transform.position);
+            bool stemForwardTowardSwitch = (dToNode <= dFromNode);
+
+            PathfinderOptions switchbackOptions = (pathOptions != null) ? pathOptions.Clone() : new PathfinderOptions();
+            if (switchbackOptions.ExcludedTracks == null)
+            {
+                switchbackOptions.ExcludedTracks = new HashSet<RailTrack>();
+            }
+            switchbackOptions.ExcludedTracks.Add(originTrack);
+
+            var switchbackPath = pathfinder.FindPath(candidateStem, destTrack, stemForwardTowardSwitch, switchbackOptions);
+            if (switchbackPath != null && switchbackPath.IsValid && switchbackPath.Tracks != null && switchbackPath.Tracks.Count >= 2)
+            {
+                Junction verifyJunc;
+                byte mainBr = 0;
+                if (SignalRegistry.TryGetJunctionBetweenTracks(candidateStem, switchbackPath.Tracks[1], out verifyJunc, out mainBr))
+                {
+                    spurMainlineBranch = mainBr;
+                }
+                spurSwitch = RearSwitch;
+                spurStemTrack = candidateStem;
+                return switchbackPath;
+            }
+
+            return null;
+        }
+
         /// <summary>
         /// Identifies the closest StationController to the given position.
         /// </summary>
@@ -204,35 +390,36 @@ namespace AITraffic.Workers
 
             List<RailTrack> candidates = new List<RailTrack>();
 
-            // 1. Prefer designated transferIn (inbound receiving) tracks
-            if (station.transferInRailtracksGONames != null && station.transferInRailtracksGONames.Count > 0)
+            // CRITICAL INVARIANT [WRK-05]: Arrival candidates are tiered strictly by station track designation
+            // (Tier 1 transferIn, Tier 2 storage, Tier 3 any station track only if 1+2 are empty), and each tier is
+            // sorted by proximity to the station office (station.transform.position). Never pick in scene-hierarchy order.
+            List<RailTrack> tierTransferIn = new List<RailTrack>();
+            List<RailTrack> tierStorage = new List<RailTrack>();
+            for (int i = 0; i < station.AllStationTracks.Count; i++)
             {
-                for (int i = 0; i < station.AllStationTracks.Count; i++)
-                {
-                    var track = station.AllStationTracks[i];
-                    if (track == null || track.curve == null) continue;
+                var track = station.AllStationTracks[i];
+                if (track == null || track.curve == null) continue;
 
-                    if (station.transferInRailtracksGONames.Contains(track.name))
-                    {
-                        candidates.Add(track);
-                    }
+                if (station.transferInRailtracksGONames != null && station.transferInRailtracksGONames.Contains(track.name))
+                {
+                    tierTransferIn.Add(track);
+                }
+                else if (station.storageRailtracksGONames != null && station.storageRailtracksGONames.Contains(track.name))
+                {
+                    tierStorage.Add(track);
                 }
             }
 
-            // 2. Fallback to storage sidings
-            if (candidates.Count == 0 && station.storageRailtracksGONames != null)
-            {
-                for (int i = 0; i < station.AllStationTracks.Count; i++)
-                {
-                    var track = station.AllStationTracks[i];
-                    if (track == null || track.curve == null) continue;
+            Vector3 stationOfficePos = station.transform.position;
+            System.Comparison<RailTrack> byStationProximity = (a, b) =>
+                (a.curve.GetPointAt(0.5f) - stationOfficePos).sqrMagnitude.CompareTo((b.curve.GetPointAt(0.5f) - stationOfficePos).sqrMagnitude);
+            tierTransferIn.Sort(byStationProximity);
+            tierStorage.Sort(byStationProximity);
 
-                    if (station.storageRailtracksGONames.Contains(track.name))
-                    {
-                        candidates.Add(track);
-                    }
-                }
-            }
+            // 1. Designated transferIn (inbound receiving) tracks, nearest first
+            candidates.AddRange(tierTransferIn);
+            // 2. Storage sidings, nearest first (always evaluated after transferIn)
+            candidates.AddRange(tierStorage);
 
             // 3. Fallback to any station track
             if (candidates.Count == 0)
@@ -256,6 +443,12 @@ namespace AITraffic.Workers
                 MaxSearchDistance = 5000000f
             };
 
+            // CRITICAL INVARIANT [WRK-06]: Shared budget of synchronous route checks across Pass 1 and Pass 2 (nearest-first per [WRK-05]);
+            // a track route-checked in Pass 1 is never re-checked in Pass 2 (same origin/options => same result).
+            const int MaxArrivalRouteChecks = 6;
+            int arrivalRouteChecks = 0;
+            var routeTestedTracks = new HashSet<RailTrack>();
+
             // Pass 1: Length >= bufferLength and strictly unoccupied
             for (int i = 0; i < candidates.Count; i++)
             {
@@ -267,7 +460,17 @@ namespace AITraffic.Workers
                     // Check if Pathfinder can find a route to this track
                     if (originTrack != null)
                     {
-                        var testPath = pathfinder.FindPath(originTrack, track, pathOptions);
+                        // [WRK-06]: bounded synchronous route checks
+                        if (arrivalRouteChecks >= MaxArrivalRouteChecks) break;
+                        arrivalRouteChecks++;
+                        routeTestedTracks.Add(track);
+
+                        Junction dummySwitch;
+                        RailTrack dummyStem;
+                        byte dummyBranch;
+                        var testPath = FindWorkerRouteWithSpurFallback(
+                            pathfinder, originTrack, track, leadLoco, pathOptions,
+                            out dummySwitch, out dummyStem, out dummyBranch);
                         if (testPath != null && testPath.IsValid)
                         {
                             bestCandidate = track;
@@ -294,7 +497,18 @@ namespace AITraffic.Workers
                     {
                         if (originTrack != null)
                         {
-                            var testPath = pathfinder.FindPath(originTrack, track, pathOptions);
+                            // [WRK-06]: never re-test a Pass-1 track; respect the shared check budget
+                            if (routeTestedTracks.Contains(track)) continue;
+                            if (arrivalRouteChecks >= MaxArrivalRouteChecks) break;
+                            arrivalRouteChecks++;
+                            routeTestedTracks.Add(track);
+
+                            Junction dummySwitch;
+                            RailTrack dummyStem;
+                            byte dummyBranch;
+                            var testPath = FindWorkerRouteWithSpurFallback(
+                                pathfinder, originTrack, track, leadLoco, pathOptions,
+                                out dummySwitch, out dummyStem, out dummyBranch);
                             if (testPath != null && testPath.IsValid)
                             {
                                 bestCandidate = track;
@@ -325,9 +539,13 @@ namespace AITraffic.Workers
         /// </summary>
         public double CalculateHiringFee(float routeDistanceMeters, float consistMassTons)
         {
-            double baseFee = 300.0;
-            double distanceFee = (routeDistanceMeters / 1000.0) * 60.0; // $60 per km
-            double massFee = consistMassTons * 0.35; // $35 per 100 tons
+            var econ = (AITraffic.Config.IniConfigManager.Instance != null && AITraffic.Config.IniConfigManager.Instance.Economy != null)
+                ? AITraffic.Config.IniConfigManager.Instance.Economy
+                : new AITraffic.Config.EconomyConfig();
+
+            double baseFee = econ.DriverBaseFee;
+            double distanceFee = routeDistanceMeters * econ.PerMeterRate;
+            double massFee = consistMassTons * econ.PerTonRate;
 
             double total = baseFee + distanceFee + massFee;
             return Math.Round(total / 10.0) * 10.0; // Round to nearest $10
@@ -352,7 +570,7 @@ namespace AITraffic.Workers
 
             if (!leadLoco.IsLoco || !TrainSpawner.IsSupportedAILocomotive(leadLoco))
             {
-                statusMessage = string.Format("Locomotive '{0}' is not supported for autonomous driving.", leadLoco.ID);
+                statusMessage = string.Format("Locomotive '{0}' is not supported for autonomous driving.", ModCompatManager.GetCarId(leadLoco));
                 return false;
             }
 
@@ -428,15 +646,21 @@ namespace AITraffic.Workers
                 MaxSearchDistance = 5000000f
             };
 
-            var routePath = pathfinder.FindPath(originTrack, destTrack, pathOptions);
+            // CRITICAL INVARIANT [WRK-02]: Enforce strict pulling-forward routing with single-switchback fallback only on dead-end spurs (See GRAVEYARD.md)
+            Junction spurSwitch;
+            RailTrack spurStemTrack;
+            byte spurMainlineBranch;
+            var routePath = FindWorkerRouteWithSpurFallback(
+                pathfinder, originTrack, destTrack, leadLoco, pathOptions,
+                out spurSwitch, out spurStemTrack, out spurMainlineBranch);
             if (routePath == null || !routePath.IsValid || routePath.Tracks == null || routePath.Tracks.Count < 2)
             {
                 if (Main.ModEntry != null && Main.ModEntry.Logger != null)
                 {
-                    Main.ModEntry.Logger.Log(string.Format("[WorkerManager] HireDriverForAtoB route calculation failed from '{0}' to '{1}'.",
+                    Main.ModEntry.Logger.Log(string.Format("[WorkerManager] HireDriverForAtoB forward route calculation failed from '{0}' to '{1}'.",
                         originTrack != null ? originTrack.name : "null", destTrack != null ? destTrack.name : "null"));
                 }
-                statusMessage = string.Format("Could not calculate a clear route to {0} track '{1}'. Switches may be blocked.",
+                statusMessage = string.Format("Could not calculate a forward route to {0} track '{1}'. Loco may face wrong way or switches are blocked.",
                     destStation.stationInfo != null ? destStation.stationInfo.Name : "destination", destTrack.name);
                 return false;
             }
@@ -460,6 +684,17 @@ namespace AITraffic.Workers
             // 7. Mechanical configuration
             // Ensure couplers connected and angle cocks open across all consist cars
             TrainSpawner.ConfigureConsistCouplers(consist);
+
+            // Connect Multiple Unit (MU) cables between all adjacent MU-capable locomotives/slugs
+            for (int i = 0; i < consist.Count - 1; i++)
+            {
+                var carA = consist[i];
+                var carB = consist[i + 1];
+                if (carA != null && carB != null && carA.IsMultipleUnit && carB.IsMultipleUnit)
+                {
+                    TrainSpawner.ConnectMUCablesBetween(carA, carB);
+                }
+            }
 
             // Release handbrakes across the entire consist
             for (int i = 0; i < consist.Count; i++)
@@ -491,8 +726,29 @@ namespace AITraffic.Workers
                 }
             }
 
-            // Start up engine prime mover and electronics
-            TrainSpawner.InitializeLocomotive(leadLoco);
+            // Traverse all locomotives in the consist:
+            // Start trailing engines and ensure trailing locomotives have BrakeCutout.Set(0f) and IndependentBrake.Set(0f)
+            for (int i = 0; i < consist.Count; i++)
+            {
+                var car = consist[i];
+                if (car != null && car.IsLoco)
+                {
+                    bool isLead = (car == leadLoco);
+                    TrainSpawner.InitializeLocomotive(car, isLead);
+
+                    if (!isLead)
+                    {
+                        var locoControls = (car.SimController != null) ? car.SimController.controlsOverrider : car.GetComponent<BaseControlsOverrider>();
+                        if (locoControls != null)
+                        {
+                            if (locoControls.BrakeCutout != null) locoControls.BrakeCutout.Set(0f);
+                            if (locoControls.IndependentBrake != null) locoControls.IndependentBrake.Set(0f);
+                            if (locoControls.Brake != null) locoControls.Brake.Set(0f);
+                            if (locoControls.Handbrake != null) locoControls.Handbrake.Set(0f);
+                        }
+                    }
+                }
+            }
 
             // 8. Attach and initialize AIEngineer
             var engineer = leadLoco.gameObject.GetComponent<AIEngineer>();
@@ -509,6 +765,17 @@ namespace AITraffic.Workers
             engineer.DestinationTrackName = destTrack.name;
             engineer.IsStationDestination = false;
             engineer.IsTerminusDestination = true;
+
+            // CRITICAL INVARIANT [WRK-02]: Lock worker pulling reverser and trigger dead-end spur switchback escape if departing from a buffer spur.
+            float pullingReverser = IsPullingAlongLocoForward(leadLoco) ? 1.0f : -1.0f;
+            if (spurSwitch != null && spurStemTrack != null)
+            {
+                engineer.InitiateSpurReverseEscape(spurSwitch, spurStemTrack, spurMainlineBranch, pullingReverser);
+            }
+            else
+            {
+                engineer.SetLockedPullingReverser(pullingReverser);
+            }
 
             // Hook terminus arrival event
             engineer.OnTerminusArrival += HandleTaskTerminusArrival;
@@ -571,6 +838,95 @@ namespace AITraffic.Workers
         /// <summary>
         /// Cancels an active worker haul, immediately halting the train and returning control to the player.
         /// </summary>
+        // CRITICAL INVARIANT [COMPAT]: Cleanly unregister AIDamageImmunity and LocoSim components upon worker handover/cancellation (See GRAVEYARD.md)
+        private static void RestorePlayerConsistDamageVulnerability(AtoBHaulTask task)
+        {
+            if (task == null) return;
+
+            if (task.LeadLocomotive != null)
+            {
+                TrainSpawner.ApplyAIDamageImmunity(task.LeadLocomotive, false);
+                AITraffic.Compat.AIDamageImmunityPatches.UnregisterAISimComponents(task.LeadLocomotive);
+
+                if (task.LeadLocomotive.trainset != null && task.LeadLocomotive.trainset.cars != null)
+                {
+                    var trainsetCars = task.LeadLocomotive.trainset.cars;
+                    for (int i = 0; i < trainsetCars.Count; i++)
+                    {
+                        var c = trainsetCars[i];
+                        if (c != null)
+                        {
+                            TrainSpawner.ApplyAIDamageImmunity(c, false);
+                            AITraffic.Compat.AIDamageImmunityPatches.UnregisterAISimComponents(c);
+                        }
+                    }
+                }
+            }
+
+            if (task.Consist != null)
+            {
+                for (int i = 0; i < task.Consist.Count; i++)
+                {
+                    var c = task.Consist[i];
+                    if (c != null)
+                    {
+                        TrainSpawner.ApplyAIDamageImmunity(c, false);
+                        AITraffic.Compat.AIDamageImmunityPatches.UnregisterAISimComponents(c);
+                    }
+                }
+            }
+        }
+
+        // CRITICAL INVARIANT [WRK-03]: Completely destroy AILocomotiveLighting, remove ConsistEOTMarker, and restore trailing MU BrakeCutout upon worker cancellation or arrival handover (See GRAVEYARD.md)
+        private static void CleanupWorkerConsistComponents(AtoBHaulTask task)
+        {
+            if (task == null) return;
+
+            if (task.LeadLocomotive != null)
+            {
+                var leadLighting = task.LeadLocomotive.GetComponent<AILocomotiveLighting>();
+                if (leadLighting != null)
+                {
+                    leadLighting.Shutdown();
+                    UnityEngine.Object.Destroy(leadLighting);
+                }
+                ConsistEOTMarker.RemoveFromCar(task.LeadLocomotive);
+
+                if (task.LeadLocomotive.trainset != null && task.LeadLocomotive.trainset.cars != null)
+                {
+                    var tsCars = task.LeadLocomotive.trainset.cars;
+                    for (int i = 0; i < tsCars.Count; i++)
+                    {
+                        var c = tsCars[i];
+                        if (c == null) continue;
+                        var l = c.GetComponent<AILocomotiveLighting>();
+                        if (l != null)
+                        {
+                            l.Shutdown();
+                            UnityEngine.Object.Destroy(l);
+                        }
+                        ConsistEOTMarker.RemoveFromCar(c);
+                    }
+                }
+            }
+
+            if (task.Consist != null)
+            {
+                for (int i = 0; i < task.Consist.Count; i++)
+                {
+                    var c = task.Consist[i];
+                    if (c == null) continue;
+                    var l = c.GetComponent<AILocomotiveLighting>();
+                    if (l != null)
+                    {
+                        l.Shutdown();
+                        UnityEngine.Object.Destroy(l);
+                    }
+                    ConsistEOTMarker.RemoveFromCar(c);
+                }
+            }
+        }
+
         public void CancelTask(AtoBHaulTask task)
         {
             if (task == null) return;
@@ -583,12 +939,29 @@ namespace AITraffic.Workers
                     task.Engineer.EmergencyStop();
                     TrafficManager.Instance.UnregisterEngineer(task.Engineer);
                     UnityEngine.Object.Destroy(task.Engineer);
+                    task.Engineer = null;
                 }
+                else if (task.LeadLocomotive != null)
+                {
+                    var remEng = task.LeadLocomotive.GetComponent<AIEngineer>();
+                    if (remEng != null)
+                    {
+                        TrafficManager.Instance.UnregisterEngineer(remEng);
+                        UnityEngine.Object.Destroy(remEng);
+                    }
+                }
+
+                CleanupWorkerConsistComponents(task);
+                RestorePlayerConsistDamageVulnerability(task);
 
                 // Apply handbrake to prevent rolling
                 if (task.LeadLocomotive != null)
                 {
                     var controls = task.LeadLocomotive.GetComponent<BaseControlsOverrider>();
+                    if (controls == null && task.LeadLocomotive.SimController != null)
+                    {
+                        controls = task.LeadLocomotive.SimController.controlsOverrider;
+                    }
                     if (controls != null && controls.Handbrake != null)
                     {
                         controls.Handbrake.Set(1.0f);
@@ -608,6 +981,28 @@ namespace AITraffic.Workers
             {
                 Debug.LogError(string.Format("[AITraffic] Error cancelling worker task: {0}", ex));
             }
+        }
+
+        /// <summary>
+        /// Checks if a train car belongs to a currently ACTIVE AI worker haul task (completed tasks are player consists).
+        /// Used by switch interlocking. Despawn/purge protection must keep using IsTrainCarInAnyWorkerTask.
+        /// </summary>
+        public static bool IsTrainCarInActiveWorkerTask(TrainCar car)
+        {
+            if (car == null || Instance == null) return false;
+
+            if (Instance.ActiveTasks != null)
+            {
+                for (int i = 0; i < Instance.ActiveTasks.Count; i++)
+                {
+                    var task = Instance.ActiveTasks[i];
+                    if (task == null) continue;
+                    if (task.LeadLocomotive == car) return true;
+                    if (task.Consist != null && task.Consist.Contains(car)) return true;
+                }
+            }
+
+            return false;
         }
 
         /// <summary>
@@ -699,8 +1094,8 @@ namespace AITraffic.Workers
                         if (controls.Reverser != null) controls.Reverser.Set(0.0f);
                         if (controls.Starter != null) controls.Starter.Set(0.0f);
                         if (controls.PowerOff != null) controls.PowerOff.Set(1.0f);
-                        if (controls.HeadlightsFront != null) controls.HeadlightsFront.Set(0.0f);
-                        if (controls.HeadlightsRear != null) controls.HeadlightsRear.Set(0.0f);
+                        if (controls.HeadlightsFront != null) controls.HeadlightsFront.Set(0.4f);
+                        if (controls.HeadlightsRear != null) controls.HeadlightsRear.Set(0.4f);
                         if (controls.CabLight != null) controls.CabLight.Set(0.0f);
                         if (controls.Wipers != null) controls.Wipers.Set(0.0f);
                     }
@@ -732,8 +1127,8 @@ namespace AITraffic.Workers
                                 if (hControls.Reverser != null) hControls.Reverser.Set(0.0f);
                                 if (hControls.Starter != null) hControls.Starter.Set(0.0f);
                                 if (hControls.PowerOff != null) hControls.PowerOff.Set(1.0f);
-                                if (hControls.HeadlightsFront != null) hControls.HeadlightsFront.Set(0.0f);
-                                if (hControls.HeadlightsRear != null) hControls.HeadlightsRear.Set(0.0f);
+                                if (hControls.HeadlightsFront != null) hControls.HeadlightsFront.Set(0.4f);
+                                if (hControls.HeadlightsRear != null) hControls.HeadlightsRear.Set(0.4f);
                                 if (hControls.CabLight != null) hControls.CabLight.Set(0.0f);
                             }
                             if (car.brakeSystem != null)
@@ -761,6 +1156,9 @@ namespace AITraffic.Workers
                     }
                 }
 
+                CleanupWorkerConsistComponents(matchedTask);
+                RestorePlayerConsistDamageVulnerability(matchedTask);
+
                 matchedTask.Status = HaulTaskStatus.Arrived;
                 matchedTask.CompletedTime = Time.time;
                 matchedTask.StatusMessage = "Consist delivered successfully!";
@@ -772,7 +1170,7 @@ namespace AITraffic.Workers
                     ? matchedTask.DestinationStation.stationInfo.Name
                     : "Destination";
                 string trackName = matchedTask.DestinationTrack != null ? matchedTask.DestinationTrack.name : "Yard";
-                string locoId = matchedTask.LeadLocomotive != null ? matchedTask.LeadLocomotive.ID : "Consist";
+                string locoId = matchedTask.LeadLocomotive != null ? ModCompatManager.GetCarId(matchedTask.LeadLocomotive) : "Consist";
 
                 string finishToast = string.Format("AI Worker completed! Train {0} delivered to {1} on track '{2}'. Engine shut down, control returned to player.",
                     locoId, destName, trackName);
@@ -810,26 +1208,10 @@ namespace AITraffic.Workers
                     continue;
                 }
 
-                // Check if train has arrived and stopped on its destination track
-                bool isStoppedOnDestTrack = false;
-                if (task.DestinationTrack != null && task.LeadLocomotive != null)
-                {
-                    var leadTrack = GetCurrentTrack(task.LeadLocomotive);
-                    if (leadTrack == task.DestinationTrack)
-                    {
-                        float speed = task.Engineer != null ? task.Engineer.CurrentSpeedKmh : Mathf.Abs(task.LeadLocomotive.GetForwardSpeed() * 3.6f);
-                        if (speed < 0.5f)
-                        {
-                            isStoppedOnDestTrack = true;
-                        }
-                    }
-                }
-
-                // Primary or secondary arrival detection
-                bool isTerminusStopped = (task.Engineer != null && task.Engineer.State == EngineState.TerminusStop && task.Engineer.CurrentSpeedKmh < 0.5f);
-                bool isIdleOnDest = (task.Engineer != null && task.Engineer.State == EngineState.Idle && isStoppedOnDestTrack);
-
-                if (isTerminusStopped || isStoppedOnDestTrack || isIdleOnDest)
+                // CRITICAL INVARIANT [NEW v0.2.8]: Strict Terminus Arrival Verification
+                // Rely strictly on AIEngineer.HasArrivedAtDestination (2.0s stationary + rear bogie on destination track)
+                // so worker trains never shut down prematurely while trailing cars still foul station throat switches.
+                if (task.Engineer != null && task.Engineer.HasArrivedAtDestination)
                 {
                     HandleTaskTerminusArrival(task.Engineer, task);
                 }
@@ -963,7 +1345,7 @@ namespace AITraffic.Workers
                 string trackName = (curTrack != null) ? curTrack.name : "Unknown Track";
 
                 GUILayout.Label(string.Format("<b>Target Train:</b> <color=#FFD700>{0}</color> ({1}) | <b>Cars:</b> {2} | <b>Length:</b> {3:F0}m | <b>Weight:</b> {4:F0}t",
-                    loco.ID, loco.carType, consist.Count, totalLen, totalMass));
+                    ModCompatManager.GetCarId(loco), loco.carType, consist.Count, totalLen, totalMass));
                 GUILayout.Label(string.Format("<b>Current Location:</b> {0} [Track: {1}]", origName, trackName));
                 GUILayout.Space(6f);
 
@@ -1113,7 +1495,7 @@ namespace AITraffic.Workers
 
                     GUILayout.BeginHorizontal();
                     GUILayout.Label(string.Format("• <b>{0}</b> -> {1} [{2}] | <b>{3:F0} km/h</b> | {4:F1} km left",
-                        task.LeadLocomotive.ID, dName, tName, task.CurrentSpeedKmh, task.RemainingDistance / 1000f));
+                        ModCompatManager.GetCarId(task.LeadLocomotive), dName, tName, task.CurrentSpeedKmh, task.RemainingDistance / 1000f));
 
                     if (GUILayout.Button("Dismiss", GUILayout.Width(70)))
                     {

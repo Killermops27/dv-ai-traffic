@@ -207,12 +207,20 @@ namespace AITraffic.Diagnostics
                         }
 
                         // Collect candidate departure tracks for this station
-                        var depTracks = TrafficScheduler.GetCandidateDepartureTracks(sc, 100f, null);
+                        var depTracks = TrafficScheduler.GetCandidateDepartureTracks(sc, 75f, null);
                         if (depTracks != null)
                         {
                             for (int d = 0; d < depTracks.Count; d++)
                             {
-                                candidateSpawnTracks.Add(depTracks[d]);
+                                var dTrk = depTracks[d];
+                                if (dTrk != null)
+                                {
+                                    candidateSpawnTracks.Add(dTrk);
+                                    if (!stationTrackMap.ContainsKey(dTrk))
+                                    {
+                                        stationTrackMap[dTrk] = yardId;
+                                    }
+                                }
                             }
                         }
                     }
@@ -344,7 +352,7 @@ namespace AITraffic.Diagnostics
 
                         if (origStation == null || destStation == null) continue;
 
-                        var depTracks = TrafficScheduler.GetCandidateDepartureTracks(origStation, 100f, null);
+                        var depTracks = TrafficScheduler.GetCandidateDepartureTracks(origStation, 75f, null);
                         var destTracks = TrafficScheduler.GetCandidateDestinationTracks(destStation, corridor.PreferredConsist, null);
 
                         if (depTracks != null && depTracks.Count > 1)

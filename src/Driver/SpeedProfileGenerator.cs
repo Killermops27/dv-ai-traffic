@@ -878,11 +878,12 @@ namespace AITraffic.Driver
 
             // 4. Physical Track Occupancy Obstacle (Another train or player on the route ahead)
             // Enforces strict absolute block separation: decelerates down to 0 km/h stop line before the obstacle/block boundary
-            if (distanceToObstacle > 0.0f && distanceToObstacle < 2000.0f)
+            // CRITICAL INVARIANT [AIE-17]: Zero-Distance Obstacle Hold Enforcement (distanceToObstacle >= 0.0f)
+            if (distanceToObstacle >= 0.0f && distanceToObstacle < 2000.0f)
             {
                 // Stop 45m behind obstacle ahead to guarantee ample buffer against rear-end collisions
                 float effectiveObstacleDist = Mathf.Max(0.0f, distanceToObstacle - 25.0f);
-                float obstacleDecel = Mathf.Max(ServiceDeceleration, 0.45f);
+                float obstacleDecel = Mathf.Max(ServiceDeceleration, 0.20f);
                 float obstacleStopSpeedMs = CalculateStopBrakingSpeed(effectiveObstacleDist, obstacleDecel);
                 float obstacleStopSpeedKmh = MsToKmH(obstacleStopSpeedMs);
 

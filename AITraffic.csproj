@@ -11,8 +11,9 @@
     <AssemblyName>AITraffic</AssemblyName>
     <TargetFrameworkVersion>v4.8</TargetFrameworkVersion>
     <FileAlignment>512</FileAlignment>
-    <Deterministic>true</Deterministic>
-    <DVInstallPath Condition=" '$(DVInstallPath)' == '' ">J:\SteamLibrary\steamapps\common\Derail Valley</DVInstallPath>
+    <DVInstallPath Condition=" '$(DVInstallPath)' == '' and Exists('C:\Program Files (x86)\Steam\steamapps\common\Derail Valley') ">C:\Program Files (x86)\Steam\steamapps\common\Derail Valley</DVInstallPath>
+    <DVInstallPath Condition=" '$(DVInstallPath)' == '' and Exists('J:\SteamLibrary\steamapps\common\Derail Valley') ">J:\SteamLibrary\steamapps\common\Derail Valley</DVInstallPath>
+    <DVInstallPath Condition=" '$(DVInstallPath)' == '' ">C:\Program Files (x86)\Steam\steamapps\common\Derail Valley</DVInstallPath>
     <LangVersion>default</LangVersion>
   </PropertyGroup>
   <PropertyGroup Condition=" '$(Configuration)|$(Platform)' == 'Debug|AnyCPU' ">
@@ -174,7 +175,10 @@
     </Reference>
   </ItemGroup>
   <ItemGroup>
-    <Compile Include="src\**\*.cs" />
+    <Compile Include="src\Config\IniConfigManager.cs" />
+    <Compile Include="src\Fleet\ConsistEOTMarker.cs" />
+    <Compile Include="src\Driver\AILocomotiveLighting.cs" />
+    <Compile Include="src\**\*.cs" Exclude="src\Config\IniConfigManager.cs;src\Fleet\ConsistEOTMarker.cs;src\Driver\AILocomotiveLighting.cs" />
     <Compile Include="Properties\AssemblyInfo.cs" />
   </ItemGroup>
   <ItemGroup>
