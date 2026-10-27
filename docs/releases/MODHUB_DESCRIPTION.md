@@ -22,6 +22,12 @@ An autonomous AI train traffic, timetable dispatching, and player-employed AI wo
 
 ---
 
+### 🧩 Compatibility Note: Persistent Jobs is DEFINITELY Supported!
+> **Persistent Jobs is now 100% officially supported and fully integrated into AI Traffic as of v0.2.8.**  
+> Even though the *Persistent Jobs* mod page may currently state that AI Traffic is unsupported or incompatible, **this information is outdated**. AI Traffic v0.2.8 includes dedicated integration patches that reflect lightweight suspended cars (`FarCarOpt`) in occupancy checks and pathfinding, enforce track-specific yard protection, and segregate debt ledgers so both mods run together seamlessly!
+
+---
+
 ## 🌟 What's New in v0.2.8
 
 - 🛡️ **30-Minute Vanilla Job Desynchronization CTD Fix:** Replaced broad station-wide destruction zone locks with track-specific protection (`Yard.IsTrackOccupied`). Vanilla DV cleanly refreshes unoccupied yard tracks every 30 minutes without PhysX overlapping explosions, NaN coordinates, or crashes.
@@ -32,6 +38,7 @@ An autonomous AI train traffic, timetable dispatching, and player-employed AI wo
 - 🚂 **Multiple Unit (MU) Helper Automation:** Trailing helper locomotives automatically configure double-heading cut-outs closed (`BrakeCutout = 0.0f`), release independent brakes (`0.0f`), and couple MU air lines.
 - 🏛️ **Demonstrator Loco Preservation & Spawn Validation:** Protects museum demonstrator locomotives at City South from false AI ghost purges, and validates spawn coordinates against `Vector3.zero` to prevent ocean spawns.
 - 🔄 **Atomic Single-Track Corridor Tokens & Diegetic Reverse Protocol:** Atomic tokens prevent opposing corridor entries; if an unavoidable standoff occurs, the AI sounds 3 horn blasts, illuminates front red marker lights, and backs up at $\le 15\text{ km/h}$ into the nearest trailing siding.
+- 🔒 **Turnout Lock Interlocking & AI Preemption ([JNC-09]):** Protects crossover switches in reserved signal blocks, enforces alignment cooldowns, and resolves AI-vs-AI turnout conflicts by signal reservation and train priority.
 - 🔀 **Destination Siding Search & Station Throat Hold:** Diverts to clear alternate sidings when the scheduled destination track is occupied, or safely holds outside the station throat and releases turnout locks to preserve player shunting freedom.
 - 🏎️ **Siding Shunting Handover & Mainline Speed Restoration:** Implemented a 4-layer mast crossing check and multi-head clearance latching, ending the bug where trains leaving sidings crawled at 15 km/h across the mainline.
 - 🚫 **Yard Through-Transit Elimination & Running Line Protection:** Applies a +500,000m routing penalty to station yard tracks (`-O]`, `-I]`, `-S]`, etc.) while protecting central running lines (`[--]`) at full line speed.
@@ -69,12 +76,13 @@ An autonomous AI train traffic, timetable dispatching, and player-employed AI wo
 
 ---
 
-### 📦 Requirements
+### 📦 Requirements & Compatibility
 1. **Derail Valley** (Latest PC / Steam release)
 2. **Unity Mod Manager (UMM)** v0.27.0+
 3. **DV Signals** (Required for block occupancy and physical signal logic)
 4. **CommsRadioAPI** (Required for Comms Radio AI Worker dispatch mode)
 5. **Double Track** (*STRONGLY RECOMMENDED* to prevent single-line gridlock)
+6. **Persistent Jobs** (**Fully Compatible & Officially Supported!**)
 
 ---
 

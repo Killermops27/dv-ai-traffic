@@ -231,8 +231,10 @@ namespace AITraffic.Navigation
 
                 // 3. Lock check
                 JunctionLockInfo existingLock;
+                bool hadOtherLock = false;
                 if (_activeLocks.TryGetValue(junction, out existingLock))
                 {
+                    hadOtherLock = (existingLock != null && existingLock.Requester != requester);
                     if (ShouldReleaseThroatLockForDwell(junction, existingLock))
                     {
                         Log(string.Format("[JunctionController] Released turnout lock on '{0}' held by '{1}' after dwell timeout outside station throat (siding occupied) to allow alignment by '{2}'.",
@@ -268,7 +270,8 @@ namespace AITraffic.Navigation
                     }
                     Log(string.Format("[JunctionController] Junction '{0}' switched to branch {1} for requester '{2}'.", junction.name, desiredBranch, requester));
 
-                    if (lockAfterSwitch)
+                    // CRITICAL INVARIANT [JNC-09]: Atomically lock junction when preempting another requester so the preempted train cannot immediately re-throw on its next 0.4s tick
+                    if (lockAfterSwitch || hadOtherLock)
                     {
                         // Immediately lock switch to protect newly aligned route
                         TryLockJunction(junction, requester, 60f);
@@ -346,6 +349,11 @@ namespace AITraffic.Navigation
                             lockInfo.ExpirationTime = Time.time + 15f;
                             return false;
                         }
+                        ReleaseJunctionInternal(junction, lockInfo.Requester);
+                    }
+                    else if (!IsJunctionPhysicallyOccupied(junction) && CanAIPreemptJunctionLock(junction, lockInfo.Requester as AITraffic.Driver.AIEngineer, requester as AITraffic.Driver.AIEngineer))
+                    {
+                        // CRITICAL INVARIANT [JNC-09]: Allow signal-reserving or higher-priority AI train to preempt stationary/unprotected AI lock holder
                         ReleaseJunctionInternal(junction, lockInfo.Requester);
                     }
                     else
@@ -771,6 +779,20 @@ namespace AITraffic.Navigation
                         return false;
                     }
 
+                    // CRITICAL INVARIANT [JNC-09]: AI-vs-AI Crossover Deadlock Preemption (Signal-Reservation Authority -> Train Priority -> First-Lock-Wins)
+                    var reqEng = requester as AITraffic.Driver.AIEngineer;
+                    if (holderEng != null && reqEng != null && CanAIPreemptJunctionLock(junction, holderEng, reqEng))
+                    {
+                        if (Main.IsDebugLoggingEnabled)
+                        {
+                            Log(string.Format("[JunctionController] Junction '{0}' lock held by '{1}' (prio {2}, sigRes={3}) preempted by '{4}' (prio {5}, sigRes={6}).",
+                                junction.name, holderEng.LocoId, AITraffic.Driver.AIEngineer.GetTrainPriority(holderEng), holderEng.HasActiveSignalReservation(),
+                                reqEng.LocoId, AITraffic.Driver.AIEngineer.GetTrainPriority(reqEng), reqEng.HasActiveSignalReservation()));
+                        }
+                        ReleaseJunctionInternal(junction, lockInfo.Requester);
+                        return false;
+                    }
+
                     return true;
                 }
 
@@ -794,6 +816,47 @@ namespace AITraffic.Navigation
 
                 return false;
             }
+        }
+
+        // CRITICAL INVARIANT [JNC-09]: Strict partial order for AI-vs-AI turnout lock preemption (Signal-Reservation Authority -> Train Priority -> First-Lock-Wins)
+        private bool CanAIPreemptJunctionLock(Junction junction, AITraffic.Driver.AIEngineer holderEng, AITraffic.Driver.AIEngineer reqEng)
+        {
+            if (junction == null || holderEng == null || reqEng == null || holderEng == reqEng)
+            {
+                return false;
+            }
+
+            // Never preempt an active rear-bogie clearance monitor ([JNC-01] / [JNC-07])
+            if (IsJunctionMonitoredForClearance(junction, holderEng))
+            {
+                return false;
+            }
+
+            // Only preempt when lock holder is stationary (< 1.5 km/h) or not actively protecting the lock
+            if (holderEng.CurrentSpeedKmh >= 1.5f && holderEng.ShouldProtectJunctionLock(junction))
+            {
+                return false;
+            }
+
+            // 1. Direct DVSignals track reservation on any branch of this junction
+            var jncResEng = SignalRegistry.GetEngineerReservingJunctionSignal(junction);
+            bool reqHasJncSig = (jncResEng == reqEng);
+            bool holderHasJncSig = (jncResEng == holderEng);
+            if (reqHasJncSig != holderHasJncSig)
+            {
+                return reqHasJncSig;
+            }
+
+            // 2. Active DVSignals reservation held by engineer for its governing block
+            bool reqHasAnySig = reqEng.HasActiveSignalReservation();
+            bool holderHasAnySig = holderEng.HasActiveSignalReservation();
+            if (reqHasAnySig != holderHasAnySig)
+            {
+                return reqHasAnySig;
+            }
+
+            // 3. Train Class Priority (Worker 500 > Passenger 400 > MainlineHeavy 300 > RegionalFreight 200 > Shunter 100); First-Lock-Wins on equal priority
+            return AITraffic.Driver.AIEngineer.GetTrainPriority(reqEng) > AITraffic.Driver.AIEngineer.GetTrainPriority(holderEng);
         }
 
         /// <summary>

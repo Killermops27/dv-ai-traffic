@@ -1203,6 +1203,44 @@ namespace AITraffic.Navigation
             return false;
         }
 
+        // CRITICAL INVARIANT [JNC-09]: Resolve AI engineer holding DVSignals track reservation on any branch of a junction for crossover deadlock preemption
+        /// <summary>
+        /// Retrieves the active AIEngineer holding a DVSignals route reservation on any branch connected to the given junction, if any.
+        /// </summary>
+        public static AITraffic.Driver.AIEngineer GetEngineerReservingJunctionSignal(Junction junction)
+        {
+            if (junction == null || !ModCompatManager.IsDVSignalsLoaded) return null;
+            try
+            {
+                DVSignal by;
+                if (junction.inBranch != null && junction.inBranch.track != null)
+                {
+                    if (Signals.Game.Railway.TrackReserver.IsTrackReserved(junction.inBranch.track, out by) && by != null)
+                    {
+                        var eng = GetEngineerHoldingSignalReservation(by);
+                        if (eng != null) return eng;
+                    }
+                }
+                if (junction.outBranches != null)
+                {
+                    for (int i = 0; i < junction.outBranches.Count; i++)
+                    {
+                        var b = junction.outBranches[i];
+                        if (b != null && b.track != null)
+                        {
+                            if (Signals.Game.Railway.TrackReserver.IsTrackReserved(b.track, out by) && by != null)
+                            {
+                                var eng = GetEngineerHoldingSignalReservation(by);
+                                if (eng != null) return eng;
+                            }
+                        }
+                    }
+                }
+            }
+            catch { }
+            return null;
+        }
+
         /// <summary>
         /// Finds the connecting junction between two consecutive route tracks and determines the required branch index.
         /// </summary>

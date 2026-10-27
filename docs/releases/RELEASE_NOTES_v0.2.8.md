@@ -7,6 +7,12 @@
 
 ---
 
+### 🧩 Compatibility Spotlight: Persistent Jobs is FULLY Supported!
+> **Persistent Jobs is now 100% officially supported and fully integrated into AI Traffic as of v0.2.8.**  
+> Even though the *Persistent Jobs* mod page or description may currently state that AI Traffic is unsupported or incompatible, **this information is outdated**. AI Traffic v0.2.8 includes dedicated integration patches that reflect lightweight suspended cars (`FarCarOpt`) in occupancy checks and pathfinding, enforce track-specific yard protection, and segregate debt ledgers so both mods run together seamlessly!
+
+---
+
 ### 🌟 Release Highlights & What's New in v0.2.8
 
 #### 🛡️ Stability, Memory & Crash to Desktop (CTD) Fixes
@@ -54,6 +60,10 @@
     3. Swaps front headlights to **illuminated red marker/tail lights** to visually signal reverse movement.
     4. Backs up at $\le 15\text{ km/h}$ to the nearest trailing siding.
     5. Throws the turnout, enters the clear siding, sets the parking handbrake, and leaves the mainline clear.
+* **Turnout Lock Interlocking & AI Preemption ([JNC-09]):**
+  * Protects crossover switches in reserved signal blocks while holding an active DVSignals reservation so trailing crossovers are not dropped before signals clear.
+  * Enforces switch alignment retry cooldowns (3s moving, 5s stationary) to prevent 0.4s crossover thrashing.
+  * Establishes a strict partial order for AI-vs-AI turnout lock preemption based on signal reservations and train priority.
 * **Dynamic Alternate Siding Search & Station Throat Hold:**
   * Ambient trains approaching an occupied destination track automatically evaluate alternate receiving/yard tracks ($\ge \text{consist} + 25\text{m}$) and repath seamlessly.
   * If the entire destination yard is congested, the train safely holds outside the station throat and releases all turnout locks so player shunting is not obstructed, displaying an on-screen toast notification and polling for openings every 30 seconds.
@@ -84,12 +94,13 @@
 
 ---
 
-### 📦 Requirements
+### 📦 Requirements & Compatibility
 1. **Derail Valley** (Latest PC / Steam release)
 2. **Unity Mod Manager (UMM)** v0.27.0+
 3. **DV Signals** (Required for block occupancy and physical signal logic)
 4. **CommsRadioAPI** (Required for Comms Radio AI Worker dispatch mode)
 5. **Double Track** (*STRONGLY RECOMMENDED* to prevent single-line gridlock)
+6. **Persistent Jobs** (**Fully Compatible & Officially Supported!**)
 
 ---
 

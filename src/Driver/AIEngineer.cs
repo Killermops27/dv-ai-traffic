@@ -969,6 +969,11 @@ namespace AITraffic.Driver
 			return _reservedDVSignals.Contains(signal) || (signal.Parent != null && _reservedDVSignals.Contains(signal.Parent));
 		}
 
+		public bool HasActiveSignalReservation()
+		{
+			return _reservedDVSignals != null && _reservedDVSignals.Count > 0;
+		}
+
 		public float CalculateStoppingDistance()
 		{
 			float currentSpeedMs = CurrentSpeedMs;
@@ -1041,6 +1046,29 @@ namespace AITraffic.Driver
 						{
 							flag2 = true;
 							break;
+						}
+					}
+				}
+			}
+			// CRITICAL INVARIANT [JNC-09]: Protect switches in the reserved signal block (Block 1 / direct signal reservation) when holding an active DVSignals reservation so ReleasePassedAndConflictingJunctions does not drop crossover locks before Hp 1/Hp 2 clears
+			if (!flag2 && _playerYieldWaitTimer <= 0f && HasActiveSignalReservation() && !SignalRegistry.IsJunctionReservedByPlayerSignal(junction))
+			{
+				if (SignalRegistry.GetEngineerReservingJunctionSignal(junction) == this)
+				{
+					flag2 = true;
+				}
+				else if (_upcomingSignalBlocks != null && _upcomingSignalBlocks.Count > 1)
+				{
+					SignalBlockInfo reservedBlockInfo = _upcomingSignalBlocks[1];
+					if (reservedBlockInfo != null && reservedBlockInfo.Switches != null)
+					{
+						for (int i = 0; i < reservedBlockInfo.Switches.Count; i++)
+						{
+							if (reservedBlockInfo.Switches[i].Junction == junction)
+							{
+								flag2 = true;
+								break;
+							}
 						}
 					}
 				}
@@ -2685,9 +2713,10 @@ namespace AITraffic.Driver
 						{
 							flag26 = true;
 						}
-						else if (!flag20 && CurrentSpeedKmh >= 1.5f && _stoppedSwitchAlignCooldown <= 0f)
+						else if (!flag20 && _stoppedSwitchAlignCooldown <= 0f)
 						{
-							_stoppedSwitchAlignCooldown = 3f;
+							// CRITICAL INVARIANT [JNC-09]: Enforce switch alignment retry cooldown when denied (3s moving, 5s stationary) to prevent 0.4s crossover lock thrashing
+							_stoppedSwitchAlignCooldown = ((CurrentSpeedKmh >= 1.5f) ? 3f : 5f);
 						}
 					}
 					if (_isShuntingMode && _isSelfBlockedShunting)
@@ -4295,7 +4324,7 @@ namespace AITraffic.Driver
 			return null;
 		}
 
-		private static int GetTrainPriority(AIEngineer eng)
+		public static int GetTrainPriority(AIEngineer eng)
 		{
 			if (eng == null)
 			{
