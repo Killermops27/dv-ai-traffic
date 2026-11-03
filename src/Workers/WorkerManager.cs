@@ -551,6 +551,97 @@ namespace AITraffic.Workers
             return Math.Round(total / 10.0) * 10.0; // Round to nearest $10
         }
 
+        /// <summary>
+        /// Calculates the variable leg fee (distance + tonnage) without the flat dispatch base fee.
+        /// Used for Leg 1..N-1 in multi-leg itineraries where DriverBaseFee is charged once on Leg 0.
+        /// </summary>
+        public double CalculateLegVariableFee(float routeDistanceMeters, float consistMassTons)
+        {
+            var econ = (AITraffic.Config.IniConfigManager.Instance != null && AITraffic.Config.IniConfigManager.Instance.Economy != null)
+                ? AITraffic.Config.IniConfigManager.Instance.Economy
+                : new AITraffic.Config.EconomyConfig();
+
+            double distanceFee = Math.Max(0f, routeDistanceMeters) * econ.PerMeterRate;
+            double massFee = Math.Max(0f, consistMassTons) * econ.PerTonRate;
+            double total = distanceFee + massFee;
+            return Math.Round(total / 10.0) * 10.0;
+        }
+
+        // CRITICAL INVARIANT [WRK-07]: Compute cancellation refund BEFORE destroying task.Engineer (which zeroes RemainingDistance).
+        // 100% full refund if cancelled within 10s grace window AND < 25m moved on Leg 0; otherwise DriverBaseFee and completed legs
+        // are non-refundable, Pending future legs refund 100%, and the active EnRoute leg refunds its variable portion pro-rata.
+        public double CalculateCancellationRefund(AtoBHaulTask task)
+        {
+            if (task == null || task.HiringFee <= 0.0) return 0.0;
+            if (task.Status == HaulTaskStatus.Arrived || task.Status == HaulTaskStatus.Cancelled) return 0.0;
+
+            float elapsed = Time.time - task.StartTime;
+            float movedMeters = (task.LeadLocomotive != null && task.InitialWorldPosition != Vector3.zero)
+                ? Vector3.Distance(task.LeadLocomotive.transform.position, task.InitialWorldPosition)
+                : 999f;
+
+            if (task.CurrentLegIndex == 0 && elapsed <= 10.0f && movedMeters < 25.0f)
+            {
+                return task.HiringFee;
+            }
+
+            if (task.Legs == null || task.Legs.Count == 0)
+            {
+                double varPortion = Math.Max(0.0, task.HiringFee - task.BaseFeeCharged);
+                float ratio = (task.RouteDistance > 1f) ? Mathf.Clamp01(task.RemainingDistance / task.RouteDistance) : 0f;
+                double rawRefund = Math.Round((varPortion * ratio) / 10.0) * 10.0;
+                return Math.Max(0.0, Math.Min(varPortion, rawRefund));
+            }
+
+            double totalRefund = 0.0;
+            for (int i = 0; i < task.Legs.Count; i++)
+            {
+                var leg = task.Legs[i];
+                if (leg == null) continue;
+
+                if (i < task.CurrentLegIndex || leg.Status == ItineraryLegStatus.Completed)
+                {
+                    continue;
+                }
+                else if (i > task.CurrentLegIndex || leg.Status == ItineraryLegStatus.Pending)
+                {
+                    totalRefund += Math.Max(0.0, leg.LegFee);
+                }
+                else
+                {
+                    double refundableLegPool = (i == 0)
+                        ? Math.Max(0.0, leg.LegFee - task.BaseFeeCharged)
+                        : Math.Max(0.0, leg.LegFee);
+
+                    float legDist = leg.RouteDistance;
+                    float remDist = (task.Status == HaulTaskStatus.WaitingAtIntermediate) ? 0f : task.RemainingDistance;
+                    float remainingRatio = (legDist > 1f) ? Mathf.Clamp01(remDist / legDist) : 0f;
+                    totalRefund += refundableLegPool * remainingRatio;
+                }
+            }
+
+            double rounded = Math.Round(totalRefund / 10.0) * 10.0;
+            double maxRefundable = Math.Max(0.0, task.HiringFee - task.BaseFeeCharged);
+            return Math.Max(0.0, Math.Min(maxRefundable, rounded));
+        }
+
+        public static bool ShouldKeepEngineRunningOnArrival(AIEngineer engineer)
+        {
+            if (engineer == null || Instance == null || Instance.ActiveTasks == null) return false;
+            for (int i = 0; i < Instance.ActiveTasks.Count; i++)
+            {
+                var t = Instance.ActiveTasks[i];
+                if (t != null && (t.Engineer == engineer || t.LeadLocomotive == engineer.TrainCar))
+                {
+                    if (!t.HasRemainingLegs) return false;
+                    // Infinite hold at intermediate waypoint (DwellSeconds < 0f) shuts down the prime mover until Radio Resume
+                    if (t.CurrentLeg != null && t.CurrentLeg.DwellSeconds < 0f) return false;
+                    return true;
+                }
+            }
+            return false;
+        }
+
         #endregion
 
         #region Worker Dispatch & Task Management
@@ -788,6 +879,10 @@ namespace AITraffic.Workers
 
 
             // 9. Create task record
+            var econ = (AITraffic.Config.IniConfigManager.Instance != null && AITraffic.Config.IniConfigManager.Instance.Economy != null)
+                ? AITraffic.Config.IniConfigManager.Instance.Economy
+                : new AITraffic.Config.EconomyConfig();
+
             var task = new AtoBHaulTask(
                 null,
                 leadLoco,
@@ -799,7 +894,8 @@ namespace AITraffic.Workers
                 isAutoTrack,
                 fee,
                 routePath.TotalDistance,
-                engineer
+                engineer,
+                econ.DriverBaseFee
             );
 
             ActiveTasks.Add(task);
@@ -815,6 +911,253 @@ namespace AITraffic.Workers
             }
 
             statusMessage = "AI Driver successfully hired and dispatched!";
+            return true;
+        }
+
+        /// <summary>
+        /// Employs an AI driver to execute a multi-leg station-to-station itinerary, billing all legs upfront.
+        /// </summary>
+        public bool HireDriverForItinerary(TrainCar leadLoco, List<ItineraryLeg> requestedLegs, out string statusMessage)
+        {
+            statusMessage = string.Empty;
+
+            if (requestedLegs == null || requestedLegs.Count == 0)
+            {
+                statusMessage = "Itinerary contains no legs!";
+                return false;
+            }
+
+            if (requestedLegs.Count == 1)
+            {
+                var single = requestedLegs[0];
+                return HireDriverForAtoB(
+                    leadLoco,
+                    single != null ? single.DestinationStation : null,
+                    single != null && !single.IsAutoSelectedTrack ? single.DestinationTrack : null,
+                    out statusMessage);
+            }
+
+            if (leadLoco == null || !leadLoco.IsLoco || !TrainSpawner.IsSupportedAILocomotive(leadLoco))
+            {
+                statusMessage = "No valid AI-supported lead locomotive selected!";
+                return false;
+            }
+
+            for (int i = 0; i < ActiveTasks.Count; i++)
+            {
+                if (ActiveTasks[i].LeadLocomotive == leadLoco)
+                {
+                    statusMessage = "This locomotive already has an active AI driver assigned!";
+                    return false;
+                }
+            }
+
+            List<TrainCar> consist;
+            float totalLength;
+            float totalMass;
+            GetConsistMetrics(leadLoco, out consist, out totalLength, out totalMass);
+
+            RailTrack initialOriginTrack = GetCurrentTrack(leadLoco);
+            if (initialOriginTrack == null)
+            {
+                statusMessage = "Locomotive is not sitting on a valid rail track!";
+                return false;
+            }
+
+            StationController initialOriginStation = GetNearestStation(leadLoco.transform.position);
+            var pathfinder = new Pathfinder(RailGraph.Instance);
+            var pathOptions = new PathfinderOptions
+            {
+                Requester = leadLoco,
+                RequesterTrainset = leadLoco.trainset,
+                PreferSpeedOverDistance = true,
+                AvoidOccupiedTracks = true,
+                StrictlyAvoidOccupied = true,
+                PreventPlayerOvertake = false,
+                MaxSearchDistance = 5000000f
+            };
+
+            var econ = (AITraffic.Config.IniConfigManager.Instance != null && AITraffic.Config.IniConfigManager.Instance.Economy != null)
+                ? AITraffic.Config.IniConfigManager.Instance.Economy
+                : new AITraffic.Config.EconomyConfig();
+
+            var validatedLegs = new List<ItineraryLeg>(requestedLegs.Count);
+            RailPath firstLegPath = null;
+            Junction firstSpurSwitch = null;
+            RailTrack firstSpurStem = null;
+            byte firstSpurBranch = 0;
+            double totalFee = 0.0;
+
+            RailTrack currentLegOriginTrack = initialOriginTrack;
+            StationController currentLegOriginStation = initialOriginStation;
+
+            for (int i = 0; i < requestedLegs.Count; i++)
+            {
+                var req = requestedLegs[i];
+                if (req == null || req.DestinationStation == null)
+                {
+                    statusMessage = string.Format("Leg {0} is missing a destination station!", i + 1);
+                    return false;
+                }
+
+                RailTrack legDestTrack = req.IsAutoSelectedTrack ? null : req.DestinationTrack;
+                bool isAuto = (legDestTrack == null);
+                if (isAuto)
+                {
+                    legDestTrack = SelectBestArrivalTrack(req.DestinationStation, totalLength, currentLegOriginTrack, i == 0 ? leadLoco : null);
+                }
+
+                if (legDestTrack == null)
+                {
+                    statusMessage = string.Format("Leg {0}: No suitable arrival track found at {1}!",
+                        i + 1, req.DestinationStation.stationInfo != null ? req.DestinationStation.stationInfo.Name : "destination");
+                    return false;
+                }
+
+                RailPath legPath;
+                if (i == 0)
+                {
+                    legPath = FindWorkerRouteWithSpurFallback(
+                        pathfinder, currentLegOriginTrack, legDestTrack, leadLoco, pathOptions,
+                        out firstSpurSwitch, out firstSpurStem, out firstSpurBranch);
+                    firstLegPath = legPath;
+                }
+                else
+                {
+                    legPath = pathfinder.FindPath(currentLegOriginTrack, legDestTrack, true, pathOptions)
+                              ?? pathfinder.FindPath(currentLegOriginTrack, legDestTrack, false, pathOptions);
+                }
+
+                if (legPath == null || !legPath.IsValid || legPath.Tracks == null || legPath.Tracks.Count < 2)
+                {
+                    statusMessage = string.Format("Leg {0}: Could not calculate a valid route to {1}!",
+                        i + 1, req.DestinationStation.stationInfo != null ? req.DestinationStation.stationInfo.Name : "destination");
+                    return false;
+                }
+
+                double legFee = (i == 0)
+                    ? CalculateHiringFee(legPath.TotalDistance, totalMass)
+                    : CalculateLegVariableFee(legPath.TotalDistance, totalMass);
+
+                totalFee += legFee;
+
+                validatedLegs.Add(new ItineraryLeg(
+                    i,
+                    currentLegOriginStation,
+                    currentLegOriginTrack,
+                    req.DestinationStation,
+                    legDestTrack,
+                    isAuto,
+                    legPath.TotalDistance,
+                    legFee,
+                    req.DwellSeconds > 0f ? req.DwellSeconds : 5.0f,
+                    i == 0 ? ItineraryLegStatus.EnRoute : ItineraryLegStatus.Pending));
+
+                currentLegOriginStation = req.DestinationStation;
+                currentLegOriginTrack = legDestTrack;
+            }
+
+            double playerMoney = Inventory.Instance != null ? Inventory.Instance.PlayerMoney : 0.0;
+            if (playerMoney < totalFee)
+            {
+                statusMessage = string.Format("Insufficient funds for {0}-leg itinerary! Cost: ${1:N0} (Wallet: ${2:N0})",
+                    validatedLegs.Count, totalFee, playerMoney);
+                return false;
+            }
+
+            if (Inventory.Instance != null)
+            {
+                Inventory.Instance.RemoveMoney(totalFee);
+            }
+
+            TrainSpawner.ConfigureConsistCouplers(consist);
+            for (int i = 0; i < consist.Count - 1; i++)
+            {
+                var carA = consist[i];
+                var carB = consist[i + 1];
+                if (carA != null && carB != null && carA.IsMultipleUnit && carB.IsMultipleUnit)
+                {
+                    TrainSpawner.ConnectMUCablesBetween(carA, carB);
+                }
+            }
+
+            for (int i = 0; i < consist.Count; i++)
+            {
+                var car = consist[i];
+                if (car == null) continue;
+                if (car.brakeSystem != null) car.brakeSystem.SetHandbrakePosition(0f, true);
+                BaseControlsOverrider controls = (car.SimController != null) ? car.SimController.controlsOverrider : car.GetComponent<BaseControlsOverrider>();
+                if (controls != null && controls.Handbrake != null) controls.Handbrake.Set(0f);
+                if (Main.Settings != null && Main.Settings.AIDamageImmunity) TrainSpawner.ApplyAIDamageImmunity(car, true);
+                if (car.IsLoco) TrainSpawner.RemoveLocoZoneBlockers(car);
+            }
+
+            for (int i = 0; i < consist.Count; i++)
+            {
+                var car = consist[i];
+                if (car != null && car.IsLoco)
+                {
+                    bool isLead = (car == leadLoco);
+                    TrainSpawner.InitializeLocomotive(car, isLead);
+                    if (!isLead)
+                    {
+                        var locoControls = (car.SimController != null) ? car.SimController.controlsOverrider : car.GetComponent<BaseControlsOverrider>();
+                        if (locoControls != null)
+                        {
+                            if (locoControls.BrakeCutout != null) locoControls.BrakeCutout.Set(0f);
+                            if (locoControls.IndependentBrake != null) locoControls.IndependentBrake.Set(0f);
+                            if (locoControls.Brake != null) locoControls.Brake.Set(0f);
+                            if (locoControls.Handbrake != null) locoControls.Handbrake.Set(0f);
+                        }
+                    }
+                }
+            }
+
+            var firstLeg = validatedLegs[0];
+            var engineer = leadLoco.gameObject.GetComponent<AIEngineer>() ?? leadLoco.gameObject.AddComponent<AIEngineer>();
+            engineer.IsWorkerDriven = true;
+            engineer.CurrentPath = firstLegPath;
+            engineer.DistanceToDestination = firstLegPath.TotalDistance;
+            engineer.OriginStationName = firstLeg.OriginStation != null && firstLeg.OriginStation.stationInfo != null ? firstLeg.OriginStation.stationInfo.Name : "Yard";
+            engineer.DestinationStationName = firstLeg.DestinationStation != null && firstLeg.DestinationStation.stationInfo != null ? firstLeg.DestinationStation.stationInfo.Name : "Destination";
+            engineer.DestinationTrackName = firstLeg.DestinationTrack.name;
+            engineer.IsStationDestination = false;
+            engineer.IsTerminusDestination = true;
+
+            float pullingReverser = IsPullingAlongLocoForward(leadLoco) ? 1.0f : -1.0f;
+            if (firstSpurSwitch != null && firstSpurStem != null)
+            {
+                engineer.InitiateSpurReverseEscape(firstSpurSwitch, firstSpurStem, firstSpurBranch, pullingReverser);
+            }
+            else
+            {
+                engineer.SetLockedPullingReverser(pullingReverser);
+            }
+
+            engineer.OnTerminusArrival += HandleTaskTerminusArrival;
+            TrafficManager.Instance.RegisterEngineer(engineer);
+
+            var multiTask = new AtoBHaulTask(
+                null,
+                leadLoco,
+                consist,
+                validatedLegs,
+                totalFee,
+                econ.DriverBaseFee,
+                engineer);
+
+            ActiveTasks.Add(multiTask);
+
+            ShowToast(string.Format("AI Driver Hired (${0:N0}) for {1}-leg itinerary! Leg 1 -> {2}.",
+                totalFee, validatedLegs.Count, engineer.DestinationStationName));
+
+            if (Main.ModEntry != null && Main.ModEntry.Logger != null)
+            {
+                Main.ModEntry.Logger.Log(string.Format("[WorkerManager] Dispatched Multi-Leg Worker Itinerary ({0} legs, Cars: {1}, TotalFee: ${2:N0}, TotalDist: {3:F0}m).",
+                    validatedLegs.Count, consist.Count, totalFee, multiTask.TotalRouteDistance));
+            }
+
+            statusMessage = "AI Driver successfully hired for multi-leg itinerary!";
             return true;
         }
 
@@ -933,6 +1276,25 @@ namespace AITraffic.Workers
 
             try
             {
+                // CRITICAL INVARIANT [WRK-07]: Compute pro-rated cancellation refund BEFORE destroying task.Engineer
+                double refund = CalculateCancellationRefund(task);
+                task.RefundedAmount = refund;
+                if (refund > 0.0 && Inventory.Instance != null)
+                {
+                    Inventory.Instance.AddMoney(refund);
+                }
+
+                if (task.Legs != null)
+                {
+                    for (int i = task.CurrentLegIndex; i < task.Legs.Count; i++)
+                    {
+                        if (task.Legs[i] != null && task.Legs[i].Status != ItineraryLegStatus.Completed)
+                        {
+                            task.Legs[i].Status = ItineraryLegStatus.Cancelled;
+                        }
+                    }
+                }
+
                 if (task.Engineer != null)
                 {
                     task.Engineer.OnTerminusArrival -= HandleTaskTerminusArrival;
@@ -970,12 +1332,27 @@ namespace AITraffic.Workers
 
                 task.Status = HaulTaskStatus.Cancelled;
                 task.CompletedTime = Time.time;
-                task.StatusMessage = "Cancelled by player";
+                task.StatusMessage = refund > 0.0
+                    ? string.Format("Cancelled by player (Refunded ${0:N0})", refund)
+                    : "Cancelled by player";
 
                 ActiveTasks.Remove(task);
                 CompletedTasks.Add(task);
 
-                ShowToast("AI Driver dismissed. Control returned to player.");
+                if (refund > 0.0)
+                {
+                    ShowToast(string.Format("AI Driver dismissed. Refunded ${0:N0} to wallet. Control returned to player.", refund));
+                }
+                else
+                {
+                    ShowToast("AI Driver dismissed. Control returned to player.");
+                }
+
+                if (Main.ModEntry != null && Main.ModEntry.Logger != null)
+                {
+                    Main.ModEntry.Logger.Log(string.Format("[WorkerManager] Cancelled worker task '{0}' (Paid: ${1:N0}, Refunded: ${2:N0}).",
+                        task.Id, task.HiringFee, refund));
+                }
             }
             catch (Exception ex)
             {
@@ -1069,6 +1446,48 @@ namespace AITraffic.Workers
 
             try
             {
+                if (matchedTask.CurrentLeg != null)
+                {
+                    matchedTask.CurrentLeg.Status = ItineraryLegStatus.Completed;
+                }
+
+                // CRITICAL INVARIANT [WRK-07]: Intermediate leg completion transitions to WaitingAtIntermediate without destroying AIEngineer or shutting down engine (unless DwellSeconds < 0f infinite hold)
+                if (matchedTask.HasRemainingLegs && matchedTask.Status != HaulTaskStatus.WaitingAtIntermediate)
+                {
+                    bool isInfiniteHold = matchedTask.CurrentLeg != null && matchedTask.CurrentLeg.DwellSeconds < 0f;
+                    float dwell = (matchedTask.CurrentLeg != null && matchedTask.CurrentLeg.DwellSeconds > 0f)
+                        ? matchedTask.CurrentLeg.DwellSeconds
+                        : 5.0f;
+                    matchedTask.Status = HaulTaskStatus.WaitingAtIntermediate;
+                    matchedTask.IntermediateDwellExpireTime = isInfiniteHold ? float.PositiveInfinity : (Time.time + dwell);
+
+                    string stopName = matchedTask.DestinationStation != null && matchedTask.DestinationStation.stationInfo != null
+                        ? matchedTask.DestinationStation.stationInfo.Name
+                        : "Waypoint";
+                    string locoName = matchedTask.LeadLocomotive != null ? ModCompatManager.GetCarId(matchedTask.LeadLocomotive) : "Consist";
+
+                    if (isInfiniteHold)
+                    {
+                        if (engineer != null)
+                        {
+                            engineer.ShutdownEngine();
+                        }
+                        matchedTask.StatusMessage = string.Format("Holding at {0} (Leg {1}/{2}) - Engine Off (Radio Resume)",
+                            stopName, matchedTask.CurrentLegIndex + 1, matchedTask.Legs.Count);
+                        ShowToast(string.Format("AI Worker ({0}) reached waypoint {1} (Leg {2}/{3}). Engine shut down; awaiting Comms Radio Resume.",
+                            locoName, stopName, matchedTask.CurrentLegIndex + 1, matchedTask.Legs.Count), "[AI Worker Dispatcher]", 10f);
+                    }
+                    else
+                    {
+                        matchedTask.StatusMessage = string.Format("Completed Leg {0}/{1} at {2} (dwelling {3:F0}s)",
+                            matchedTask.CurrentLegIndex + 1, matchedTask.Legs.Count, stopName, dwell);
+
+                        ShowToast(string.Format("AI Worker ({0}) reached waypoint {1} (Leg {2}/{3}). Proceeding in {4:F0}s...",
+                            locoName, stopName, matchedTask.CurrentLegIndex + 1, matchedTask.Legs.Count, dwell));
+                    }
+                    return;
+                }
+
                 if (engineer != null)
                 {
                     engineer.OnTerminusArrival -= HandleTaskTerminusArrival;
@@ -1189,6 +1608,194 @@ namespace AITraffic.Workers
             }
         }
 
+        private bool TryAdvanceToNextItineraryLeg(AtoBHaulTask task)
+        {
+            if (task == null || !task.HasRemainingLegs || task.LeadLocomotive == null || task.Engineer == null)
+                return false;
+
+            int nextIdx = task.CurrentLegIndex + 1;
+            var nextLeg = task.Legs[nextIdx];
+            if (nextLeg == null || nextLeg.DestinationStation == null)
+                return false;
+
+            List<TrainCar> consist;
+            float totalLen;
+            float totalMass;
+            GetConsistMetrics(task.LeadLocomotive, out consist, out totalLen, out totalMass);
+
+            RailTrack originTrack = GetCurrentTrack(task.LeadLocomotive) ?? nextLeg.OriginTrack;
+            if (originTrack == null) return false;
+
+            nextLeg.OriginTrack = originTrack;
+            if (nextLeg.OriginStation == null)
+            {
+                nextLeg.OriginStation = GetNearestStation(task.LeadLocomotive.transform.position);
+            }
+
+            RailTrack destTrack = nextLeg.DestinationTrack;
+            if (nextLeg.IsAutoSelectedTrack || destTrack == null || TrafficScheduler.IsTrackOccupied(destTrack))
+            {
+                destTrack = SelectBestArrivalTrack(nextLeg.DestinationStation, totalLen, originTrack, task.LeadLocomotive);
+                nextLeg.DestinationTrack = destTrack;
+            }
+
+            if (destTrack == null || destTrack == originTrack)
+                return false;
+
+            var pathfinder = new Pathfinder(RailGraph.Instance);
+            var pathOptions = new PathfinderOptions
+            {
+                Requester = task.LeadLocomotive,
+                RequesterTrainset = task.LeadLocomotive.trainset,
+                PreferSpeedOverDistance = true,
+                AvoidOccupiedTracks = true,
+                StrictlyAvoidOccupied = true,
+                PreventPlayerOvertake = false,
+                MaxSearchDistance = 5000000f
+            };
+
+            Junction spurSwitch;
+            RailTrack spurStemTrack;
+            byte spurMainlineBranch;
+            var routePath = FindWorkerRouteWithSpurFallback(
+                pathfinder, originTrack, destTrack, task.LeadLocomotive, pathOptions,
+                out spurSwitch, out spurStemTrack, out spurMainlineBranch);
+
+            if (routePath == null || !routePath.IsValid || routePath.Tracks == null || routePath.Tracks.Count < 2)
+                return false;
+
+            task.CurrentLegIndex = nextIdx;
+            nextLeg.RouteDistance = routePath.TotalDistance;
+            nextLeg.Status = ItineraryLegStatus.EnRoute;
+            task.Status = HaulTaskStatus.EnRoute;
+            task.IntermediateDwellExpireTime = 0f;
+
+            string origName = nextLeg.OriginStation != null && nextLeg.OriginStation.stationInfo != null
+                ? nextLeg.OriginStation.stationInfo.Name : "Waypoint";
+            string destName = nextLeg.DestinationStation.stationInfo != null
+                ? nextLeg.DestinationStation.stationInfo.Name : "Destination";
+            task.StatusMessage = string.Format("Leg {0}/{1}: En route to {2}",
+                nextIdx + 1, task.Legs.Count, destName);
+
+            float pullingReverser = IsPullingAlongLocoForward(task.LeadLocomotive) ? 1.0f : -1.0f;
+            task.Engineer.AssignNextItineraryLeg(
+                routePath, origName, destName, destTrack.name, pullingReverser,
+                spurSwitch, spurStemTrack, spurMainlineBranch);
+
+            ShowToast(string.Format("AI Worker departing {0} -> {1} (Leg {2}/{3}) on track '{4}'.",
+                origName, destName, nextIdx + 1, task.Legs.Count, destTrack.name));
+            return true;
+        }
+
+        /// <summary>
+        /// Returns the first active worker task that currently has a pre-evaluated 30s blocked-track alert pending.
+        /// </summary>
+        public AtoBHaulTask GetFirstAlertingTask()
+        {
+            for (int i = 0; i < ActiveTasks.Count; i++)
+            {
+                var t = ActiveTasks[i];
+                if (t != null && t.HasPendingBlockedAlert)
+                {
+                    return t;
+                }
+            }
+            return null;
+        }
+
+        public bool ResumeWorkerTask(AtoBHaulTask task)
+        {
+            if (task == null || task.LeadLocomotive == null) return false;
+            string locoId = ModCompatManager.GetCarId(task.LeadLocomotive);
+
+            if (task.Status == HaulTaskStatus.WaitingAtIntermediate)
+            {
+                if (!TryAdvanceToNextItineraryLeg(task))
+                {
+                    CancelTask(task);
+                    return false;
+                }
+                return true;
+            }
+
+            if (task.Engineer != null)
+            {
+                task.HasBroadcastBlockedAlert = false;
+                if (task.Engineer.State == EngineState.PlayerCoPilotStandby)
+                {
+                    task.Engineer.ResumeAIDriving(true);
+                }
+                else
+                {
+                    task.Engineer.Resume();
+                }
+                string destName = (task.DestinationStation != null && task.DestinationStation.stationInfo != null)
+                    ? task.DestinationStation.stationInfo.Name
+                    : "Destination";
+                task.StatusMessage = "En route to " + destName;
+                if (task.Engineer.State != EngineState.PlayerCoPilotStandby)
+                {
+                    ShowToast(string.Format("AI Worker ({0}) resuming run to {1}.", locoId, destName));
+                }
+                return true;
+            }
+            return false;
+        }
+
+        public bool RequestHoldAtNextLoop(AtoBHaulTask task)
+        {
+            if (task == null || task.Engineer == null || task.LeadLocomotive == null) return false;
+            task.Engineer.RequestHoldAtNextLoop();
+            string locoId = ModCompatManager.GetCarId(task.LeadLocomotive);
+            task.StatusMessage = "Ordered to hold at next loop";
+            ShowToast(string.Format("AI Worker ({0}) will hold inside the next passing loop on route.", locoId));
+            return true;
+        }
+
+        public bool EmergencyStopWorkerTask(AtoBHaulTask task)
+        {
+            if (task == null || task.Engineer == null || task.LeadLocomotive == null) return false;
+            task.Engineer.EmergencyStop();
+            string locoId = ModCompatManager.GetCarId(task.LeadLocomotive);
+            task.StatusMessage = "Emergency Stop (All Brakes Max)";
+            ShowToast(string.Format("AI Worker ({0}) executing Emergency Stop! Holding max brakes until resumed.", locoId));
+            return true;
+        }
+
+        public bool WaitOnBlockedTask(AtoBHaulTask task, float waitSeconds)
+        {
+            if (task == null || task.Engineer == null || task.LeadLocomotive == null) return false;
+            task.Engineer.AcknowledgeWorkerBlockedWait(waitSeconds);
+            task.HasBroadcastBlockedAlert = false;
+            string locoId = ModCompatManager.GetCarId(task.LeadLocomotive);
+            int mins = Mathf.Max(1, Mathf.RoundToInt(waitSeconds / 60f));
+            task.StatusMessage = string.Format("Holding in place ({0} min)", mins);
+            ShowToast(string.Format("AI Worker ({0}) holding position for {1} min before re-evaluating.", locoId, mins));
+            return true;
+        }
+
+        public bool RerouteBlockedTask(AtoBHaulTask task)
+        {
+            if (task == null || task.Engineer == null || task.LeadLocomotive == null) return false;
+            if (!task.Engineer.ExecutePrecalculatedWorkerBypass()) return false;
+            task.HasBroadcastBlockedAlert = false;
+            string locoId = ModCompatManager.GetCarId(task.LeadLocomotive);
+            task.StatusMessage = "Rerouting via clear bypass";
+            ShowToast(string.Format("AI Worker ({0}) rerouted via clear bypass track.", locoId));
+            return true;
+        }
+
+        public bool BackupBlockedTaskToSiding(AtoBHaulTask task)
+        {
+            if (task == null || task.Engineer == null || task.LeadLocomotive == null) return false;
+            if (!task.Engineer.ExecuteWorkerTrailingSidingBackup()) return false;
+            task.HasBroadcastBlockedAlert = false;
+            string locoId = ModCompatManager.GetCarId(task.LeadLocomotive);
+            task.StatusMessage = "Backing into trailing siding";
+            ShowToast(string.Format("AI Worker ({0}) reversing into trailing siding to clear mainline.", locoId));
+            return true;
+        }
+
         #endregion
 
         #region Update & Toast Notifications
@@ -1206,6 +1813,47 @@ namespace AITraffic.Workers
                 {
                     ActiveTasks.RemoveAt(i);
                     continue;
+                }
+
+                if (task.Status == HaulTaskStatus.WaitingAtIntermediate)
+                {
+                    if (Time.time >= task.IntermediateDwellExpireTime)
+                    {
+                        if (!TryAdvanceToNextItineraryLeg(task))
+                        {
+                            // Could not route next leg: refund remaining unperformed legs and hand back control cleanly
+                            CancelTask(task);
+                        }
+                    }
+                    continue;
+                }
+
+                // CRITICAL INVARIANT [WRK-08]: Only broadcast 30s blocked-track toast after AIEngineer finishes async option pre-calculation
+                if (task.Engineer != null)
+                {
+                    if (task.Engineer.HasPendingWorkerBlockedAlert)
+                    {
+                        if (!task.HasBroadcastBlockedAlert)
+                        {
+                            task.HasBroadcastBlockedAlert = true;
+                            string locoId = ModCompatManager.GetCarId(task.LeadLocomotive);
+                            string destName = (task.DestinationStation != null && task.DestinationStation.stationInfo != null)
+                                ? task.DestinationStation.stationInfo.Name
+                                : "Destination";
+                            string reason = !string.IsNullOrEmpty(task.Engineer.WorkerBlockedReason)
+                                ? task.Engineer.WorkerBlockedReason
+                                : "Track ahead obstructed";
+                            task.StatusMessage = "Blocked >30s: " + reason;
+                            ShowToast(
+                                string.Format("Worker {0} (-> {1}) waiting >30s: {2}. Open Comms Radio [AI WORKER] to give orders.", locoId, destName, reason),
+                                "[AI Worker Alert]",
+                                12f);
+                        }
+                    }
+                    else
+                    {
+                        task.HasBroadcastBlockedAlert = false;
+                    }
                 }
 
                 // CRITICAL INVARIANT [NEW v0.2.8]: Strict Terminus Arrival Verification

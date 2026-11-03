@@ -8,6 +8,7 @@ using AITraffic.Core;
 using AITraffic.Fleet;
 using AITraffic.Navigation;
 using AITraffic.Compat;
+using AITraffic.Driver;
 
 namespace AITraffic.Workers.Radio
 {
@@ -41,8 +42,39 @@ namespace AITraffic.Workers.Radio
 
         private static CommsRadioState BuildState(TrainCar loco, AtoBHaulTask task)
         {
+            int activeCount = (WorkerManager.Instance != null && WorkerManager.Instance.ActiveTasks != null)
+                ? WorkerManager.Instance.ActiveTasks.Count
+                : 0;
+            AtoBHaulTask alertTask = (WorkerManager.Instance != null) ? WorkerManager.Instance.GetFirstAlertingTask() : null;
+
             if (loco == null)
             {
+                if (alertTask != null && alertTask.LeadLocomotive != null)
+                {
+                    return new CommsRadioState(
+                        "AI WORKER: ALERT!",
+                        string.Format("{0} BLOCKED >30s\n{1}\n[Trigger/Scroll: Orders]",
+                            ModCompatManager.GetCarId(alertTask.LeadLocomotive),
+                            alertTask.Engineer != null ? alertTask.Engineer.WorkerBlockedReason : "Awaiting orders"),
+                        "RESOLVE ALERT",
+                        LCDArrowState.Right,
+                        LEDState.On,
+                        ButtonBehaviourType.Regular
+                    );
+                }
+
+                if (activeCount > 0)
+                {
+                    return new CommsRadioState(
+                        "AI WORKER",
+                        string.Format("Active Trains: {0}\nPoint at train to hire\nor press Trigger/Scroll\nfor Active Fleet.", activeCount),
+                        "ACTIVE TRAINS",
+                        LCDArrowState.Right,
+                        LEDState.On,
+                        ButtonBehaviourType.Regular
+                    );
+                }
+
                 return new CommsRadioState(
                     "AI WORKER",
                     "Point at train to\ninspect consist or\nhire an AI driver.",
@@ -60,11 +92,11 @@ namespace AITraffic.Workers.Radio
                     : "Destination";
 
                 return new CommsRadioState(
-                    "AI WORKER: ACTIVE",
+                    task.HasPendingBlockedAlert ? "AI WORKER: BLOCKED" : "AI WORKER: ACTIVE",
                     string.Format("{0} -> {1}\nSpeed: {2:F0} km/h\nDist Rem: {3:F1} km",
                         ModCompatManager.GetCarId(loco), destName, task.CurrentSpeedKmh, task.RemainingDistance / 1000f),
-                    "DISMISS DRIVER",
-                    LCDArrowState.Off,
+                    "MANAGE TRAIN",
+                    LCDArrowState.Right,
                     LEDState.On,
                     ButtonBehaviourType.Regular
                 );
@@ -141,19 +173,47 @@ namespace AITraffic.Workers.Radio
 
         public override AStateBehaviour OnAction(CommsRadioUtility utility, InputAction action)
         {
+            int activeCount = (WorkerManager.Instance != null && WorkerManager.Instance.ActiveTasks != null)
+                ? WorkerManager.Instance.ActiveTasks.Count
+                : 0;
+
+            if (action == InputAction.Up || action == InputAction.Down)
+            {
+                if (activeCount > 0)
+                {
+                    if (utility != null) utility.PlaySound(VanillaSoundCommsRadio.HoverOver, utility.SignalOrigin);
+                    return new WorkerRadioActiveListState(0);
+                }
+                return this;
+            }
+
             if (action == InputAction.Activate)
             {
                 if (_hoveredLoco == null)
                 {
+                    AtoBHaulTask alertTask = (WorkerManager.Instance != null) ? WorkerManager.Instance.GetFirstAlertingTask() : null;
+                    if (alertTask != null)
+                    {
+                        if (utility != null) utility.PlaySound(VanillaSoundCommsRadio.Confirm, utility.SignalOrigin);
+                        return new WorkerRadioBlockedMenuState(alertTask, 0, 0);
+                    }
+                    if (activeCount > 0)
+                    {
+                        if (utility != null) utility.PlaySound(VanillaSoundCommsRadio.Confirm, utility.SignalOrigin);
+                        return new WorkerRadioActiveListState(0);
+                    }
                     if (utility != null) utility.PlaySound(VanillaSoundCommsRadio.Warning, utility.SignalOrigin);
                     return new WorkerRadioScanState();
                 }
 
                 if (_hoveredTask != null)
                 {
-                    WorkerManager.Instance.CancelTask(_hoveredTask);
-                    if (utility != null) utility.PlaySound(VanillaSoundCommsRadio.Cancel, utility.SignalOrigin);
-                    return new WorkerRadioScanState();
+                    if (utility != null) utility.PlaySound(VanillaSoundCommsRadio.Confirm, utility.SignalOrigin);
+                    if (_hoveredTask.HasPendingBlockedAlert)
+                    {
+                        return new WorkerRadioBlockedMenuState(_hoveredTask, 0, 0);
+                    }
+                    return new WorkerRadioTrainDetailState(_hoveredTask, 0);
                 }
 
                 if (utility != null)
@@ -577,6 +637,587 @@ namespace AITraffic.Workers.Radio
                 return new WorkerRadioScanState();
             }
 
+            return this;
+        }
+    }
+
+    /// <summary>
+    /// Valley-wide carousel of all active AI Worker trains plus a [+ Scan / New Haul] return entry.
+    /// </summary>
+    public class WorkerRadioActiveListState : AStateBehaviour
+    {
+        private readonly int _selectedIndex;
+        private readonly int _totalEntries;
+        private readonly AtoBHaulTask _selectedTask;
+        private float _refreshTimer;
+
+        public WorkerRadioActiveListState(int selectedIndex)
+            : this(selectedIndex, (WorkerManager.Instance != null && WorkerManager.Instance.ActiveTasks != null)
+                ? WorkerManager.Instance.ActiveTasks
+                : new List<AtoBHaulTask>())
+        {
+        }
+
+        private WorkerRadioActiveListState(int rawIndex, List<AtoBHaulTask> tasks)
+            : this(tasks, tasks.Count + 1, ((rawIndex % (tasks.Count + 1) + (tasks.Count + 1)) % (tasks.Count + 1)))
+        {
+        }
+
+        private WorkerRadioActiveListState(List<AtoBHaulTask> tasks, int totalEntries, int normalizedIndex)
+            : base(BuildState(tasks, totalEntries, normalizedIndex))
+        {
+            _selectedIndex = normalizedIndex;
+            _totalEntries = totalEntries;
+            _selectedTask = (normalizedIndex < tasks.Count) ? tasks[normalizedIndex] : null;
+            _refreshTimer = 0.5f;
+        }
+
+        private static CommsRadioState BuildState(List<AtoBHaulTask> tasks, int totalEntries, int idx)
+        {
+            if (idx == tasks.Count || tasks.Count == 0)
+            {
+                return new CommsRadioState(
+                    string.Format("ACTIVE FLEET ({0})", tasks.Count),
+                    "[+ Scan / New Haul]\nReturn to laser scan\nto hire a new worker\nor inspect cars.",
+                    "SCAN MODE",
+                    LCDArrowState.Right,
+                    LEDState.Off,
+                    ButtonBehaviourType.Override
+                );
+            }
+
+            AtoBHaulTask selectedTask = tasks[idx];
+            string locoId = (selectedTask != null && selectedTask.LeadLocomotive != null)
+                ? ModCompatManager.GetCarId(selectedTask.LeadLocomotive)
+                : "Consist";
+            string origName = (selectedTask != null && selectedTask.OriginStation != null && selectedTask.OriginStation.stationInfo != null)
+                ? selectedTask.OriginStation.stationInfo.YardID
+                : "ORG";
+            string destName = (selectedTask != null && selectedTask.DestinationStation != null && selectedTask.DestinationStation.stationInfo != null)
+                ? selectedTask.DestinationStation.stationInfo.YardID
+                : "DST";
+            string stateTag = "RUN";
+            if (selectedTask != null)
+            {
+                if (selectedTask.HasPendingBlockedAlert) stateTag = "ALERT!";
+                else if (selectedTask.Engineer != null && selectedTask.Engineer.State == EngineState.PlayerCoPilotStandby) stateTag = "CO-PILOT";
+                else if (selectedTask.Engineer != null && selectedTask.Engineer.IsEmergencyStopped) stateTag = "E-STOP";
+                else if (selectedTask.Engineer != null && selectedTask.Engineer.IsHoldingAtLoop) stateTag = "HOLD-LOOP";
+                else if (selectedTask.IsInfiniteIntermediateHold) stateTag = "HOLD-WPT";
+                else if (selectedTask.Status == HaulTaskStatus.WaitingAtIntermediate) stateTag = "DWELL";
+                else if (selectedTask.CurrentSpeedKmh < 0.5f) stateTag = "WAIT";
+            }
+
+            float speed = selectedTask != null ? selectedTask.CurrentSpeedKmh : 0f;
+            float remKm = selectedTask != null ? (selectedTask.RemainingDistance / 1000f) : 0f;
+
+            return new CommsRadioState(
+                string.Format("TRAIN {0}/{1} [{2}]", idx + 1, tasks.Count, stateTag),
+                string.Format("{0}: {1} -> {2}\nSpd: {3:F0} km/h | Rem: {4:F1} km\n{5}",
+                    locoId, origName, destName, speed, remKm,
+                    selectedTask != null ? selectedTask.StatusMessage : ""),
+                selectedTask != null && selectedTask.HasPendingBlockedAlert ? "RESOLVE ALERT" : "INSPECT / CMD",
+                LCDArrowState.Right,
+                LEDState.On,
+                ButtonBehaviourType.Override
+            );
+        }
+
+        public override AStateBehaviour OnUpdate(CommsRadioUtility utility)
+        {
+            _refreshTimer -= Time.deltaTime;
+            if (_refreshTimer <= 0f)
+            {
+                return new WorkerRadioActiveListState(_selectedIndex);
+            }
+            return this;
+        }
+
+        public override AStateBehaviour OnAction(CommsRadioUtility utility, InputAction action)
+        {
+            if (action == InputAction.Up)
+            {
+                if (utility != null) utility.PlaySound(VanillaSoundCommsRadio.HoverOver, utility.SignalOrigin);
+                return new WorkerRadioActiveListState(_selectedIndex - 1);
+            }
+            if (action == InputAction.Down)
+            {
+                if (utility != null) utility.PlaySound(VanillaSoundCommsRadio.HoverOver, utility.SignalOrigin);
+                return new WorkerRadioActiveListState(_selectedIndex + 1);
+            }
+            if (action == InputAction.Activate)
+            {
+                if (_selectedTask == null || _selectedTask.LeadLocomotive == null)
+                {
+                    if (utility != null) utility.PlaySound(VanillaSoundCommsRadio.Cancel, utility.SignalOrigin);
+                    return new WorkerRadioScanState();
+                }
+                if (utility != null) utility.PlaySound(VanillaSoundCommsRadio.Confirm, utility.SignalOrigin);
+                if (_selectedTask.HasPendingBlockedAlert)
+                {
+                    return new WorkerRadioBlockedMenuState(_selectedTask, 0, _selectedIndex);
+                }
+                return new WorkerRadioTrainDetailState(_selectedTask, _selectedIndex);
+            }
+            return this;
+        }
+    }
+
+    /// <summary>
+    /// Live telemetry view for a selected active worker train (loco ID, car count, current track,
+    /// speed, remaining distance, governing signal aspect, and current driver state).
+    /// </summary>
+    public class WorkerRadioTrainDetailState : AStateBehaviour
+    {
+        private readonly AtoBHaulTask _task;
+        private readonly int _returnListIndex;
+        private float _refreshTimer;
+
+        public WorkerRadioTrainDetailState(AtoBHaulTask task, int returnListIndex)
+            : base(BuildState(task))
+        {
+            _task = task;
+            _returnListIndex = returnListIndex;
+            _refreshTimer = 0.5f;
+        }
+
+        private static CommsRadioState BuildState(AtoBHaulTask task)
+        {
+            if (task == null || task.LeadLocomotive == null)
+            {
+                return new CommsRadioState(
+                    "AI WORKER",
+                    "Task ended or train\nno longer active.",
+                    "BACK",
+                    LCDArrowState.Off,
+                    LEDState.Off,
+                    ButtonBehaviourType.Override
+                );
+            }
+
+            string locoId = ModCompatManager.GetCarId(task.LeadLocomotive);
+            int carCount = task.Consist != null ? task.Consist.Count : 1;
+            string destName = (task.DestinationStation != null && task.DestinationStation.stationInfo != null)
+                ? task.DestinationStation.stationInfo.YardID
+                : "DST";
+            string trackName = (task.Engineer != null && task.Engineer.CurrentTrack != null)
+                ? task.Engineer.CurrentTrack.name
+                : "Unknown";
+            if (trackName.Length > 16) trackName = trackName.Substring(0, 16);
+
+            string sigInfo = "Clear";
+            if (task.Engineer != null)
+            {
+                var sig = task.Engineer.GoverningSignal ?? task.Engineer.ApproachingSignal;
+                if (sig != null)
+                {
+                    sigInfo = SignalRegistry.GetAspectDisplayName(sig);
+                }
+            }
+
+            string stateInfo = task.Engineer != null ? task.Engineer.State.ToString() : task.Status.ToString();
+            if (task.HasPendingBlockedAlert) stateInfo = "BLOCKED >30s";
+            else if (task.Engineer != null && task.Engineer.State == EngineState.PlayerCoPilotStandby) stateInfo = "CO-PILOT STANDBY";
+            else if (task.Engineer != null && task.Engineer.IsEmergencyStopped) stateInfo = "E-STOP (MAX BRK)";
+            else if (task.Engineer != null && task.Engineer.IsHoldingAtLoop) stateInfo = "HOLD AT LOOP";
+            else if (task.IsInfiniteIntermediateHold) stateInfo = "HOLD AT WAYPOINT";
+
+            return new CommsRadioState(
+                string.Format("{0} ({1}c) -> {2}", locoId, carCount, destName),
+                string.Format("Trk: {0}\n{1:F0} km/h | {2:F1}km | Sig:{3}\nState: {4}",
+                    trackName, task.CurrentSpeedKmh, task.RemainingDistance / 1000f, sigInfo, stateInfo),
+                "COMMANDS",
+                LCDArrowState.Right,
+                LEDState.On,
+                ButtonBehaviourType.Override
+            );
+        }
+
+        public override AStateBehaviour OnUpdate(CommsRadioUtility utility)
+        {
+            if (_task == null || _task.LeadLocomotive == null || (WorkerManager.Instance != null && !WorkerManager.Instance.ActiveTasks.Contains(_task)))
+            {
+                return new WorkerRadioActiveListState(0);
+            }
+            _refreshTimer -= Time.deltaTime;
+            if (_refreshTimer <= 0f)
+            {
+                return new WorkerRadioTrainDetailState(_task, _returnListIndex);
+            }
+            return this;
+        }
+
+        public override AStateBehaviour OnAction(CommsRadioUtility utility, InputAction action)
+        {
+            if (action == InputAction.Up || action == InputAction.Down)
+            {
+                if (utility != null) utility.PlaySound(VanillaSoundCommsRadio.Cancel, utility.SignalOrigin);
+                return new WorkerRadioActiveListState(_returnListIndex);
+            }
+            if (action == InputAction.Activate)
+            {
+                if (_task == null || _task.LeadLocomotive == null)
+                {
+                    return new WorkerRadioActiveListState(0);
+                }
+                if (utility != null) utility.PlaySound(VanillaSoundCommsRadio.Confirm, utility.SignalOrigin);
+                if (_task.HasPendingBlockedAlert)
+                {
+                    return new WorkerRadioBlockedMenuState(_task, 0, _returnListIndex);
+                }
+                return new WorkerRadioInFlightCommandsState(_task, 0, _returnListIndex);
+            }
+            return this;
+        }
+    }
+
+    /// <summary>
+    /// Remote command menu for an active worker train:
+    /// Resume Run, Hold at Next Loop, Emergency Stop, Blocked Menu (if blocked), Abort & Hand Over, Back.
+    /// </summary>
+    public class WorkerRadioInFlightCommandsState : AStateBehaviour
+    {
+        private enum CommandOption
+        {
+            ResumeRun,
+            HoldAtNextLoop,
+            EmergencyStop,
+            BlockedMenu,
+            AbortAndHandOver,
+            Back
+        }
+
+        private readonly AtoBHaulTask _task;
+        private readonly int _selectedIndex;
+        private readonly int _returnListIndex;
+        private readonly List<CommandOption> _options;
+
+        public WorkerRadioInFlightCommandsState(AtoBHaulTask task, int selectedIndex, int returnListIndex)
+            : this(task, selectedIndex, returnListIndex, GetCommandOptions(task))
+        {
+        }
+
+        private WorkerRadioInFlightCommandsState(AtoBHaulTask task, int rawIndex, int returnListIndex, List<CommandOption> options)
+            : this(task, (options.Count > 0) ? ((rawIndex % options.Count + options.Count) % options.Count) : 0, returnListIndex, options, true)
+        {
+        }
+
+        private WorkerRadioInFlightCommandsState(AtoBHaulTask task, int selectedIndex, int returnListIndex, List<CommandOption> options, bool dummy)
+            : base(BuildState(task, selectedIndex, options))
+        {
+            _task = task;
+            _selectedIndex = selectedIndex;
+            _returnListIndex = returnListIndex;
+            _options = options;
+        }
+
+        private static List<CommandOption> GetCommandOptions(AtoBHaulTask task)
+        {
+            var options = new List<CommandOption>();
+            if (task == null || task.LeadLocomotive == null)
+            {
+                options.Add(CommandOption.Back);
+                return options;
+            }
+
+            bool isCoPilotStandby = task.Engineer != null && task.Engineer.State == EngineState.PlayerCoPilotStandby;
+            bool needsResume = isCoPilotStandby
+                || task.Status == HaulTaskStatus.WaitingAtIntermediate
+                || (task.Engineer != null && (task.Engineer.IsEmergencyStopped || task.Engineer.IsHoldingAtLoop || task.Engineer.HoldAtNextLoopRequested));
+
+            if (needsResume)
+            {
+                options.Add(CommandOption.ResumeRun);
+            }
+            if (task.HasPendingBlockedAlert)
+            {
+                options.Add(CommandOption.BlockedMenu);
+            }
+            options.Add(CommandOption.HoldAtNextLoop);
+            options.Add(CommandOption.EmergencyStop);
+            if (!needsResume)
+            {
+                options.Add(CommandOption.ResumeRun);
+            }
+            options.Add(CommandOption.AbortAndHandOver);
+            options.Add(CommandOption.Back);
+            return options;
+        }
+
+        private static CommsRadioState BuildState(AtoBHaulTask task, int idx, List<CommandOption> options)
+        {
+            if (task == null || task.LeadLocomotive == null || options == null || options.Count == 0)
+            {
+                return new CommsRadioState("COMMANDS", "Train no longer active.", "BACK", LCDArrowState.Off, LEDState.Off, ButtonBehaviourType.Override);
+            }
+
+            CommandOption cmd = options[idx];
+            string locoId = ModCompatManager.GetCarId(task.LeadLocomotive);
+
+            string title = string.Format("CMD: {0} ({1}/{2})", locoId, idx + 1, options.Count);
+            string body;
+            string actionLabel;
+
+            switch (cmd)
+            {
+                case CommandOption.ResumeRun:
+                    if (task.Engineer != null && task.Engineer.State == EngineState.PlayerCoPilotStandby)
+                    {
+                        body = "Resume AI Driving:\nSmoothly blend cab levers\nover 2.0s and return\ncontrol to AI Co-Pilot.";
+                        actionLabel = "RESUME AI DRIVING";
+                    }
+                    else
+                    {
+                        body = "Resume Run:\nRestart engine (if off),\nrelease brakes & proceed\nto destination.";
+                        actionLabel = "RESUME RUN";
+                    }
+                    break;
+                case CommandOption.HoldAtNextLoop:
+                    body = "Hold at Next Loop:\nPull clear into the next\npassing siding/loop on\nroute and hold.";
+                    actionLabel = "HOLD AT LOOP";
+                    break;
+                case CommandOption.EmergencyStop:
+                    body = "Emergency Stop:\nApply full brakes and\nhold ALL brakes at MAX\nuntil Resumed.";
+                    actionLabel = "E-STOP";
+                    break;
+                case CommandOption.BlockedMenu:
+                    body = "Blocked-Track Orders:\nReview pre-calculated\nbypass, siding backup,\nor wait timers.";
+                    actionLabel = "BLOCKED MENU";
+                    break;
+                case CommandOption.AbortAndHandOver:
+                    double refund = WorkerManager.Instance != null ? WorkerManager.Instance.CalculateCancellationRefund(task) : 0.0;
+                    body = string.Format("Abort & Hand Over:\nDismiss AI driver and\nreturn manual control.\nEst. Refund: ${0:F0}", refund);
+                    actionLabel = "ABORT HAUL";
+                    break;
+                default:
+                    body = "Return to train\ntelemetry overview.";
+                    actionLabel = "BACK";
+                    break;
+            }
+
+            return new CommsRadioState(title, body, actionLabel, LCDArrowState.Right, LEDState.On, ButtonBehaviourType.Override);
+        }
+
+        public override AStateBehaviour OnAction(CommsRadioUtility utility, InputAction action)
+        {
+            if (action == InputAction.Up)
+            {
+                if (utility != null) utility.PlaySound(VanillaSoundCommsRadio.HoverOver, utility.SignalOrigin);
+                return new WorkerRadioInFlightCommandsState(_task, _selectedIndex - 1, _returnListIndex);
+            }
+            if (action == InputAction.Down)
+            {
+                if (utility != null) utility.PlaySound(VanillaSoundCommsRadio.HoverOver, utility.SignalOrigin);
+                return new WorkerRadioInFlightCommandsState(_task, _selectedIndex + 1, _returnListIndex);
+            }
+            if (action == InputAction.Activate)
+            {
+                if (_task == null || _task.LeadLocomotive == null || _options == null || _options.Count == 0)
+                {
+                    return new WorkerRadioActiveListState(0);
+                }
+                CommandOption selected = _options[_selectedIndex];
+                switch (selected)
+                {
+                    case CommandOption.ResumeRun:
+                        WorkerManager.Instance.ResumeWorkerTask(_task);
+                        if (utility != null) utility.PlaySound(VanillaSoundCommsRadio.Confirm, utility.SignalOrigin);
+                        return new WorkerRadioTrainDetailState(_task, _returnListIndex);
+                    case CommandOption.HoldAtNextLoop:
+                        WorkerManager.Instance.RequestHoldAtNextLoop(_task);
+                        if (utility != null) utility.PlaySound(VanillaSoundCommsRadio.Confirm, utility.SignalOrigin);
+                        return new WorkerRadioTrainDetailState(_task, _returnListIndex);
+                    case CommandOption.EmergencyStop:
+                        WorkerManager.Instance.EmergencyStopWorkerTask(_task);
+                        if (utility != null) utility.PlaySound(VanillaSoundCommsRadio.Warning, utility.SignalOrigin);
+                        return new WorkerRadioTrainDetailState(_task, _returnListIndex);
+                    case CommandOption.BlockedMenu:
+                        if (utility != null) utility.PlaySound(VanillaSoundCommsRadio.Confirm, utility.SignalOrigin);
+                        return new WorkerRadioBlockedMenuState(_task, 0, _returnListIndex);
+                    case CommandOption.AbortAndHandOver:
+                        WorkerManager.Instance.CancelTask(_task);
+                        if (utility != null) utility.PlaySound(VanillaSoundCommsRadio.Cancel, utility.SignalOrigin);
+                        return new WorkerRadioActiveListState(0);
+                    default:
+                        if (utility != null) utility.PlaySound(VanillaSoundCommsRadio.Cancel, utility.SignalOrigin);
+                        return new WorkerRadioTrainDetailState(_task, _returnListIndex);
+                }
+            }
+            return this;
+        }
+    }
+
+    /// <summary>
+    /// Blocked-Track Escalation Menu (Goal 9):
+    /// Presents pre-calculated bypass/siding options alongside multiple "Wait for X time" timers
+    /// (Wait 1 Min, Wait 3 Min, Wait 5 Min) and Hand Over Control.
+    /// </summary>
+    public class WorkerRadioBlockedMenuState : AStateBehaviour
+    {
+        private enum BlockedAction
+        {
+            Wait1Min,
+            Wait3Min,
+            Wait5Min,
+            RerouteBypass,
+            BackupIntoSiding,
+            HandOverControl,
+            Back
+        }
+
+        private readonly AtoBHaulTask _task;
+        private readonly int _selectedIndex;
+        private readonly int _returnListIndex;
+        private readonly List<BlockedAction> _actions;
+
+        public WorkerRadioBlockedMenuState(AtoBHaulTask task, int selectedIndex, int returnListIndex)
+            : this(task, selectedIndex, returnListIndex, GetBlockedActions(task))
+        {
+        }
+
+        private WorkerRadioBlockedMenuState(AtoBHaulTask task, int rawIndex, int returnListIndex, List<BlockedAction> actions)
+            : this(task, (actions.Count > 0) ? ((rawIndex % actions.Count + actions.Count) % actions.Count) : 0, returnListIndex, actions, true)
+        {
+        }
+
+        private WorkerRadioBlockedMenuState(AtoBHaulTask task, int selectedIndex, int returnListIndex, List<BlockedAction> actions, bool dummy)
+            : base(BuildState(task, selectedIndex, actions))
+        {
+            _task = task;
+            _selectedIndex = selectedIndex;
+            _returnListIndex = returnListIndex;
+            _actions = actions;
+        }
+
+        private static List<BlockedAction> GetBlockedActions(AtoBHaulTask task)
+        {
+            var actions = new List<BlockedAction>();
+            if (task == null || task.LeadLocomotive == null || task.Engineer == null)
+            {
+                actions.Add(BlockedAction.Back);
+                return actions;
+            }
+
+            if (task.Engineer.HasPrecalculatedWorkerBypass)
+            {
+                actions.Add(BlockedAction.RerouteBypass);
+            }
+            if (task.Engineer.HasPrecalculatedWorkerTrailingSiding)
+            {
+                actions.Add(BlockedAction.BackupIntoSiding);
+            }
+            actions.Add(BlockedAction.Wait1Min);
+            actions.Add(BlockedAction.Wait3Min);
+            actions.Add(BlockedAction.Wait5Min);
+            actions.Add(BlockedAction.HandOverControl);
+            actions.Add(BlockedAction.Back);
+            return actions;
+        }
+
+        private static CommsRadioState BuildState(AtoBHaulTask task, int idx, List<BlockedAction> actions)
+        {
+            if (task == null || task.LeadLocomotive == null || task.Engineer == null || actions == null || actions.Count == 0)
+            {
+                return new CommsRadioState("BLOCKED MENU", "Train no longer active.", "BACK", LCDArrowState.Off, LEDState.Off, ButtonBehaviourType.Override);
+            }
+
+            BlockedAction act = actions[idx];
+            string locoId = ModCompatManager.GetCarId(task.LeadLocomotive);
+            string reason = !string.IsNullOrEmpty(task.Engineer.WorkerBlockedReason)
+                ? task.Engineer.WorkerBlockedReason
+                : "Track obstructed";
+
+            string title = string.Format("ALERT: {0} ({1}/{2})", locoId, idx + 1, actions.Count);
+            string body;
+            string buttonText;
+
+            switch (act)
+            {
+                case BlockedAction.RerouteBypass:
+                    body = string.Format("{0}\nOption: Reroute via\nclear {1} bypass.",
+                        reason, task.Engineer.PrecalculatedWorkerBypassIsShunting ? "shunting" : "mainline");
+                    buttonText = "REROUTE BYPASS";
+                    break;
+                case BlockedAction.BackupIntoSiding:
+                    body = string.Format("{0}\nOption: Reverse into\nclear trailing siding\nto yield right-of-way.", reason);
+                    buttonText = "BACKUP TO SIDING";
+                    break;
+                case BlockedAction.Wait1Min:
+                    body = string.Format("{0}\nOption: Hold position\nfor 1 minute (60s)\nbefore re-checking.", reason);
+                    buttonText = "WAIT 1 MIN";
+                    break;
+                case BlockedAction.Wait3Min:
+                    body = string.Format("{0}\nOption: Hold position\nfor 3 minutes (180s)\nbefore re-checking.", reason);
+                    buttonText = "WAIT 3 MIN";
+                    break;
+                case BlockedAction.Wait5Min:
+                    body = string.Format("{0}\nOption: Hold position\nfor 5 minutes (300s)\nbefore re-checking.", reason);
+                    buttonText = "WAIT 5 MIN";
+                    break;
+                case BlockedAction.HandOverControl:
+                    double refund = WorkerManager.Instance != null ? WorkerManager.Instance.CalculateCancellationRefund(task) : 0.0;
+                    body = string.Format("{0}\nOption: Dismiss driver &\ntake manual control.\nEst. Refund: ${1:F0}", reason, refund);
+                    buttonText = "HAND OVER";
+                    break;
+                default:
+                    body = "Return to train\ntelemetry screen.";
+                    buttonText = "BACK";
+                    break;
+            }
+
+            return new CommsRadioState(title, body, buttonText, LCDArrowState.Right, LEDState.On, ButtonBehaviourType.Override);
+        }
+
+        public override AStateBehaviour OnAction(CommsRadioUtility utility, InputAction action)
+        {
+            if (action == InputAction.Up)
+            {
+                if (utility != null) utility.PlaySound(VanillaSoundCommsRadio.HoverOver, utility.SignalOrigin);
+                return new WorkerRadioBlockedMenuState(_task, _selectedIndex - 1, _returnListIndex);
+            }
+            if (action == InputAction.Down)
+            {
+                if (utility != null) utility.PlaySound(VanillaSoundCommsRadio.HoverOver, utility.SignalOrigin);
+                return new WorkerRadioBlockedMenuState(_task, _selectedIndex + 1, _returnListIndex);
+            }
+            if (action == InputAction.Activate)
+            {
+                if (_task == null || _task.LeadLocomotive == null || _actions == null || _actions.Count == 0)
+                {
+                    return new WorkerRadioActiveListState(0);
+                }
+                BlockedAction act = _actions[_selectedIndex];
+                switch (act)
+                {
+                    case BlockedAction.RerouteBypass:
+                        WorkerManager.Instance.RerouteBlockedTask(_task);
+                        if (utility != null) utility.PlaySound(VanillaSoundCommsRadio.Confirm, utility.SignalOrigin);
+                        return new WorkerRadioTrainDetailState(_task, _returnListIndex);
+                    case BlockedAction.BackupIntoSiding:
+                        WorkerManager.Instance.BackupBlockedTaskToSiding(_task);
+                        if (utility != null) utility.PlaySound(VanillaSoundCommsRadio.Confirm, utility.SignalOrigin);
+                        return new WorkerRadioTrainDetailState(_task, _returnListIndex);
+                    case BlockedAction.Wait1Min:
+                        WorkerManager.Instance.WaitOnBlockedTask(_task, 60f);
+                        if (utility != null) utility.PlaySound(VanillaSoundCommsRadio.Confirm, utility.SignalOrigin);
+                        return new WorkerRadioTrainDetailState(_task, _returnListIndex);
+                    case BlockedAction.Wait3Min:
+                        WorkerManager.Instance.WaitOnBlockedTask(_task, 180f);
+                        if (utility != null) utility.PlaySound(VanillaSoundCommsRadio.Confirm, utility.SignalOrigin);
+                        return new WorkerRadioTrainDetailState(_task, _returnListIndex);
+                    case BlockedAction.Wait5Min:
+                        WorkerManager.Instance.WaitOnBlockedTask(_task, 300f);
+                        if (utility != null) utility.PlaySound(VanillaSoundCommsRadio.Confirm, utility.SignalOrigin);
+                        return new WorkerRadioTrainDetailState(_task, _returnListIndex);
+                    case BlockedAction.HandOverControl:
+                        WorkerManager.Instance.CancelTask(_task);
+                        if (utility != null) utility.PlaySound(VanillaSoundCommsRadio.Cancel, utility.SignalOrigin);
+                        return new WorkerRadioActiveListState(0);
+                    default:
+                        if (utility != null) utility.PlaySound(VanillaSoundCommsRadio.Cancel, utility.SignalOrigin);
+                        return new WorkerRadioTrainDetailState(_task, _returnListIndex);
+                }
+            }
             return this;
         }
     }

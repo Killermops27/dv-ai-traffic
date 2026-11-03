@@ -1,0 +1,35 @@
+# OpenHands Repository Guidelines: Derail Valley AI Traffic (dv_ai_traffic)
+
+## 1. Project Context & Environment
+- **Target Game:** Derail Valley (Simulator)
+- **Runtime / Framework:** Unity (.NET Framework 4.8 / .NET Standard 2.0), UnityModManager (UMM) v0.27+, HarmonyX.
+- **Current Active Development:** Phase 2: Player-Employed AI Worker System (Mainline Freight/Passenger Haulage, Multi-Leg Routing, In-Cab CoPilot, Radio Dispatching).
+- **Current Development Branch:** `dev`
+
+## 2. Mandatory Architectural Documents (Must Read First)
+Before writing or proposing any code changes, always inspect:
+1. `VISION_AND_ARCHITECTURE.md` - Core system architecture, dispatcher rules, speed enforcement, and cross-mod compat.
+2. `GRAVEYARD.md` - Catalog of fatal bugs, deadlocks, and explicitly rejected designs.
+3. `phase2_spec.md` - High-level specification and behavioral rules for Phase 2.
+4. `phase2_tech_plan.md` - Granular, phased implementation blueprint (Package 1 through 7).
+
+## 3. Strict Development Invariants & Rules
+- **Critical Invariant Integrity:** Never alter, weaken, or delete any code guarded by `// CRITICAL INVARIANT`. The exact invariant comment tags (e.g., `[AIE-01]`, `[WRK-07]`, `[FLT-12]`) are tracked and verified statically.
+- **Search Hygiene:** Always restrict code searches to `src/` and active spec markdown files. Never search inside `bin/`, `obj/`, `dist/`, or `docs/`.
+- **Minimal Diffs & Zero Refactoring:** Make surgical, targeted edits. Never reformat, reorder, or refactor unrelated code.
+- **Package-by-Package Workflow:** Work strictly according to the order defined in `phase2_tech_plan.md`. Do not attempt to implement multiple future packages at once.
+
+## 4. Static Verification & Testing
+- Derail Valley game DLLs (`UnityEngine.dll`, `Assembly-CSharp.dll`) are external to the repository and may not be present in the sandbox container.
+- **Automated Gatekeeper:** The primary validation tool in the container is `verify_invariants.py`.
+- **Command:**
+  ```bash
+  python verify_invariants.py
+  ```
+- **Rule:** This script MUST pass with 0 errors and 0 invariant violations before concluding any task or committing changes.
+
+## 5. Current Implementation Status
+- **Package 1 (Core Itinerary & Ledger Foundation):** COMPLETED (`[WRK-07]`)
+- **Package 2 (Valley-Wide Radio Spine & Dispatch):** COMPLETED (`[WRK-08]`)
+- **Package 3 (In-Cab CoPilot & Resource Throttling):** COMPLETED (`[WRK-09]`)
+- **Upcoming Milestone:** **Package 4: Mainline Flow & Outer Station Congestion Staging** (`[WRK-10]`)

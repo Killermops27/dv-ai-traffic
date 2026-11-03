@@ -62,6 +62,7 @@ namespace AITraffic.Config
         public double DriverBaseFee = 300.0;
         public double PerMeterRate = 0.06;
         public double PerTonRate = 0.35;
+        public string CoPilotResumeHotkey = "Ctrl+A";
     }
 
     /// <summary>
@@ -322,6 +323,71 @@ namespace AITraffic.Config
             Economy.DriverBaseFee = GetDouble(sec, "DriverBaseFee", Economy.DriverBaseFee);
             Economy.PerMeterRate = GetDouble(sec, "PerMeterRate", Economy.PerMeterRate);
             Economy.PerTonRate = GetDouble(sec, "PerTonRate", Economy.PerTonRate);
+            Economy.CoPilotResumeHotkey = GetString(sec, "CoPilotResumeHotkey", Economy.CoPilotResumeHotkey);
+            if (string.IsNullOrEmpty(Economy.CoPilotResumeHotkey))
+            {
+                Economy.CoPilotResumeHotkey = "Ctrl+A";
+            }
+        }
+
+        // CRITICAL INVARIANT [WRK-09]: Configurable In-Cab Co-Pilot Resume Hotkey Parser (Default: Ctrl+A)
+        public bool IsCoPilotResumeHotkeyDown()
+        {
+            string raw = (Economy != null && !string.IsNullOrEmpty(Economy.CoPilotResumeHotkey))
+                ? Economy.CoPilotResumeHotkey.Trim()
+                : "Ctrl+A";
+
+            bool reqCtrl = false;
+            bool reqAlt = false;
+            bool reqShift = false;
+            KeyCode mainKey = KeyCode.A;
+            bool parsedKey = false;
+
+            string[] parts = raw.Split(new char[] { '+' }, StringSplitOptions.RemoveEmptyEntries);
+            for (int i = 0; i < parts.Length; i++)
+            {
+                string token = parts[i].Trim();
+                if (token.Equals("Ctrl", StringComparison.OrdinalIgnoreCase) || token.Equals("Control", StringComparison.OrdinalIgnoreCase))
+                {
+                    reqCtrl = true;
+                }
+                else if (token.Equals("Alt", StringComparison.OrdinalIgnoreCase))
+                {
+                    reqAlt = true;
+                }
+                else if (token.Equals("Shift", StringComparison.OrdinalIgnoreCase))
+                {
+                    reqShift = true;
+                }
+                else
+                {
+                    try
+                    {
+                        mainKey = (KeyCode)Enum.Parse(typeof(KeyCode), token, true);
+                        parsedKey = true;
+                    }
+                    catch { }
+                }
+            }
+
+            if (!parsedKey)
+            {
+                reqCtrl = true;
+                reqAlt = false;
+                reqShift = false;
+                mainKey = KeyCode.A;
+            }
+
+            if (!Input.GetKeyDown(mainKey))
+            {
+                return false;
+            }
+
+            bool ctrlHeld = Input.GetKey(KeyCode.LeftControl) || Input.GetKey(KeyCode.RightControl);
+            bool altHeld = Input.GetKey(KeyCode.LeftAlt) || Input.GetKey(KeyCode.RightAlt);
+            bool shiftHeld = Input.GetKey(KeyCode.LeftShift) || Input.GetKey(KeyCode.RightShift);
+
+            return (ctrlHeld == reqCtrl) && (altHeld == reqAlt) && (shiftHeld == reqShift);
         }
 
         private void MapConsistsSection()
@@ -502,6 +568,8 @@ namespace AITraffic.Config
             sb.AppendLine(string.Format(CultureInfo.InvariantCulture, "PerMeterRate = {0:F4}", Economy.PerMeterRate));
             sb.AppendLine("; Mass surcharge per ton of consist weight in dollars ($0.35/ton = $35/100t, default: 0.35)");
             sb.AppendLine(string.Format(CultureInfo.InvariantCulture, "PerTonRate = {0:F4}", Economy.PerTonRate));
+            sb.AppendLine("; Hotkey to re-engage AI Co-Pilot after taking manual control in cab (default: Ctrl+A)");
+            sb.AppendLine(string.Format("CoPilotResumeHotkey = {0}", !string.IsNullOrEmpty(Economy.CoPilotResumeHotkey) ? Economy.CoPilotResumeHotkey : "Ctrl+A"));
             sb.AppendLine();
 
             // [Consists]

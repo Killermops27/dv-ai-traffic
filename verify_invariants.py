@@ -294,6 +294,27 @@ MANDATORY_INVARIANTS = [
         "expected_files": ["Navigation/SignalRegistry.cs"],
         "min_count": 1,
         "graveyard_ref": "GRAVEYARD.md Section 3 [RGR-11]"
+    },
+    {
+        "tag": "WRK-07",
+        "description": "Pre-Teardown Pro-Rated Cancellation Refund & Multi-Leg Intermediate Engine Preservation",
+        "expected_files": ["Workers/AtoBHaulTask.cs", "Workers/WorkerManager.cs", "Driver/AIEngineer.cs"],
+        "min_count": 3,
+        "graveyard_ref": "GRAVEYARD.md Section 5 [WRK-07]"
+    },
+    {
+        "tag": "WRK-08",
+        "description": "Valley-Wide Radio Dispatch, Pre-Switch Worker Hold, Async Blocked-Option Pre-Evaluation & E-Stop Max-Brake Lock",
+        "expected_files": ["Driver/AIEngineer.cs", "Workers/WorkerManager.cs"],
+        "min_count": 4,
+        "graveyard_ref": "GRAVEYARD.md Section 5 [WRK-08]"
+    },
+    {
+        "tag": "WRK-09",
+        "description": "In-Cab Co-Pilot Touch-to-Yield (PlayerCoPilotStandby), Servo Suppression, Configurable Hotkey & Physical Resource Stall Capping",
+        "expected_files": ["Driver/AIEngineer.cs", "Config/IniConfigManager.cs"],
+        "min_count": 5,
+        "graveyard_ref": "GRAVEYARD.md Section 5 [WRK-09]"
     }
 ]
 
@@ -1217,6 +1238,28 @@ def verify_v029_invariants(src_dir: Path) -> Tuple[bool, List[str]]:
     check_file("Workers/WorkerManager.cs",
                ["[WRK-06]", "MaxArrivalRouteChecks = 6", "originTrack.inJunction, originTrack.outJunction"],
                [], "WRK-06")
+
+    # WRK-07: AtoBHaulTask.cs, WorkerManager.cs, AIEngineer.cs
+    check_file("Workers/AtoBHaulTask.cs",
+               ["[WRK-07]", "public class ItineraryLeg", "WaitingAtIntermediate", "HasRemainingLegs"],
+               [], "WRK-07")
+    check_file("Workers/WorkerManager.cs",
+               ["[WRK-07]", "CalculateCancellationRefund(task)", "Inventory.Instance.AddMoney(refund)", "ShouldKeepEngineRunningOnArrival", "TryAdvanceToNextItineraryLeg"],
+               [], "WRK-07")
+    check_file("Driver/AIEngineer.cs",
+               ["[WRK-07]", "AssignNextItineraryLeg", "ShouldKeepEngineRunningOnArrival(this)"],
+               [], "WRK-07")
+
+    # WRK-09: AIEngineer.cs, IniConfigManager.cs, WorkerRadioStates.cs
+    check_file("Driver/AIEngineer.cs",
+               ["[WRK-09]", "PlayerCoPilotStandby", "ResumeAIDriving", "UpdatePlayerCoPilotHandover", "UpdateResourceConsumptionStallCapping", "Mathf.SmoothStep"],
+               [], "WRK-09")
+    check_file("Config/IniConfigManager.cs",
+               ["[WRK-09]", "CoPilotResumeHotkey", "IsCoPilotResumeHotkeyDown"],
+               [], "WRK-09")
+    check_file("Workers/Radio/WorkerRadioStates.cs",
+               ["RESUME AI DRIVING", "CO-PILOT"],
+               [], "WRK-09")
 
     # RGR-10: TrafficScheduler.cs
     target_sch = src_dir / "Core/TrafficScheduler.cs"

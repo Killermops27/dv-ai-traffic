@@ -98,8 +98,22 @@ namespace AITraffic.Workers
                         var task = activeTasks[i];
                         if (task == null || task.LeadLocomotive == null) continue;
 
-                        // Check if this station is the worker's destination or origin
-                        if (task.DestinationStation == station || task.OriginStation == station)
+                        bool matchesStation = (task.DestinationStation == station || task.OriginStation == station);
+                        if (!matchesStation && task.Legs != null)
+                        {
+                            for (int l = 0; l < task.Legs.Count; l++)
+                            {
+                                var leg = task.Legs[l];
+                                if (leg != null && (leg.DestinationStation == station || leg.OriginStation == station))
+                                {
+                                    matchesStation = true;
+                                    break;
+                                }
+                            }
+                        }
+
+                        // Check if this station is the worker's destination or origin across any itinerary leg
+                        if (matchesStation)
                         {
                             float distSq = (task.LeadLocomotive.transform.position - center).sqrMagnitude;
                             if (distSq <= wakeSqrDist)
@@ -250,9 +264,18 @@ namespace AITraffic.Workers
             for (int i = 0; i < activeTasks.Count; i++)
             {
                 var task = activeTasks[i];
-                if (task != null && task.DestinationTrack == track)
+                if (task == null) continue;
+                if (task.DestinationTrack == track) return true;
+                if (task.Legs != null)
                 {
-                    return true;
+                    for (int l = task.CurrentLegIndex; l < task.Legs.Count; l++)
+                    {
+                        var leg = task.Legs[l];
+                        if (leg != null && leg.DestinationTrack == track)
+                        {
+                            return true;
+                        }
+                    }
                 }
             }
 

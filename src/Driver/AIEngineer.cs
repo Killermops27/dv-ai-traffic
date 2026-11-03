@@ -36,7 +36,8 @@ namespace AITraffic.Driver
 		Coasting,
 		Braking,
 		StationHold,
-		TerminusStop
+		TerminusStop,
+		PlayerCoPilotStandby
 	}
 
 	// CRITICAL INVARIANT [RGR-06]: Absolute Prohibition of traversing occupied tracks in train routing
@@ -176,6 +177,27 @@ namespace AITraffic.Driver
 
 		private readonly List<Port> _amperagePorts = new List<Port>();
 
+		// CRITICAL INVARIANT [WRK-09]: Physical Resource Ports & Co-Pilot Smooth Handover State
+		private readonly List<Port> _resourcePorts = new List<Port>();
+
+		private readonly List<bool> _resourcePortIsSand = new List<bool>();
+
+		private readonly List<float> _lastResourcePortValues = new List<float>();
+
+		private const float CoPilotBlendDuration = 2.0f;
+
+		private float _copilotBlendTimer = 0f;
+
+		private float _copilotStartThrottle = 0f;
+
+		private float _copilotStartTrainBrake = 0f;
+
+		private float _copilotStartIndBrake = 0f;
+
+		private float _copilotStartDynBrake = 0f;
+
+		private float _copilotTakeoverGraceTimer = 0f;
+
 		private Port _portAmpsPerTM;
 
 		private Port _portTotalAmps;
@@ -255,6 +277,38 @@ namespace AITraffic.Driver
 		private bool _isStartingEngine;
 
 		private bool _isEmergencyStop;
+
+		private bool _holdAtNextLoopRequested;
+
+		private bool _isHoldingAtLoop;
+
+		private float _workerObstructionHoldTimer;
+
+		private float _workerBlockedAlertCooldown;
+
+		private bool _workerBlockedEvalInProgress;
+
+		private int _workerBlockedEvalStep;
+
+		private bool _hasPendingWorkerBlockedAlert;
+
+		private string _workerBlockedReason = string.Empty;
+
+		private RailPath _precalculatedWorkerBypassPath;
+
+		private bool _precalculatedWorkerBypassIsShunting;
+
+		private Signals.Game.Signal _precalculatedWorkerBypassSignal;
+
+		private Signals.Game.Signal _precalculatedWorkerBypassTargetSignal;
+
+		private bool _hasPrecalculatedWorkerTrailingSiding;
+
+		private Junction _precalculatedWorkerSidingSwitch;
+
+		private byte _precalculatedWorkerSidingBranch;
+
+		private RailTrack _precalculatedWorkerSidingTrack;
 
 		private readonly List<SignalRegistry.UpcomingSignal> _upcomingSignals = new List<SignalRegistry.UpcomingSignal>();
 
@@ -498,6 +552,70 @@ namespace AITraffic.Driver
 		public float TerminusArrivalTime { get; private set; }
 
 		public bool HasArrivedAtDestination { get; private set; }
+
+		public bool IsEmergencyStopped
+		{
+			get
+			{
+				return _isEmergencyStop;
+			}
+		}
+
+		public bool HoldAtNextLoopRequested
+		{
+			get
+			{
+				return _holdAtNextLoopRequested;
+			}
+		}
+
+		public bool IsHoldingAtLoop
+		{
+			get
+			{
+				return _isHoldingAtLoop;
+			}
+		}
+
+		public bool HasPendingWorkerBlockedAlert
+		{
+			get
+			{
+				return _hasPendingWorkerBlockedAlert;
+			}
+		}
+
+		public string WorkerBlockedReason
+		{
+			get
+			{
+				return _workerBlockedReason;
+			}
+		}
+
+		public bool HasPrecalculatedWorkerBypass
+		{
+			get
+			{
+				return _precalculatedWorkerBypassPath != null && _precalculatedWorkerBypassPath.IsValid && _precalculatedWorkerBypassPath.Tracks != null && _precalculatedWorkerBypassPath.Tracks.Count > 1;
+			}
+		}
+
+		public bool PrecalculatedWorkerBypassIsShunting
+		{
+			get
+			{
+				return _precalculatedWorkerBypassIsShunting;
+			}
+		}
+
+		public bool HasPrecalculatedWorkerTrailingSiding
+		{
+			get
+			{
+				return _hasPrecalculatedWorkerTrailingSiding && _precalculatedWorkerSidingSwitch != null && _precalculatedWorkerSidingTrack != null;
+			}
+		}
 
 		public bool IsShuntingMode
 		{
@@ -1389,6 +1507,61 @@ namespace AITraffic.Driver
 			_offRouteReverseTimer = 0f;
 		}
 
+		// CRITICAL INVARIANT [WRK-07]: Seamless multi-leg itinerary continuation without destroying AIEngineer or shutting down prime mover
+		public void AssignNextItineraryLeg(
+			RailPath nextPath,
+			string originStationName,
+			string destStationName,
+			string destTrackName,
+			float pullingReverser,
+			Junction spurSwitch = null,
+			RailTrack spurStemTrack = null,
+			byte spurMainlineBranch = 0)
+		{
+			CurrentPath = nextPath;
+			CurrentPathTrackIndex = 0;
+			DistanceToDestination = ((nextPath != null) ? nextPath.TotalDistance : 0f);
+			OriginStationName = originStationName ?? "Yard";
+			DestinationStationName = destStationName ?? "Destination";
+			DestinationTrackName = destTrackName ?? string.Empty;
+			IsStationDestination = false;
+			IsTerminusDestination = true;
+			HasArrivedAtDestination = false;
+			StationaryTimer = 0f;
+			_isWaitingOutsideStationThroat = false;
+			_stationThroatPollTimer = 0f;
+			_isEmergencyStop = false;
+			_holdAtNextLoopRequested = false;
+			_isHoldingAtLoop = false;
+			ResetWorkerBlockedAlertState(0f);
+			ClearShuntingState();
+
+			ReleaseAllConsistHandbrakes();
+			if (_controlsOverrider != null && _controlsOverrider.Handbrake != null)
+			{
+				_controlsOverrider.Handbrake.Set(0f);
+			}
+			if (_trainCar != null && _trainCar.brakeSystem != null)
+			{
+				_trainCar.brakeSystem.SetHandbrakePosition(0f, true);
+			}
+
+			if (spurSwitch != null && spurStemTrack != null)
+			{
+				InitiateSpurReverseEscape(spurSwitch, spurStemTrack, spurMainlineBranch, pullingReverser);
+			}
+			else
+			{
+				_offRouteReverseStage = OffRouteReverseStage.None;
+				_offRouteDivergingSwitch = null;
+				_offRouteRecoveryTargetTrack = null;
+				SetLockedPullingReverser(pullingReverser);
+			}
+
+			State = EngineState.Idle;
+			EnsureEngineRunning();
+		}
+
 		private void OnDestroy()
 		{
 			try
@@ -1594,12 +1767,14 @@ namespace AITraffic.Driver
 			{
 				UpdateSensors(deltaTime);
 				UpdateSingleTrackCorridorProtection(deltaTime);
+				// CRITICAL INVARIANT [WRK-09]: Touch-to-Yield In-Cab Co-Pilot Detection & Hotkey Resumption
+				UpdatePlayerCoPilotHandover(deltaTime);
 				UpdateWheelTractionAndSlideProtection(deltaTime);
 				UpdatePowertrainProtection(deltaTime);
 				UpdateLevelCrossingHorn(deltaTime);
 				UpdateSpeedProfile(deltaTime);
 				UpdateStateMachine(deltaTime);
-				if (_dm3Controller != null && _dm3Controller.IsDM3)
+				if (_dm3Controller != null && _dm3Controller.IsDM3 && State != EngineState.PlayerCoPilotStandby)
 				{
 					_dm3Controller.Update(deltaTime);
 				}
@@ -1794,8 +1969,11 @@ namespace AITraffic.Driver
 			{
 				_obstacleTrack = obstacleTrack;
 				ClassifyUpcomingObstacle(obstacleCar, ourDirectionAtObstacle, out _isObstacleComingHeadOn, out _isObstacleSameDirection);
+				// CRITICAL INVARIANT [WRK-08]: Pre-Switch Standoff Clamping for Both Ambient and Worker Trains
+				// Worker trains must also clamp DistanceToObstacle 15m prior to the last facing diverging switch
+				// before an occupied track so player-authorized Comms Radio bypass rerouting remains topologically valid.
 				float switchDistance;
-				if (!IsWorkerDriven && obstacleTrack != null && obstacleTrack != railTrack && !_isObstacleSameDirection && TryGetUpcomingDivergingSwitchDistance(railTrack, num2, obstacleTrack, out switchDistance))
+				if (obstacleTrack != null && obstacleTrack != railTrack && !_isObstacleSameDirection && TryGetUpcomingDivergingSwitchDistance(railTrack, num2, obstacleTrack, out switchDistance))
 				{
 					float b2 = Mathf.Max(7.5f, switchDistance - 15f);
 					DistanceToObstacle = Mathf.Min(distanceToObstacle, b2);
@@ -2170,12 +2348,13 @@ namespace AITraffic.Driver
 			Signals.Game.Signal signal = ((GoverningSignal != null && DistanceToGoverningSignal < 350f) ? GoverningSignal : ApproachingSignal);
 			float num6 = ((signal == GoverningSignal) ? DistanceToGoverningSignal : DistanceToSignal);
 			Signals.Game.Signal signal3;
+			bool flag5 = false;
 			if (railTrack != null && signal != null && num6 < 350f)
 			{
 				Signals.Game.Signal signal2 = ((signal.Parent != null) ? signal.Parent : signal);
 				signal3 = ((_shuntingBypassedSignal != null && _shuntingBypassedSignal.Parent != null) ? _shuntingBypassedSignal.Parent : _shuntingBypassedSignal);
 				AspectBaseDefinition aspectBaseDefinition = ((signal.CurrentAspect != null) ? signal.CurrentAspect.GetDefinition() : null);
-				bool flag5 = signal.CurrentAspect != null && (signal.CurrentAspect.DisallowPassing || (aspectBaseDefinition != null && aspectBaseDefinition.DisallowPassing));
+				flag5 = signal.CurrentAspect != null && (signal.CurrentAspect.DisallowPassing || (aspectBaseDefinition != null && aspectBaseDefinition.DisallowPassing));
 				if (!flag5 && ApproachingSignal != null && SignalRegistry.IsDistantSignal(ApproachingSignal) && ApproachingSignal.CurrentAspect != null)
 				{
 					string text3 = ApproachingSignal.CurrentAspect.Id ?? "";
@@ -2281,6 +2460,10 @@ namespace AITraffic.Driver
 						_signalWaitRetryTimer = 5f;
 					}
 				}
+			}
+			if (IsWorkerDriven)
+			{
+				UpdateWorkerLoopHoldAndBlockedEscalation(railTrack, signal, flag5, dt);
 			}
 			if (railTrack != null && CurrentSpeedKmh < 1f && CurrentPath != null && CurrentPath.Tracks != null && CurrentPath.Tracks.Count > 1)
 			{
@@ -4744,7 +4927,7 @@ namespace AITraffic.Driver
 						}
 						_corridorHoldDistance = Mathf.Min(_corridorHoldDistance, b2);
 					}
-					else if ((((flag7 || flag8) && (DistanceToObstacle < 500f || CurrentSpeedKmh < 1.5f)) || (aIEngineer != null && DistanceToObstacle < 120f)) && FindNearestTrailingSiding(out _trailingSidingSwitch, out _trailingSidingBranch, out _trailingSidingTrack))
+					else if (!IsWorkerDriven && (((flag7 || flag8) && (DistanceToObstacle < 500f || CurrentSpeedKmh < 1.5f)) || (aIEngineer != null && DistanceToObstacle < 120f)) && FindNearestTrailingSiding(out _trailingSidingSwitch, out _trailingSidingBranch, out _trailingSidingTrack))
 					{
 						if (_reverseProtocolStage == SingleTrackReverseStage.None)
 						{
@@ -5174,7 +5357,7 @@ namespace AITraffic.Driver
 					_reroutePending = true;
 					return false;
 				}
-				if (path == null || !path.IsValid || path.Tracks == null || path.Tracks.Count <= 1)
+				if (!IsWorkerDriven && (path == null || !path.IsValid || path.Tracks == null || path.Tracks.Count <= 1))
 				{
 					text2 = BuildRerouteKey("RCB", CurrentTrack, null, railTrack, !flag);
 					if (!TryGetAsyncReroute(text2, CurrentTrack, railTrack, !flag, options, out path))
@@ -5198,7 +5381,7 @@ namespace AITraffic.Driver
 			else
 			{
 				path = pathfinder.FindPath(CurrentTrack, railTrack, flag, options);
-				if (path == null || !path.IsValid || path.Tracks == null || path.Tracks.Count <= 1)
+				if (!IsWorkerDriven && (path == null || !path.IsValid || path.Tracks == null || path.Tracks.Count <= 1))
 				{
 					path = pathfinder.FindPath(CurrentTrack, railTrack, !flag, options);
 				}
@@ -5207,7 +5390,10 @@ namespace AITraffic.Driver
 			{
 				CurrentPath = path;
 				CurrentPathTrackIndex = 0;
-				_ambientLockedReverser = 0f;
+				if (!IsWorkerDriven)
+				{
+					_ambientLockedReverser = 0f;
+				}
 				_upcomingTracks.Clear();
 				for (int i = 0; i < CurrentPath.Tracks.Count; i++)
 				{
@@ -5770,7 +5956,7 @@ namespace AITraffic.Driver
 
 		private void UpdateSpeedProfile(float dt)
 		{
-			if (_isEmergencyStop || _isWaitingOutsideStationThroat)
+			if (_isEmergencyStop || _isHoldingAtLoop || _isWaitingOutsideStationThroat)
 			{
 				TargetSpeedKmh = 0f;
 				TargetSpeedMs = 0f;
@@ -5933,6 +6119,9 @@ namespace AITraffic.Driver
 			_temperaturePorts.Clear();
 			_amperagePorts.Clear();
 			_amperagePortIsTotal.Clear();
+			_resourcePorts.Clear();
+			_resourcePortIsSand.Clear();
+			_lastResourcePortValues.Clear();
 			_portAmpsPerTM = null;
 			_portTotalAmps = null;
 			_portEngineOn = null;
@@ -5999,6 +6188,21 @@ namespace AITraffic.Driver
 							_portTotalAmps = port;
 						}
 					}
+				}
+				// CRITICAL INVARIANT [WRK-09]: Collect physical FUEL, SAND, and OIL reservoir ports across consist locomotives
+				if ((port.valueType == PortValueType.FUEL || port.valueType == PortValueType.SAND || port.valueType == PortValueType.OIL)
+					&& port.id.IndexOf("CONSUMPTION", StringComparison.OrdinalIgnoreCase) < 0
+					&& port.id.IndexOf("RATE", StringComparison.OrdinalIgnoreCase) < 0
+					&& port.id.IndexOf("FLOW", StringComparison.OrdinalIgnoreCase) < 0
+					&& port.id.IndexOf("MAX", StringComparison.OrdinalIgnoreCase) < 0
+					&& port.id.IndexOf("CAP", StringComparison.OrdinalIgnoreCase) < 0
+					&& port.id.IndexOf("EMPTY", StringComparison.OrdinalIgnoreCase) < 0
+					&& port.id.IndexOf("CHANGE", StringComparison.OrdinalIgnoreCase) < 0
+					&& port.id.IndexOf("NORMALIZED", StringComparison.OrdinalIgnoreCase) < 0)
+				{
+					_resourcePorts.Add(port);
+					_resourcePortIsSand.Add(port.valueType == PortValueType.SAND || port.id.IndexOf("SAND", StringComparison.OrdinalIgnoreCase) >= 0);
+					_lastResourcePortValues.Add(port.Value);
 				}
 				if (isLead)
 				{
@@ -6169,7 +6373,7 @@ namespace AITraffic.Driver
 
 		private void UpdateSanderActuation(float dt)
 		{
-			if (_controlsOverrider == null || _controlsOverrider.Sander == null)
+			if (_controlsOverrider == null || _controlsOverrider.Sander == null || State == EngineState.PlayerCoPilotStandby)
 			{
 				return;
 			}
@@ -6345,6 +6549,15 @@ namespace AITraffic.Driver
 				_overcurrentThrottleLimit = Mathf.Clamp(_overcurrentThrottleLimit, 0.15f, 1f);
 			}
 			OvercurrentThrottleLimit = _overcurrentThrottleLimit;
+			// CRITICAL INVARIANT [WRK-09]: Enforce Physical Consumables Stall Capping & Yield Powertrain Servo Writes in Co-Pilot Standby
+			if (IsWorkerDriven)
+			{
+				UpdateResourceConsumptionStallCapping(dt);
+			}
+			if (State == EngineState.PlayerCoPilotStandby)
+			{
+				return;
+			}
 			bool flag = IsEngineRunning();
 			if ((cachedIsDE || cachedIsDE2 || cachedIsBE || _portAmpsPerTM != null || _portTotalAmps != null || _amperagePorts.Count > 0) && flag && (_commandedThrottle >= 0.1f || _rampThrottle >= 0.1f || _currentThrottle >= 0.1f) && num2 <= 0.02f)
 			{
@@ -6641,7 +6854,7 @@ namespace AITraffic.Driver
 
 		private void UpdateLevelCrossingHorn(float dt)
 		{
-			if (_controlsOverrider == null || _controlsOverrider.Horn == null)
+			if (_controlsOverrider == null || _controlsOverrider.Horn == null || State == EngineState.PlayerCoPilotStandby)
 			{
 				return;
 			}
@@ -7093,6 +7306,10 @@ namespace AITraffic.Driver
 					return;
 				}
 			}
+			if (State == EngineState.PlayerCoPilotStandby)
+			{
+				return;
+			}
 			switch (State)
 			{
 			case EngineState.Idle:
@@ -7102,10 +7319,10 @@ namespace AITraffic.Driver
 				_rampThrottle = 0f;
 				_commandedReverser = _desiredReverser;
 				float f = ((_trainCar != null) ? _trainCar.transform.forward.y : 0f);
-				bool flag6 = Mathf.Abs(f) > 0.002f;
+				bool flag6 = Mathf.Abs(f) > 0.002f || _isEmergencyStop || _isHoldingAtLoop;
 				_commandedTrainBrake = (flag6 ? 1f : 0.85f);
 				_commandedIndependentBrake = 1f;
-				if (TargetSpeedKmh > 1f && !_isEmergencyStop)
+				if (TargetSpeedKmh > 1f && !_isEmergencyStop && !_isHoldingAtLoop)
 				{
 					State = EngineState.Starting;
 				}
@@ -7558,7 +7775,15 @@ namespace AITraffic.Driver
 					float num8 = Mathf.Clamp01((0f - num - 2f) / 10f);
 					num2 = Mathf.Max(num2, 0.4f + num8 * 0.6f);
 				}
+				if (_isEmergencyStop)
+				{
+					num2 = 1f;
+				}
 				ApplyBrakeBlending(num2);
+				if (_isEmergencyStop)
+				{
+					_commandedTrainBrake = 1f;
+				}
 				if (TargetSpeedKmh <= 0.01f && CurrentSpeedKmh < 0.3f)
 				{
 					if (IsStationDestination && flag2)
@@ -7611,17 +7836,20 @@ namespace AITraffic.Driver
 					{
 						_controlsOverrider.Reverser.Set(0.5f);
 					}
-					if (_controlsOverrider.HeadlightsFront != null)
+					if (!AITraffic.Workers.WorkerManager.ShouldKeepEngineRunningOnArrival(this))
 					{
-						_controlsOverrider.HeadlightsFront.Set(0.4f);
-					}
-					if (_controlsOverrider.HeadlightsRear != null)
-					{
-						_controlsOverrider.HeadlightsRear.Set(0.4f);
-					}
-					if (_controlsOverrider.EngineOnReader != null && _controlsOverrider.EngineOnReader.IsOn && _controlsOverrider.PowerOff != null)
-					{
-						_controlsOverrider.PowerOff.Set(1f);
+						if (_controlsOverrider.HeadlightsFront != null)
+						{
+							_controlsOverrider.HeadlightsFront.Set(0.4f);
+						}
+						if (_controlsOverrider.HeadlightsRear != null)
+						{
+							_controlsOverrider.HeadlightsRear.Set(0.4f);
+						}
+						if (_controlsOverrider.EngineOnReader != null && _controlsOverrider.EngineOnReader.IsOn && _controlsOverrider.PowerOff != null)
+						{
+							_controlsOverrider.PowerOff.Set(1f);
+						}
 					}
 				}
 				break;
@@ -7717,7 +7945,11 @@ namespace AITraffic.Driver
 		{
 			State = EngineState.TerminusStop;
 			TerminusArrivalTime = Time.time;
-			ShutdownEngine();
+			// CRITICAL INVARIANT [WRK-07]: Preserve running prime mover during intermediate multi-leg dwells
+			if (!AITraffic.Workers.WorkerManager.ShouldKeepEngineRunningOnArrival(this))
+			{
+				ShutdownEngine();
+			}
 			if (_reservedTracks.Count > 0)
 			{
 				foreach (RailTrack reservedTrack in _reservedTracks)
@@ -7762,6 +7994,12 @@ namespace AITraffic.Driver
 			{
 				return;
 			}
+			// CRITICAL INVARIANT [WRK-09]: Zero Control Actuation During PlayerCoPilotStandby & Smooth 2.0s Resumption Blend
+			if (State == EngineState.PlayerCoPilotStandby)
+			{
+				SyncCurrentControlsFromCabLevers();
+				return;
+			}
 			if (!IsIntentionalReverseActive && (DistanceToObstacle < 45f || (DistanceToRedSignal < 12f && !_isSelfBlockedShunting)))
 			{
 				_commandedThrottle = 0f;
@@ -7798,6 +8036,54 @@ namespace AITraffic.Driver
 				_commandedThrottle = 0f;
 				_rampThrottle = 0f;
 				_currentThrottle = 0f;
+			}
+			if (_copilotBlendTimer > 0f)
+			{
+				_copilotBlendTimer = Mathf.Max(0f, _copilotBlendTimer - dt);
+				float blendT = Mathf.SmoothStep(0f, 1f, 1f - (_copilotBlendTimer / CoPilotBlendDuration));
+				_currentThrottle = Mathf.Lerp(_copilotStartThrottle, num, blendT);
+				_rampThrottle = _currentThrottle;
+				_currentTrainBrake = Mathf.Lerp(_copilotStartTrainBrake, _commandedTrainBrake, blendT);
+				if (_controlsOverrider.Throttle != null)
+				{
+					_controlsOverrider.Throttle.Set(_currentThrottle);
+				}
+				if (_controlsOverrider.Brake != null)
+				{
+					_controlsOverrider.Brake.Set(_currentTrainBrake);
+				}
+				if (_hasDynamicBrake && _controlsOverrider.DynamicBrake != null)
+				{
+					_currentDynamicBrake = Mathf.Lerp(_copilotStartDynBrake, _commandedDynamicBrake, blendT);
+					_controlsOverrider.DynamicBrake.Set(_currentDynamicBrake);
+				}
+				// CRITICAL INVARIANT [AIE-03]: Decoupled Hill-Start Balanced Bleed & Independent Brake Motion Invariant
+				if (CurrentSpeedKmh >= 0.2f)
+				{
+					_commandedIndependentBrake = 0.0f;
+					_currentIndependentBrake = 0f;
+				}
+				else
+				{
+					_currentIndependentBrake = Mathf.Lerp(_copilotStartIndBrake, _commandedIndependentBrake, blendT);
+				}
+				if (_controlsOverrider.IndependentBrake != null)
+				{
+					_controlsOverrider.IndependentBrake.Set(_currentIndependentBrake);
+				}
+				if (CurrentSpeedMs < 0.15f)
+				{
+					_currentReverser = _commandedReverser;
+					if (_controlsOverrider.Reverser != null)
+					{
+						_controlsOverrider.Reverser.Set(MapDirectionToReverserControl(_currentReverser));
+					}
+				}
+				if (_controlsOverrider.Handbrake != null && State != EngineState.TerminusStop && _reverseProtocolStage != SingleTrackReverseStage.SecuredInSiding)
+				{
+					_controlsOverrider.Handbrake.Set(0f);
+				}
+				return;
 			}
 			float num2 = ((IsHillStarting && num > _currentThrottle) ? Mathf.Max(ThrottleSlewRate, 0.16f) : ThrottleSlewRate);
 			_currentThrottle = Mathf.MoveTowards(_currentThrottle, num, num2 * dt);
@@ -7865,7 +8151,31 @@ namespace AITraffic.Driver
 					_controlsOverrider.Reverser.Set(MapDirectionToReverserControl(_currentReverser));
 				}
 			}
-			if (_controlsOverrider.Handbrake != null && State != EngineState.TerminusStop && _reverseProtocolStage != SingleTrackReverseStage.SecuredInSiding)
+			// CRITICAL INVARIANT [WRK-08]: E-Stop & Loop-Hold Stationary Max-Brake Lock (Respecting [AIE-03] >= 0.2 km/h Motion Invariant)
+			if ((_isEmergencyStop || _isHoldingAtLoop) && CurrentSpeedKmh < 0.2f)
+			{
+				_commandedTrainBrake = 1f;
+				_currentTrainBrake = 1f;
+				_commandedIndependentBrake = 1f;
+				_currentIndependentBrake = 1f;
+				if (_controlsOverrider.Brake != null)
+				{
+					_controlsOverrider.Brake.Set(1f);
+				}
+				if (_controlsOverrider.IndependentBrake != null)
+				{
+					_controlsOverrider.IndependentBrake.Set(1f);
+				}
+				if (_controlsOverrider.Handbrake != null)
+				{
+					_controlsOverrider.Handbrake.Set(1f);
+				}
+				if (_trainCar != null && _trainCar.brakeSystem != null)
+				{
+					_trainCar.brakeSystem.SetHandbrakePosition(1f, true);
+				}
+			}
+			else if (_controlsOverrider.Handbrake != null && State != EngineState.TerminusStop && _reverseProtocolStage != SingleTrackReverseStage.SecuredInSiding)
 			{
 				_controlsOverrider.Handbrake.Set(0f);
 			}
@@ -8122,15 +8432,22 @@ namespace AITraffic.Driver
 			HasArrivedAtDestination = false;
 		}
 
+		// CRITICAL INVARIANT [WRK-08]: EmergencyStop respects [AIE-03] while moving (>= 0.2 km/h) and clamps all 3 brakes once stopped
 		public void EmergencyStop()
 		{
 			_isEmergencyStop = true;
+			_holdAtNextLoopRequested = false;
 			TargetSpeedKmh = 0f;
 			TargetSpeedMs = 0f;
-			State = EngineState.Braking;
+			State = ((CurrentSpeedKmh < 0.2f) ? EngineState.Idle : EngineState.Braking);
 			_commandedThrottle = 0f;
+			_rampThrottle = 0f;
+			_currentThrottle = 0f;
 			_commandedTrainBrake = 1f;
-			_commandedIndependentBrake = 1f;
+			_currentTrainBrake = 1f;
+			bool isStopped = CurrentSpeedKmh < 0.2f;
+			_commandedIndependentBrake = (isStopped ? 1f : 0f);
+			_currentIndependentBrake = _commandedIndependentBrake;
 			if (_controlsOverrider != null)
 			{
 				if (_controlsOverrider.Throttle != null)
@@ -8143,8 +8460,16 @@ namespace AITraffic.Driver
 				}
 				if (_controlsOverrider.IndependentBrake != null)
 				{
-					_controlsOverrider.IndependentBrake.Set(1f);
+					_controlsOverrider.IndependentBrake.Set(_commandedIndependentBrake);
 				}
+				if (isStopped && _controlsOverrider.Handbrake != null)
+				{
+					_controlsOverrider.Handbrake.Set(1f);
+				}
+			}
+			if (isStopped && _trainCar != null && _trainCar.brakeSystem != null)
+			{
+				_trainCar.brakeSystem.SetHandbrakePosition(1f, true);
 			}
 		}
 
@@ -8153,14 +8478,619 @@ namespace AITraffic.Driver
 			EmergencyStop();
 		}
 
+		public void RequestHoldAtNextLoop()
+		{
+			_holdAtNextLoopRequested = true;
+		}
+
 		public void Resume()
 		{
+			if (State == EngineState.PlayerCoPilotStandby)
+			{
+				ResumeAIDriving(false);
+				return;
+			}
 			_isEmergencyStop = false;
+			_holdAtNextLoopRequested = false;
+			_isHoldingAtLoop = false;
 			HasArrivedAtDestination = false;
-			if (State == EngineState.TerminusStop || State == EngineState.Idle)
+			ReleaseAllConsistHandbrakes();
+			if (_controlsOverrider != null && _controlsOverrider.Handbrake != null)
+			{
+				_controlsOverrider.Handbrake.Set(0f);
+			}
+			if (_trainCar != null && _trainCar.brakeSystem != null)
+			{
+				_trainCar.brakeSystem.SetHandbrakePosition(0f, true);
+			}
+			if (State == EngineState.TerminusStop || State == EngineState.Idle || State == EngineState.Braking)
 			{
 				State = EngineState.Starting;
 			}
+			EnsureEngineRunning();
+		}
+
+		// CRITICAL INVARIANT [WRK-09]: Smooth Co-Pilot Resumption & Touch-to-Yield Handover
+		public void ResumeAIDriving(bool showToast = false)
+		{
+			SyncCurrentControlsFromCabLevers();
+			_copilotStartThrottle = _currentThrottle;
+			_copilotStartTrainBrake = _currentTrainBrake;
+			_copilotStartIndBrake = _currentIndependentBrake;
+			_copilotStartDynBrake = _currentDynamicBrake;
+			_copilotBlendTimer = CoPilotBlendDuration;
+			_copilotTakeoverGraceTimer = 0.75f;
+			_isEmergencyStop = false;
+			_holdAtNextLoopRequested = false;
+			_isHoldingAtLoop = false;
+			HasArrivedAtDestination = false;
+			if (ThrottlePID != null)
+			{
+				ThrottlePID.Reset();
+			}
+			if (BrakePID != null)
+			{
+				BrakePID.Reset();
+			}
+			ReleaseAllConsistHandbrakes();
+			if (_controlsOverrider != null && _controlsOverrider.Handbrake != null)
+			{
+				_controlsOverrider.Handbrake.Set(0f);
+			}
+			if (_trainCar != null && _trainCar.brakeSystem != null)
+			{
+				_trainCar.brakeSystem.SetHandbrakePosition(0f, true);
+			}
+			State = ((CurrentSpeedKmh > 1.0f) ? EngineState.Cruising : EngineState.Starting);
+			EnsureEngineRunning();
+			if (showToast && WorkerManager.Instance != null)
+			{
+				string dest = !string.IsNullOrEmpty(DestinationStationName) ? DestinationStationName : "Destination";
+				WorkerManager.Instance.ShowToast(
+					string.Format("AI Co-Pilot re-engaged on {0}. Smoothly resuming route to {1}.", LocoId, dest),
+					"[AI Co-Pilot Active]",
+					8f);
+			}
+		}
+
+		private void SyncCurrentControlsFromCabLevers()
+		{
+			if (_controlsOverrider == null)
+			{
+				return;
+			}
+			if (_controlsOverrider.Throttle != null)
+			{
+				_currentThrottle = _controlsOverrider.Throttle.Value;
+				_rampThrottle = _currentThrottle;
+			}
+			if (_controlsOverrider.Brake != null)
+			{
+				_currentTrainBrake = _controlsOverrider.Brake.Value;
+			}
+			if (_controlsOverrider.IndependentBrake != null)
+			{
+				_currentIndependentBrake = _controlsOverrider.IndependentBrake.Value;
+			}
+			if (_hasDynamicBrake && _controlsOverrider.DynamicBrake != null)
+			{
+				_currentDynamicBrake = _controlsOverrider.DynamicBrake.Value;
+			}
+		}
+
+		private bool IsPlayerInConsistOrCab()
+		{
+			if (_trainCar == null || PlayerManager.Car == null)
+			{
+				return false;
+			}
+			if (PlayerManager.Car == _trainCar)
+			{
+				return true;
+			}
+			return _trainCar.trainset != null && PlayerManager.Car.trainset == _trainCar.trainset;
+		}
+
+		private void UpdatePlayerCoPilotHandover(float dt)
+		{
+			if (!IsWorkerDriven || _trainCar == null || _controlsOverrider == null || State == EngineState.TerminusStop)
+			{
+				return;
+			}
+			if (_copilotTakeoverGraceTimer > 0f)
+			{
+				_copilotTakeoverGraceTimer = Mathf.Max(0f, _copilotTakeoverGraceTimer - dt);
+			}
+			if (State == EngineState.PlayerCoPilotStandby)
+			{
+				if (IsPlayerInConsistOrCab() && IniConfigManager.Instance != null && IniConfigManager.Instance.IsCoPilotResumeHotkeyDown())
+				{
+					ResumeAIDriving(true);
+				}
+				return;
+			}
+			if (_isStartingEngine || _copilotBlendTimer > 0f || _copilotTakeoverGraceTimer > 0f)
+			{
+				return;
+			}
+			if (PlayerManager.Car != _trainCar)
+			{
+				return;
+			}
+			bool playerTouchedControl = false;
+			if (_controlsOverrider.Throttle != null && Mathf.Abs(_controlsOverrider.Throttle.Value - _currentThrottle) > 0.08f)
+			{
+				playerTouchedControl = true;
+			}
+			else if (_controlsOverrider.Brake != null && Mathf.Abs(_controlsOverrider.Brake.Value - _currentTrainBrake) > 0.08f)
+			{
+				playerTouchedControl = true;
+			}
+			else if (_controlsOverrider.IndependentBrake != null && Mathf.Abs(_controlsOverrider.IndependentBrake.Value - _currentIndependentBrake) > 0.08f)
+			{
+				playerTouchedControl = true;
+			}
+			else if (_hasDynamicBrake && _controlsOverrider.DynamicBrake != null && Mathf.Abs(_controlsOverrider.DynamicBrake.Value - _currentDynamicBrake) > 0.08f)
+			{
+				playerTouchedControl = true;
+			}
+			else if (CurrentSpeedMs < 0.15f && _controlsOverrider.Reverser != null && Mathf.Abs(_controlsOverrider.Reverser.Value - MapDirectionToReverserControl(_currentReverser)) > 0.08f)
+			{
+				playerTouchedControl = true;
+			}
+
+			if (playerTouchedControl)
+			{
+				EnterPlayerCoPilotStandby();
+			}
+		}
+
+		public void EnterPlayerCoPilotStandby()
+		{
+			if (State == EngineState.PlayerCoPilotStandby || State == EngineState.TerminusStop)
+			{
+				return;
+			}
+			SyncCurrentControlsFromCabLevers();
+			_copilotBlendTimer = 0f;
+			_isEmergencyStop = false;
+			_isHoldingAtLoop = false;
+			_holdAtNextLoopRequested = false;
+			_sanderRequested = false;
+			if (_isHornPatternActive)
+			{
+				_isHornPatternActive = false;
+				if (_controlsOverrider != null && _controlsOverrider.Horn != null)
+				{
+					_controlsOverrider.Horn.Set(0f);
+				}
+			}
+			if (ThrottlePID != null)
+			{
+				ThrottlePID.Reset();
+			}
+			if (BrakePID != null)
+			{
+				BrakePID.Reset();
+			}
+			State = EngineState.PlayerCoPilotStandby;
+			if (WorkerManager.Instance != null)
+			{
+				string hotkey = (IniConfigManager.Instance != null && IniConfigManager.Instance.Economy != null && !string.IsNullOrEmpty(IniConfigManager.Instance.Economy.CoPilotResumeHotkey))
+					? IniConfigManager.Instance.Economy.CoPilotResumeHotkey
+					: "Ctrl+A";
+				WorkerManager.Instance.ShowToast(
+					string.Format("You have taken over manual control of {0}. Press [{1}] or use Comms Radio [AI WORKER] to re-engage AI driver.", LocoId, hotkey),
+					"[AI Co-Pilot Standby]",
+					10f);
+			}
+		}
+
+		// CRITICAL INVARIANT [WRK-09]: Physical Resource Consumption Stall & Slip Capping
+		private void UpdateResourceConsumptionStallCapping(float dt)
+		{
+			int count = _resourcePorts.Count;
+			if (count == 0 || _lastResourcePortValues.Count != count || _resourcePortIsSand.Count != count)
+			{
+				return;
+			}
+			if (State == EngineState.PlayerCoPilotStandby)
+			{
+				for (int i = 0; i < count; i++)
+				{
+					Port p = _resourcePorts[i];
+				if (p != null)
+				{
+					_lastResourcePortValues[i] = p.Value;
+				}
+				}
+				return;
+			}
+			bool isZeroDrainHold = State == EngineState.Idle
+				|| State == EngineState.StationHold
+				|| State == EngineState.TerminusStop
+				|| _isHoldingForCorridor
+				|| _isHoldingInMultiTrack
+				|| _isWaitingOutsideStationThroat
+				|| _isHoldingAtLoop
+				|| _isEmergencyStop
+				|| _stoppedAtRedTimer > 0.5f
+				|| _hillStagnationTimer > 5.0f
+				|| HillStage == HillLaunchStage.PermanentlyStalled;
+
+			bool isSlipOrHillCap = _isWheelSlipping
+				|| _isWheelSliding
+				|| IsHillStarting
+				|| HillStage != HillLaunchStage.None
+				|| _hillStagnationTimer > 0f;
+
+			for (int i = 0; i < count; i++)
+			{
+				Port port = _resourcePorts[i];
+				if (port == null)
+				{
+					continue;
+				}
+				float prevVal = _lastResourcePortValues[i];
+				float curVal = port.Value;
+				float consumed = prevVal - curVal;
+				if (consumed > 0f && consumed < 50f)
+				{
+					if (isZeroDrainHold)
+					{
+						curVal = prevVal;
+						port.Value = curVal;
+					}
+					else if (isSlipOrHillCap)
+					{
+						float keepFraction = _resourcePortIsSand[i] ? 0.25f : 0.20f;
+						curVal = prevVal - (consumed * keepFraction);
+						port.Value = curVal;
+					}
+				}
+				_lastResourcePortValues[i] = curVal;
+			}
+		}
+
+		public void ResetWorkerBlockedAlertState(float cooldownSeconds)
+		{
+			_workerObstructionHoldTimer = 0f;
+			_workerBlockedAlertCooldown = Mathf.Max(0f, cooldownSeconds);
+			_workerBlockedEvalInProgress = false;
+			_workerBlockedEvalStep = 0;
+			_hasPendingWorkerBlockedAlert = false;
+			_workerBlockedReason = string.Empty;
+			_precalculatedWorkerBypassPath = null;
+			_precalculatedWorkerBypassIsShunting = false;
+			_precalculatedWorkerBypassSignal = null;
+			_precalculatedWorkerBypassTargetSignal = null;
+			_hasPrecalculatedWorkerTrailingSiding = false;
+			_precalculatedWorkerSidingSwitch = null;
+			_precalculatedWorkerSidingBranch = 0;
+			_precalculatedWorkerSidingTrack = null;
+		}
+
+		public void AcknowledgeWorkerBlockedWait(float waitSeconds)
+		{
+			ResetWorkerBlockedAlertState(Mathf.Max(15f, waitSeconds));
+		}
+
+		public bool ExecutePrecalculatedWorkerBypass()
+		{
+			if (!HasPrecalculatedWorkerBypass)
+			{
+				return false;
+			}
+			RailTrack curTrack = CurrentTrack;
+			CurrentPath = _precalculatedWorkerBypassPath;
+			int idx = ((curTrack != null) ? CurrentPath.Tracks.IndexOf(curTrack) : 0);
+			CurrentPathTrackIndex = Mathf.Max(0, idx);
+			_upcomingTracks.Clear();
+			for (int i = CurrentPathTrackIndex; i < CurrentPath.Tracks.Count; i++)
+			{
+				_upcomingTracks.Add(CurrentPath.Tracks[i]);
+			}
+			if (_precalculatedWorkerBypassIsShunting)
+			{
+				_isShuntingMode = true;
+				_isSelfBlockedShunting = false;
+				_shuntingBypassedSignal = _precalculatedWorkerBypassSignal;
+				SetShuntingTarget(_precalculatedWorkerBypassTargetSignal);
+			}
+			_obstacleTrack = null;
+			DistanceToObstacle = float.PositiveInfinity;
+			_obstacleWaitTimer = 0f;
+			_stoppedAtRedTimer = 0f;
+			_hasPendingDivergingSwitchHold = false;
+			_pendingDivergingSwitchDistance = float.PositiveInfinity;
+			_isHoldingForCorridor = false;
+			_isHoldingInMultiTrack = false;
+			_corridorHoldDistance = float.PositiveInfinity;
+			_switchHoldDistance = float.PositiveInfinity;
+			ResetWorkerBlockedAlertState(30f);
+			Resume();
+			return true;
+		}
+
+		public bool ExecuteWorkerTrailingSidingBackup()
+		{
+			if (!HasPrecalculatedWorkerTrailingSiding)
+			{
+				if (!FindNearestTrailingSiding(out _precalculatedWorkerSidingSwitch, out _precalculatedWorkerSidingBranch, out _precalculatedWorkerSidingTrack))
+				{
+					return false;
+				}
+			}
+			_trailingSidingSwitch = _precalculatedWorkerSidingSwitch;
+			_trailingSidingBranch = _precalculatedWorkerSidingBranch;
+			_trailingSidingTrack = _precalculatedWorkerSidingTrack;
+			_reverseProtocolStage = SingleTrackReverseStage.HaltAndYield;
+			_reverseProtocolTimer = 0f;
+			_isHoldingForCorridor = true;
+			_corridorHoldReason = "Backing into trailing siding (Radio Order)";
+			ResetWorkerBlockedAlertState(60f);
+			_isEmergencyStop = false;
+			_holdAtNextLoopRequested = false;
+			_isHoldingAtLoop = false;
+			ReleaseAllConsistHandbrakes();
+			EnsureEngineRunning();
+			return true;
+		}
+
+		private static bool IsPassingLoopOrSidingTrack(RailTrack track)
+		{
+			if (track == null)
+			{
+				return false;
+			}
+			if (Pathfinder.IsShuntingOrStorageTrack(track))
+			{
+				return true;
+			}
+			string name = track.name ?? string.Empty;
+			return name.IndexOf("-L]", StringComparison.OrdinalIgnoreCase) >= 0
+				|| name.IndexOf("-S]", StringComparison.OrdinalIgnoreCase) >= 0
+				|| name.StartsWith("[L]", StringComparison.OrdinalIgnoreCase)
+				|| name.StartsWith("[Y]", StringComparison.OrdinalIgnoreCase);
+		}
+
+		// CRITICAL INVARIANT [WRK-08]: Async Pre-Evaluation of Blocked-Track Options Before Raising Player Alert
+		private void UpdateWorkerLoopHoldAndBlockedEscalation(RailTrack curTrack, Signals.Game.Signal signal, bool isRedSignalStop, float dt)
+		{
+			if (_holdAtNextLoopRequested && !_isHoldingAtLoop && curTrack != null)
+			{
+				TrainCar rearCar = ((_registeredConsistCars.Count > 0) ? _registeredConsistCars[_registeredConsistCars.Count - 1] : _trainCar);
+				RailTrack rearTrack = ((rearCar != null && rearCar.RearBogie != null && rearCar.RearBogie.track != null) ? rearCar.RearBogie.track : curTrack);
+				if (IsPassingLoopOrSidingTrack(curTrack) && IsPassingLoopOrSidingTrack(rearTrack))
+				{
+					_isHoldingAtLoop = true;
+					_holdAtNextLoopRequested = false;
+					TargetSpeedKmh = 0f;
+					TargetSpeedMs = 0f;
+					State = ((CurrentSpeedKmh < 0.2f) ? EngineState.Idle : EngineState.Braking);
+					if (WorkerManager.Instance != null)
+					{
+						WorkerManager.Instance.ShowToast(string.Format("Worker {0} holding inside loop '{1}'. Use Comms Radio to Resume.", LocoId, curTrack.name));
+					}
+				}
+			}
+
+			if (_isEmergencyStop || _isHoldingAtLoop || State == EngineState.TerminusStop || State == EngineState.StationHold || State == EngineState.PlayerCoPilotStandby || HasArrivedAtDestination || IsIntentionalReverseActive)
+			{
+				_workerObstructionHoldTimer = 0f;
+				_workerBlockedEvalInProgress = false;
+				return;
+			}
+
+			if (_workerBlockedAlertCooldown > 0f)
+			{
+				_workerBlockedAlertCooldown = Mathf.Max(0f, _workerBlockedAlertCooldown - dt);
+			}
+
+			bool hasObstacleHold = DistanceToObstacle < 2500f && (_obstacleTrack != null || DistanceToObstacle < 150f);
+			bool hasCorridorHold = _isHoldingForCorridor || _isHoldingInMultiTrack;
+			bool hasSwitchHold = _switchHoldDistance < 100f;
+			bool hasRedHold = isRedSignalStop || _stoppedAtRedTimer >= 5f;
+			bool hasThroatHold = _isWaitingOutsideStationThroat;
+			bool isBlockedHold = CurrentSpeedKmh < 0.5f && (hasObstacleHold || hasCorridorHold || hasSwitchHold || hasRedHold || hasThroatHold);
+
+			if (!isBlockedHold)
+			{
+				if (CurrentSpeedKmh > 2.5f)
+				{
+					ResetWorkerBlockedAlertState(0f);
+				}
+				return;
+			}
+
+			if (_hasPendingWorkerBlockedAlert || _workerBlockedAlertCooldown > 0f)
+			{
+				return;
+			}
+
+			_workerObstructionHoldTimer += dt;
+			if (_workerObstructionHoldTimer < 30f)
+			{
+				return;
+			}
+
+			if (!_workerBlockedEvalInProgress)
+			{
+				_workerBlockedEvalInProgress = true;
+				_workerBlockedEvalStep = 0;
+				_precalculatedWorkerBypassPath = null;
+				_precalculatedWorkerBypassIsShunting = false;
+				_hasPrecalculatedWorkerTrailingSiding = FindNearestTrailingSiding(out _precalculatedWorkerSidingSwitch, out _precalculatedWorkerSidingBranch, out _precalculatedWorkerSidingTrack);
+				if (hasThroatHold)
+				{
+					_workerBlockedReason = "Arrival tracks occupied";
+				}
+				else if (hasCorridorHold)
+				{
+					_workerBlockedReason = (!string.IsNullOrEmpty(_corridorHoldReason) ? _corridorHoldReason : "Single-track corridor occupied");
+				}
+				else if (hasObstacleHold)
+				{
+					_workerBlockedReason = ((_obstacleTrack != null) ? ("Track ahead occupied (" + _obstacleTrack.name + ")") : "Obstacle ahead");
+				}
+				else if (hasRedHold && signal != null)
+				{
+					_workerBlockedReason = "Red signal " + SignalRegistry.GetSignalName(signal);
+				}
+				else
+				{
+					_workerBlockedReason = "Contended switch / route blocked";
+				}
+			}
+
+			if (TryStepWorkerBlockedPrecalculation(curTrack, signal))
+			{
+				_workerBlockedEvalInProgress = false;
+				_hasPendingWorkerBlockedAlert = true;
+			}
+		}
+
+		private bool TryStepWorkerBlockedPrecalculation(RailTrack curTrack, Signals.Game.Signal signal)
+		{
+			if (curTrack == null || CurrentPath == null || CurrentPath.Tracks == null || CurrentPath.Tracks.Count <= 1 || _trainCar == null)
+			{
+				return true;
+			}
+			RailTrack destTrack = CurrentPath.Tracks[CurrentPath.Tracks.Count - 1];
+			if (destTrack == null || destTrack == curTrack)
+			{
+				return true;
+			}
+			RailTrack excludedTrack = _obstacleTrack;
+			if (excludedTrack == null || excludedTrack == curTrack)
+			{
+				int idx = Mathf.Clamp(CurrentPathTrackIndex, 0, CurrentPath.Tracks.Count - 1);
+				for (int i = idx; i < CurrentPath.Tracks.Count - 1 && i < idx + 6; i++)
+				{
+					RailTrack tA = CurrentPath.Tracks[i];
+					RailTrack tB = CurrentPath.Tracks[i + 1];
+					Junction junc;
+					byte branch;
+					if (tA != null && tB != null && SignalRegistry.TryGetJunctionBetweenTracks(tA, tB, out junc, out branch) && junc != null && junc.outBranches != null && junc.outBranches.Count > 1)
+					{
+						excludedTrack = tB;
+						break;
+					}
+				}
+			}
+			if (excludedTrack == null || excludedTrack == curTrack || excludedTrack == destTrack)
+			{
+				return true;
+			}
+			bool forward = TargetDirection >= 0f;
+			if (_trainCar.FrontBogie != null && _trainCar.RearBogie != null && _trainCar.FrontBogie.traveller != null && _trainCar.RearBogie.traveller != null && _trainCar.FrontBogie.track == _trainCar.RearBogie.track)
+			{
+				forward = _trainCar.FrontBogie.traveller.Span >= _trainCar.RearBogie.traveller.Span;
+				if (_ambientLockedReverser < 0f)
+				{
+					forward = !forward;
+				}
+			}
+
+			if (_workerBlockedEvalStep == 0)
+			{
+				PathfinderOptions opts = new PathfinderOptions
+				{
+					Requester = this,
+					RequesterTrainset = _trainCar.trainset,
+					PreferSpeedOverDistance = true,
+					AvoidOccupiedTracks = true,
+					StrictlyAvoidOccupied = true,
+					AvoidReservedTracks = true,
+					StrictlyAvoidReserved = false,
+					PreventPlayerOvertake = false,
+					MaxSearchDistance = 5000000f,
+					ExcludedTracks = new HashSet<RailTrack> { excludedTrack }
+				};
+				RailPath candidatePath;
+				string key = BuildRerouteKey("WRK_OBS", curTrack, excludedTrack, destTrack, forward);
+				if (!TryGetAsyncReroute(key, curTrack, destTrack, forward, opts, out candidatePath))
+				{
+					_reroutePending = true;
+					return false;
+				}
+				if (IsValidForwardBypassCandidate(curTrack, excludedTrack, candidatePath))
+				{
+					_precalculatedWorkerBypassPath = candidatePath;
+					_precalculatedWorkerBypassIsShunting = false;
+					return true;
+				}
+				_workerBlockedEvalStep = 1;
+			}
+
+			if (_workerBlockedEvalStep == 1)
+			{
+				PathfinderOptions shuntingOpts = new PathfinderOptions
+				{
+					Requester = this,
+					RequesterTrainset = _trainCar.trainset,
+					PreferSpeedOverDistance = true,
+					AvoidOccupiedTracks = true,
+					StrictlyAvoidOccupied = true,
+					AvoidReservedTracks = true,
+					StrictlyAvoidReserved = false,
+					PreventPlayerOvertake = false,
+					AllowShuntingDetour = true,
+					MaxSearchDistance = 5000000f,
+					ExcludedTracks = new HashSet<RailTrack> { excludedTrack }
+				};
+				RailPath shuntingPath;
+				string shuntingKey = BuildRerouteKey("WRK_SHU", curTrack, excludedTrack, destTrack, forward);
+				if (!TryGetAsyncReroute(shuntingKey, curTrack, destTrack, forward, shuntingOpts, out shuntingPath))
+				{
+					_reroutePending = true;
+					return false;
+				}
+				if (IsValidForwardBypassCandidate(curTrack, excludedTrack, shuntingPath))
+				{
+					_precalculatedWorkerBypassPath = shuntingPath;
+					_precalculatedWorkerBypassIsShunting = true;
+					_precalculatedWorkerBypassSignal = signal ?? ApproachingSignal;
+					_precalculatedWorkerBypassTargetSignal = ((_precalculatedWorkerBypassSignal != null) ? FindNextGoverningMainSignal(_precalculatedWorkerBypassSignal) : null);
+				}
+				_workerBlockedEvalStep = 2;
+			}
+
+			return true;
+		}
+
+		private bool IsValidForwardBypassCandidate(RailTrack curTrack, RailTrack excludedTrack, RailPath path)
+		{
+			if (path == null || !path.IsValid || path.Tracks == null || path.Tracks.Count < 2 || path.Tracks.Contains(excludedTrack))
+			{
+				return false;
+			}
+			for (int i = 0; i < path.Tracks.Count - 1; i++)
+			{
+				RailTrack tA = path.Tracks[i];
+				RailTrack tB = path.Tracks[i + 1];
+				if (tA == null || tB == null || RailGraph.Instance == null)
+				{
+					continue;
+				}
+				RailEdge eA = RailGraph.Instance.GetEdge(tA);
+				RailEdge eB = RailGraph.Instance.GetEdge(tB);
+				if (eA == null || eB == null)
+				{
+					continue;
+				}
+				RailNode node = RailGraph.Instance.GetConnectingNode(eA, eB);
+				if (node != null)
+				{
+					Vector3 inVec = RailGraph.GetIncomingVector(node, eA);
+					Vector3 outVec = RailGraph.GetDepartingVector(node, eB);
+					if (Vector3.Dot(inVec, outVec) < -0.3f)
+					{
+						return false;
+					}
+				}
+			}
+			return true;
 		}
 
 		public static bool TryGetJunctionBetweenTracks(RailTrack trackA, RailTrack trackB, out Junction junction, out byte requiredBranch)
