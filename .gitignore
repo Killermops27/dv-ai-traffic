@@ -47,3 +47,9 @@ docs/issues/
 docs/artifacts/
 media/debug*
 
+# Agent Handoff: Step 0 recovery reference (temporary, deleted in Step 5)
+P4_RESTORE_IL_REFERENCE.md
+
+# Phase 2 design documents are local-only (never versioned)
+phase2_*.md
+
