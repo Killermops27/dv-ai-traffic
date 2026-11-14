@@ -4,12 +4,17 @@
 #>
 param(
     [string]$Configuration = "Debug",
-    [switch]$NoBuild = $false
+    [switch]$NoBuild = $false,
+    [string]$RoslynVersion = "4.14.0",
+    [string]$CscToolPath = $null,
+    [switch]$NoRoslynDownload = $false
 )
 
 $ErrorActionPreference = "Stop"
 $scriptDir = $PSScriptRoot
 if (-not $scriptDir) { $scriptDir = (Get-Location).Path }
+
+. (Join-Path $scriptDir "Resolve-RoslynToolset.ps1")
 
 # 0. Pre-Build Static Gatekeeper: Verify Architecture Invariants & Anti-Patterns
 $verifierScript = Join-Path $scriptDir "verify_invariants.py"
@@ -41,43 +46,23 @@ if (-not (Test-Path $destDir)) {
     New-Item -ItemType Directory -Path $destDir -Force | Out-Null
 }
 
-if (-not $NoBuild) {
-    Write-Host "[Deploy] Building AITraffic in $Configuration configuration..." -ForegroundColor Yellow
-    
-    # Locate best MSBuild (VS2022 > VS Build Tools > .NET Framework)
-    $msbuildPath = $null
-    $vswhere = "C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe"
-    if (Test-Path $vswhere) {
-        $found = & $vswhere -latest -requires Microsoft.Component.MSBuild -find "MSBuild\**\Bin\MSBuild.exe" | Select-Object -First 1
-        if ($found -and (Test-Path $found)) {
-            $msbuildPath = $found
-        }
-    }
-    if (-not $msbuildPath) {
-        $vs2022Candidate = "C:\Program Files\Microsoft Visual Studio\2022\Community\MSBuild\Current\Bin\MSBuild.exe"
-        if (Test-Path $vs2022Candidate) {
-            $msbuildPath = $vs2022Candidate
-        }
-    }
-    if (-not $msbuildPath) {
-        $msbuildPath = "C:\Windows\Microsoft.NET\Framework64\v4.0.30319\MSBuild.exe"
-    }
-    if (-not (Test-Path $msbuildPath)) {
-        $msbuildPath = "C:\Windows\Microsoft.NET\Framework\v4.0.30319\MSBuild.exe"
-    }
-
-    Write-Host "[Deploy] Using MSBuild: $msbuildPath" -ForegroundColor Cyan
-    $csprojPath = Join-Path $scriptDir "AITraffic.csproj"
-    & $msbuildPath "$csprojPath" /p:Configuration=$Configuration /p:DVInstallPath="$dvBase" /t:Rebuild /verbosity:minimal /nologo
-
-    if ($LASTEXITCODE -ne 0) {
-        Write-Error "Build failed with exit code $LASTEXITCODE"
-    }
-}
-
 $binDir = Join-Path $scriptDir "bin\$Configuration"
 $dllPath = Join-Path $binDir "AITraffic.dll"
 $pdbPath = Join-Path $binDir "AITraffic.pdb"
+
+if (-not $NoBuild) {
+    Write-Host "[Deploy] Building AITraffic in $Configuration configuration..." -ForegroundColor Yellow
+    $csprojPath = Join-Path $scriptDir "AITraffic.csproj"
+    Invoke-AITrafficBuild `
+        -ScriptDir $scriptDir `
+        -ProjectPath $csprojPath `
+        -Configuration $Configuration `
+        -DVInstallPath $dvBase `
+        -ExpectedDllPath $dllPath `
+        -RoslynVersion $RoslynVersion `
+        -CscToolPath $CscToolPath `
+        -NoRoslynDownload:$NoRoslynDownload
+}
 
 if (-not (Test-Path $dllPath)) {
     Write-Error "Compiled assembly not found at $dllPath"

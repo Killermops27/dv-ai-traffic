@@ -5,18 +5,34 @@
 .PARAMETER NoBuild
     Skip the MSBuild step and package from existing bin/Release artifacts.
 
+.PARAMETER RoslynVersion
+    Roslyn compiler toolset version auto-provisioned from NuGet when the detected MSBuild
+    cannot compile C# 6+ on its own (the in-box .NET Framework MSBuild only ships a C# 5 csc).
+
+.PARAMETER CscToolPath
+    Explicit path to a Roslyn toolset folder containing csc.exe. Overrides auto-detection.
+
+.PARAMETER NoRoslynDownload
+    Fail instead of downloading the Roslyn toolset from NuGet when no C# 6+ compiler is found.
+
 .EXAMPLE
     .\package_release.ps1
     .\package_release.ps1 -NoBuild
+    .\package_release.ps1 -NoRoslynDownload
 #>
 
 param(
-    [switch]$NoBuild = $false
+    [switch]$NoBuild = $false,
+    [string]$RoslynVersion = "4.14.0",
+    [string]$CscToolPath = $null,
+    [switch]$NoRoslynDownload = $false
 )
 
 $ErrorActionPreference = "Stop"
 $scriptDir = $PSScriptRoot
 if (-not $scriptDir) { $scriptDir = (Get-Location).Path }
+
+. (Join-Path $scriptDir "Resolve-RoslynToolset.ps1")
 
 $infoJsonPath = Join-Path $scriptDir "Info.json"
 if (-not (Test-Path $infoJsonPath)) {
@@ -52,40 +68,17 @@ if (-not (Test-Path $dvBase)) {
 # 1. Build project in Release mode (unless -NoBuild is specified)
 if (-not $NoBuild) {
     Write-Host "[1/3] Building $modId in Release configuration..." -ForegroundColor Yellow
-    
-    # Locate best MSBuild (VS2022 > VS Build Tools > .NET Framework)
-    $msbuildPath = $null
-    $vswhere = "C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe"
-    if (Test-Path $vswhere) {
-        $found = & $vswhere -latest -requires Microsoft.Component.MSBuild -find "MSBuild\**\Bin\MSBuild.exe" | Select-Object -First 1
-        if ($found -and (Test-Path $found)) {
-            $msbuildPath = $found
-        }
-    }
-    if (-not $msbuildPath) {
-        $vs2022Candidate = "C:\Program Files\Microsoft Visual Studio\2022\Community\MSBuild\Current\Bin\MSBuild.exe"
-        if (Test-Path $vs2022Candidate) {
-            $msbuildPath = $vs2022Candidate
-        }
-    }
-    if (-not $msbuildPath) {
-        $msbuildPath = "C:\Windows\Microsoft.NET\Framework64\v4.0.30319\MSBuild.exe"
-    }
-    if (-not (Test-Path $msbuildPath)) {
-        $msbuildPath = "C:\Windows\Microsoft.NET\Framework\v4.0.30319\MSBuild.exe"
-    }
-
-    if (-not (Test-Path $msbuildPath)) {
-        Write-Error "Could not locate MSBuild.exe on this system."
-    }
-
-    Write-Host "[Build] Using MSBuild: $msbuildPath" -ForegroundColor Cyan
     $csprojPath = Join-Path $scriptDir "$modId.csproj"
-    & $msbuildPath "$csprojPath" /p:Configuration=Release /p:DVInstallPath="$dvBase" /t:Rebuild /verbosity:minimal /nologo
-
-    if ($LASTEXITCODE -ne 0) {
-        Write-Error "Build failed with exit code $LASTEXITCODE"
-    }
+    $builtDllPath = Join-Path $scriptDir "bin\Release\$modId.dll"
+    Invoke-AITrafficBuild `
+        -ScriptDir $scriptDir `
+        -ProjectPath $csprojPath `
+        -Configuration "Release" `
+        -DVInstallPath $dvBase `
+        -ExpectedDllPath $builtDllPath `
+        -RoslynVersion $RoslynVersion `
+        -CscToolPath $CscToolPath `
+        -NoRoslynDownload:$NoRoslynDownload
     Write-Host "Build completed successfully." -ForegroundColor Green
 } else {
     Write-Host "[1/3] Skipping build step (-NoBuild specified)..." -ForegroundColor DarkGray
