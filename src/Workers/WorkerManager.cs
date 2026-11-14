@@ -864,6 +864,9 @@ namespace AITraffic.Workers
             {
                 engineer.SetLockedPullingReverser(pullingReverser);
             }
+            // CRITICAL INVARIANT [AIE-23]: arm the 3.0 s takeover grace window and the physical-lever baseline in the
+            // SAME frame as the attach, i.e. before the engineer's first UpdatePlayerCoPilotHandover tick.
+            engineer.BeginWorkerCoPilotSession();
 
             // Re-evaluate lead locomotive lighting immediately after pullingReverser is locked on the engineer
             var leadLighting = AILocomotiveLighting.GetOrCreate(leadLoco, engineer);
@@ -1137,6 +1140,9 @@ namespace AITraffic.Workers
             {
                 engineer.SetLockedPullingReverser(pullingReverser);
             }
+            // CRITICAL INVARIANT [AIE-23]: multi-leg re-attach must re-arm exactly like a fresh hire — this is the
+            // path that fired the false takeover after a station dwell, because ResumeAIDriving was the only armer.
+            engineer.BeginWorkerCoPilotSession();
 
             engineer.OnTerminusArrival += HandleTaskTerminusArrival;
             TrafficManager.Instance.RegisterEngineer(engineer);

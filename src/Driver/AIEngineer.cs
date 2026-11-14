@@ -1800,6 +1800,14 @@ namespace AITraffic.Driver
 			{
 				return;
 			}
+			// CRITICAL INVARIANT [AIE-23]: the takeover grace window is decayed HERE — the only always-run site that
+			// both the reverse-protocol fast path (returns at 1832) and the normal path pass through. It must never be
+			// decayed inside UpdatePlayerCoPilotHandover (frozen for the whole manoeuvre) nor in two places at once
+			// (halves the window). Exactly one decay exists in the whole file after this edit.
+			if (_copilotTakeoverGraceTimer > 0f)
+			{
+				_copilotTakeoverGraceTimer = Mathf.Max(0f, _copilotTakeoverGraceTimer - deltaTime);
+			}
 			if (CurrentSpeedKmh < 0.2f && State != EngineState.TerminusStop && State != EngineState.StationHold)
 			{
 				StationaryTimer += deltaTime;
@@ -1843,7 +1851,10 @@ namespace AITraffic.Driver
 				UpdateLevelCrossingHorn(deltaTime);
 				UpdateSpeedProfile(deltaTime);
 				UpdateStateMachine(deltaTime);
-				if (_dm3Controller != null && _dm3Controller.IsDM3 && State != EngineState.PlayerCoPilotStandby)
+				// CRITICAL INVARIANT [AIE-22]: never tick the DM3 transmission on a parked or terminal train. The
+				// controller upshifts from gear 1 at 0 km/h (UpshiftKmh == 0.0f) and re-shifts forever against a
+				// zero commanded throttle — the mechanical half of the Issue 3 loop.
+				if (_dm3Controller != null && _dm3Controller.IsDM3 && State != EngineState.PlayerCoPilotStandby && State != EngineState.TerminusStop && !_parkedStateLatched)
 				{
 					_dm3Controller.Update(deltaTime);
 				}
@@ -7577,6 +7588,11 @@ namespace AITraffic.Driver
 						{
 							_hillGroundWindowStartPos = _trainCar.transform.position;
 						}
+						// CRITICAL INVARIANT [AIE-21]: a brand-new launch starts with zero run-up history and zero
+						// progress credit; the latch is armed from the position the locomotive is standing on.
+						_momentumRunUpAttempts = 0;
+						_stageEntryPosition = ((_trainCar != null) ? _trainCar.transform.position : Vector3.zero);
+						_hasMadeProgressSinceStageEntry = false;
 					}
 				}
 				else
@@ -7585,6 +7601,8 @@ namespace AITraffic.Driver
 					_hillStagnationTimer = 0f;
 					_stage2ContinuousSandingTimer = 0f;
 					_hillGroundProgressWindowTimer = 0f;
+					_momentumRunUpAttempts = 0;
+					_hasMadeProgressSinceStageEntry = false;
 				}
 				State = EngineState.Accelerating;
 				break;
@@ -7607,6 +7625,11 @@ namespace AITraffic.Driver
 				bool flag11 = num11 < -0.003f;
 				bool flag12 = flag10 && CurrentSpeedKmh < 5f;
 				bool flag13 = ConsistCarCount <= 1;
+				// CRITICAL INVARIANT [AIE-21]: while the DM3 transmission is shifting (or re-engaging inside its 3.5 s
+				// re-engage cooldown) the locomotive physically CANNOT pull. That interval is expected downtime, not
+				// stagnation: it freezes the stagnation/ladder evidence and suppresses the brake slam below, otherwise
+				// a healthy L-020 launch is scored as a permanent stall.
+				bool dm3GearboxBusy = _dm3Controller != null && _dm3Controller.IsDM3 && (_dm3Controller.IsShifting || _dm3Controller.IsInNeutral);
 				IsHillStarting = flag12 && num13 < 0.2f;
 				if (flag12)
 				{
@@ -7620,6 +7643,11 @@ namespace AITraffic.Driver
 						{
 							_hillGroundWindowStartPos = _trainCar.transform.position;
 						}
+						// CRITICAL INVARIANT [AIE-21]: a brand-new launch starts with zero run-up history and zero
+						// progress credit; the latch is armed from the position the locomotive is standing on.
+						_momentumRunUpAttempts = 0;
+						_stageEntryPosition = ((_trainCar != null) ? _trainCar.transform.position : Vector3.zero);
+						_hasMadeProgressSinceStageEntry = false;
 					}
 					if (HillStage == HillLaunchStage.RollbackDescent)
 					{
@@ -7668,6 +7696,12 @@ namespace AITraffic.Driver
 								_commandedReverser = num10;
 								_hasAttemptedMomentumRunUp = true;
 								_hillStagnationTimer = 0f;
+								// CRITICAL INVARIANT [AIE-22]: count only real run-up attempts and re-arm the progress
+								// latch from the launch position. This is the ONLY increment site of
+								// _momentumRunUpAttempts in the whole file.
+								_momentumRunUpAttempts++;
+								_stageEntryPosition = ((_trainCar != null) ? _trainCar.transform.position : Vector3.zero);
+								_hasMadeProgressSinceStageEntry = false;
 								HillStage = HillLaunchStage.MomentumRunUp;
 							}
 						}
@@ -7676,20 +7710,22 @@ namespace AITraffic.Driver
 					{
 						if (HillStage == HillLaunchStage.PermanentlyStalled)
 						{
-							_commandedThrottle = 0f;
-							_rampThrottle = 0f;
-							_currentThrottle = 0f;
-							_commandedTrainBrake = 1f;
-							_currentTrainBrake = 1f;
-							_commandedIndependentBrake = 1f;
-							_currentIndependentBrake = 1f;
-							if (_controlsOverrider != null && _controlsOverrider.Handbrake != null)
+							// CRITICAL INVARIANT [AIE-22]: terminal and ONE-SHOT. The old body re-clamped and re-toasted
+							// on every frame that still satisfied flag12, faked a terminus arrival (which COMPLETED the
+							// job through HandleTaskTerminusArrival) and never released reservations. Now the train is
+							// secured once through the non-arrival terminus path and the stall is logged once.
+							if (!_parkedStateLatched)
 							{
-								_controlsOverrider.Handbrake.Set(1f);
+								IsPermanentlyStalled = true;
+								// §7.3 of the scout report: the ladder and NotifyPermanentStall never wrote to the
+								// logger, which is why Issue 2 could not be diagnosed. This is the missing breadcrumb.
+								if (Main.ModEntry != null)
+								{
+									Main.ModEntry.Logger.Warning(string.Format("[AITraffic] '{0}' PERMANENTLY STALLED: stage {1}, speed {2:0.00} km/h, gear {3}, run-up attempts {4}.", LocoId, HillStage, CurrentSpeedKmh, ((_dm3Controller != null) ? _dm3Controller.CurrentGearIndex : 0), _momentumRunUpAttempts));
+								}
+								NotifyPermanentStall();
+								EnterTerminusStop(false);
 							}
-							IsPermanentlyStalled = true;
-							State = EngineState.TerminusStop;
-							NotifyPermanentStall();
 							break;
 						}
 						if (HillStage == HillLaunchStage.Stage1_Clean && IsPrecipitationActive())
@@ -7697,15 +7733,23 @@ namespace AITraffic.Driver
 							HillStage = HillLaunchStage.Stage2_Sanded;
 							_hillStagnationTimer = 0f;
 							_stage2ContinuousSandingTimer = 0f;
+							_stageEntryPosition = ((_trainCar != null) ? _trainCar.transform.position : Vector3.zero);
+							_hasMadeProgressSinceStageEntry = false;
 						}
 						if (HillStage == HillLaunchStage.Stage2_Sanded)
 						{
 							_stage2ContinuousSandingTimer += dt;
-							if (_stage2ContinuousSandingTimer >= 11f && CurrentSpeedKmh < 1f)
+							// CRITICAL INVARIANT [AIE-21]: a rolling, progressing launch is never abandoned for a rollback
+							// just because the sand window expired — that transition manufactured the very rollback →
+							// run-up → stall chain this SPEC removes.
+							if (_stage2ContinuousSandingTimer >= 11f && CurrentSpeedKmh < 1f && !_hasMadeProgressSinceStageEntry)
 							{
 								_stage2ContinuousSandingTimer = 0f;
 								_hillStagnationTimer = 0f;
 								_hillGroundProgressWindowTimer = 0f;
+								// CRITICAL INVARIANT [AIE-21]: a new descending stage starts its own evidence window.
+								_stageEntryPosition = ((_trainCar != null) ? _trainCar.transform.position : Vector3.zero);
+								_hasMadeProgressSinceStageEntry = false;
 								_commandedTrainBrake = 1f;
 								_currentTrainBrake = 1f;
 								_commandedThrottle = 0f;
@@ -7748,7 +7792,10 @@ namespace AITraffic.Driver
 						{
 							if (_dm3Controller.IsInNeutral || _dm3Controller.IsShifting)
 							{
-								_commandedTrainBrake = 1f;
+								// CRITICAL INVARIANT [AIE-21]: cut tractive effort ONLY. Never slam the train brake for a
+								// gear change: the old `_commandedTrainBrake = 1f` here re-applied a full service
+								// application on every 0.95 s shift cycle (plus 3.5 s cooldown), which is exactly what
+								// prevented the DM3 from ever regaining 1 km/h on a grade.
 								_commandedThrottle = 0f;
 								_rampThrottle = 0f;
 								break;
@@ -7789,13 +7836,34 @@ namespace AITraffic.Driver
 								_hillStagnationTimer = 0f;
 								_stage2ContinuousSandingTimer = 0f;
 								_hillGroundProgressWindowTimer = 0f;
+								// CRITICAL INVARIANT [AIE-22]: a successful launch wipes the run-up budget.
+								_momentumRunUpAttempts = 0;
+								_hasMadeProgressSinceStageEntry = false;
 								if (_controlsOverrider != null && _controlsOverrider.Sander != null)
 								{
 									_controlsOverrider.Sander.Set(0f);
 								}
 							}
 						}
-						_hillGroundProgressWindowTimer += dt;
+						// CRITICAL INVARIANT [AIE-21]: stage progress latch. One metre of SIGNED forward movement, or
+						// 1 km/h, permanently disarms escalation out of the CURRENT stage. The projection is taken along
+						// the locomotive's own forward axis and flipped by the commanded travel direction, never a
+						// direction-agnostic Vector3.Distance, so a rollback cannot be mistaken for progress.
+						if (_trainCar != null)
+						{
+							Vector3 stageDelta = _trainCar.transform.position - _stageEntryPosition;
+							float travelSign = ((_currentReverser < 0f) ? (-1f) : 1f);
+							float signedProgress = Vector3.Dot(_trainCar.transform.forward, stageDelta) * travelSign;
+							if (CurrentSpeedKmh >= StageProgressSpeedKmh || signedProgress >= StageProgressResetDistance)
+							{
+								_hasMadeProgressSinceStageEntry = true;
+							}
+						}
+						// CRITICAL INVARIANT [AIE-21]: freeze, never decay, the 6 s ground window while the gearbox is busy.
+						if (!dm3GearboxBusy)
+						{
+							_hillGroundProgressWindowTimer += dt;
+						}
 						if (_hillGroundProgressWindowTimer >= 6f)
 						{
 							float num18 = ((_trainCar != null) ? Vector3.Distance(_trainCar.transform.position, _hillGroundWindowStartPos) : 0f);
@@ -7815,7 +7883,14 @@ namespace AITraffic.Driver
 						bool flag20 = _isWheelSlipping && num13 < 0.2f;
 						bool flag21 = _commandedThrottle > 0.1f;
 						bool flag22 = flag10 && CurrentSpeedKmh < 0.5f && flag21;
-						if (flag17 && flag18 && flag19)
+						// CRITICAL INVARIANT [AIE-21]: while the DM3 gearbox is busy the stagnation clock is FROZEN —
+						// neither incremented nor decayed. Adding a `else` decay branch here would re-introduce the
+						// [AIE-01] slip-grip ping-pong; removing this guard re-introduces the L-020 false stall.
+						if (dm3GearboxBusy)
+						{
+							_hillStagnationTimer = _hillStagnationTimer;
+						}
+						else if (flag17 && flag18 && flag19)
 						{
 							_hillStagnationTimer += dt;
 						}
@@ -7831,7 +7906,9 @@ namespace AITraffic.Driver
 						{
 							_hillStagnationTimer = Mathf.Max(0f, _hillStagnationTimer - 0.5f * dt);
 						}
-						if (_hillStagnationTimer >= 3f)
+						// CRITICAL INVARIANT [AIE-21]: a stage that has demonstrably moved the train is never escalated
+						// out of. The ladder advances only on fresh, progress-free evidence.
+						if (_hillStagnationTimer >= 3f && !_hasMadeProgressSinceStageEntry)
 						{
 							_hillStagnationTimer = 0f;
 							_stage2ContinuousSandingTimer = 0f;
@@ -7840,6 +7917,11 @@ namespace AITraffic.Driver
 							{
 								_hillGroundWindowStartPos = _trainCar.transform.position;
 							}
+							// CRITICAL INVARIANT [AIE-21]: every stage entry re-arms the progress latch from the position
+							// the stage actually starts from — evidence of a previous stage's launch is NEVER carried
+							// over (that carry-over was the "started moving, then declared permanently stuck" bug).
+							_stageEntryPosition = ((_trainCar != null) ? _trainCar.transform.position : Vector3.zero);
+							_hasMadeProgressSinceStageEntry = false;
 							_commandedTrainBrake = 1f;
 							_currentTrainBrake = 1f;
 							_commandedThrottle = 0f;
@@ -7855,7 +7937,21 @@ namespace AITraffic.Driver
 							}
 							else if (HillStage == HillLaunchStage.MomentumRunUp)
 							{
-								HillStage = HillLaunchStage.PermanentlyStalled;
+								// CRITICAL INVARIANT [AIE-22]: a run-up may only be declared failed after
+								// MaxMomentumRunUpAttempts real attempts AND with no progress since the stage began.
+								// Otherwise fall back to a controlled rollback and try again — one bad run-up is not a
+								// permanent stall.
+								if (_momentumRunUpAttempts >= MaxMomentumRunUpAttempts && !_hasMadeProgressSinceStageEntry)
+								{
+									HillStage = HillLaunchStage.PermanentlyStalled;
+								}
+								else
+								{
+									HillStage = HillLaunchStage.RollbackDescent;
+									_rollbackStartPosition = ((_trainCar != null) ? _trainCar.transform.position : Vector3.zero);
+									_stageEntryPosition = _rollbackStartPosition;
+									_hasMadeProgressSinceStageEntry = false;
+								}
 							}
 						}
 					}
@@ -8050,36 +8146,19 @@ namespace AITraffic.Driver
 				}
 				break;
 			case EngineState.TerminusStop:
-				_commandedThrottle = 0f;
-				_commandedDynamicBrake = 0f;
-				_commandedTrainBrake = 1f;
-				_commandedIndependentBrake = 1f;
-				_commandedReverser = 0f;
-				if (_controlsOverrider != null)
+				// CRITICAL INVARIANT [AIE-22]: the parked state is written exactly ONCE, by
+				// SecureTrainForTerminalStop(). This case is now a pure command mirror: no per-frame Throttle /
+				// Reverser / Headlights writes (the 0.4f headlight ping-pong against AILocomotiveLighting's red
+				// markers and the ±1-vs-0 reverser servo were the audible/visual actuation loop of Issue 3).
+				// It also makes EVERY entry into TerminusStop — worker, ambient or stall — idempotent.
+				if (_parkedStateLatched)
 				{
-					if (_controlsOverrider.Throttle != null && _controlsOverrider.Throttle.Value > 0f)
-					{
-						_controlsOverrider.Throttle.Set(0f);
-					}
-					if (_controlsOverrider.Reverser != null && Mathf.Abs(_controlsOverrider.Reverser.Value - 0.5f) > 0.05f)
-					{
-						_controlsOverrider.Reverser.Set(0.5f);
-					}
-					if (!AITraffic.Workers.WorkerManager.ShouldKeepEngineRunningOnArrival(this))
-					{
-						if (_controlsOverrider.HeadlightsFront != null)
-						{
-							_controlsOverrider.HeadlightsFront.Set(0.4f);
-						}
-						if (_controlsOverrider.HeadlightsRear != null)
-						{
-							_controlsOverrider.HeadlightsRear.Set(0.4f);
-						}
-						if (_controlsOverrider.EngineOnReader != null && _controlsOverrider.EngineOnReader.IsOn && _controlsOverrider.PowerOff != null)
-						{
-							_controlsOverrider.PowerOff.Set(1f);
-						}
-					}
+					break;
+				}
+				SecureTrainForTerminalStop();
+				if (!AITraffic.Workers.WorkerManager.ShouldKeepEngineRunningOnArrival(this) && _controlsOverrider != null && _controlsOverrider.EngineOnReader != null && _controlsOverrider.EngineOnReader.IsOn && _controlsOverrider.PowerOff != null)
+				{
+					_controlsOverrider.PowerOff.Set(1f);
 				}
 				break;
 			}
@@ -8172,6 +8251,13 @@ namespace AITraffic.Driver
 
 		private void EnterTerminusStop()
 		{
+			EnterTerminusStop(true);
+		}
+
+		// CRITICAL INVARIANT [AIE-22]: the arrival callback is now a REQUEST parameter, not a side effect. A stall
+		// must secure the train without telling WorkerManager that the delivery succeeded.
+		private void EnterTerminusStop(bool fireArrivalEvent)
+		{
 			State = EngineState.TerminusStop;
 			TerminusArrivalTime = Time.time;
 			// CRITICAL INVARIANT [WRK-07]: Preserve running prime mover during intermediate multi-leg dwells
@@ -8200,9 +8286,10 @@ namespace AITraffic.Driver
 			_isHoldingInMultiTrack = false;
 			_corridorHoldReason = null;
 			_corridorHoldDistance = float.PositiveInfinity;
-			if (IsWorkerDriven && _controlsOverrider != null && _controlsOverrider.Handbrake != null)
+			SecureTrainForTerminalStop();
+			if (!fireArrivalEvent)
 			{
-				_controlsOverrider.Handbrake.Set(1f);
+				return;
 			}
 			try
 			{
@@ -8217,6 +8304,75 @@ namespace AITraffic.Driver
 			}
 		}
 
+		// CRITICAL INVARIANT [AIE-22]: the ONE place a train is put to bed. Idempotent; after the first call
+		// _parkedStateLatched is true and no code path may write a control again (§3.4).
+		private void SecureTrainForTerminalStop()
+		{
+			if (_parkedStateLatched)
+			{
+				return;
+			}
+			_parkedStateLatched = true;
+			_ambientLockedReverser = 0f;
+			_commandedReverser = 0f;
+			_currentReverser = 0f;
+			_commandedThrottle = 0f;
+			_rampThrottle = 0f;
+			_currentThrottle = 0f;
+			_commandedDynamicBrake = 0f;
+			_currentDynamicBrake = 0f;
+			_commandedTrainBrake = 1f;
+			_currentTrainBrake = 1f;
+			_hillStagnationTimer = 0f;
+			_stage2ContinuousSandingTimer = 0f;
+			_hillGroundProgressWindowTimer = 0f;
+			// CRITICAL INVARIANT [AIE-03]: never apply the independent brake while the consist is still moving.
+			if (CurrentSpeedKmh < 0.2f)
+			{
+				_commandedIndependentBrake = 1f;
+				_currentIndependentBrake = 1f;
+			}
+			else
+			{
+				_commandedIndependentBrake = 0f;
+				_currentIndependentBrake = 0f;
+			}
+			if (IsWorkerDriven && _controlsOverrider != null && _controlsOverrider.Handbrake != null)
+			{
+				_controlsOverrider.Handbrake.Set(1f);
+			}
+			if (_trainCar != null && _trainCar.brakeSystem != null)
+			{
+				_trainCar.brakeSystem.SetHandbrakePosition(1f, true);
+			}
+			// CRITICAL INVARIANT [AIE-22]: the ONLY physical lever writes on a parked train, executed once here.
+			// ExecuteControlOutputs() returns immediately while _parkedStateLatched is set (§3.4.1), so nothing can
+			// re-open the throttle/reverser servo loop that produced the audible back-and-forth of Issue 3.
+			if (_controlsOverrider != null)
+			{
+				if (_controlsOverrider.Throttle != null)
+				{
+					_controlsOverrider.Throttle.Set(0f);
+				}
+				if (_controlsOverrider.Reverser != null)
+				{
+					_controlsOverrider.Reverser.Set(0.5f);
+				}
+			}
+			if (_dm3Controller != null && _dm3Controller.IsDM3)
+			{
+				_dm3Controller.SetParked(true);
+				_dm3Controller.ForceNeutral();
+			}
+			if (Main.ModEntry != null)
+			{
+				Main.ModEntry.Logger.Log(string.Format("[AITraffic] '{0}' parked: state TerminusStop, reverser lock dropped, gearbox neutralised, brakes secured.", LocoId));
+			}
+		}
+
+		// NOTE: there is deliberately NO "notify WorkerManager of failure" helper here — see the boxed rationale in
+		// §3.3.1. The engineer stays alive and inert in the parked latch so AILocomotiveLighting keeps the markers.
+
 		private void ExecuteControlOutputs(float dt)
 		{
 			if (_controlsOverrider == null)
@@ -8227,6 +8383,14 @@ namespace AITraffic.Driver
 			if (State == EngineState.PlayerCoPilotStandby)
 			{
 				SyncCurrentControlsFromCabLevers();
+				return;
+			}
+			// CRITICAL INVARIANT [AIE-22]: a parked train is never touched again. Everything below this line writes a
+			// control; SecureTrainForTerminalStop() already performed the single legal write pass. Without this
+			// return the reverser lock (±1) at 8371-8374 fought `case TerminusStop`'s 0f every frame, the
+			// handbrake else-branch at 8426 released what the secure pass applied, and the servo cycle was audible.
+			if (_parkedStateLatched)
+			{
 				return;
 			}
 			if (!IsIntentionalReverseActive && (DistanceToObstacle < 45f || (DistanceToRedSignal < 12f && !_isSelfBlockedShunting)))
@@ -8431,7 +8595,7 @@ namespace AITraffic.Driver
 
 		public void EnsureEngineRunning()
 		{
-			if (!(_trainCar == null) && State != EngineState.TerminusStop)
+			if (!(_trainCar == null) && State != EngineState.TerminusStop && !_parkedStateLatched)
 			{
 				if (_controlsOverrider == null && _trainCar.SimController != null)
 				{
@@ -8751,6 +8915,24 @@ namespace AITraffic.Driver
 			_holdAtNextLoopRequested = false;
 			_isHoldingAtLoop = false;
 			HasArrivedAtDestination = false;
+			// CRITICAL INVARIANT [AIE-22]: Resume() must clear the ENTIRE hill/stall/parked lifecycle, otherwise
+			// IsPermanentlyStalled + HillStage + the parked latch keep the locomotive inert forever and every radio
+			// resume is a silent no-op (this was the "resume does nothing" half of Issue 3).
+			HillStage = HillLaunchStage.None;
+			IsPermanentlyStalled = false;
+			_hasAttemptedMomentumRunUp = false;
+			_momentumRunUpAttempts = 0;
+			_hasMadeProgressSinceStageEntry = false;
+			_hillStagnationTimer = 0f;
+			_stage2ContinuousSandingTimer = 0f;
+			_hillGroundProgressWindowTimer = 0f;
+			_stalledNotificationCooldown = 0f;
+			_parkedStateLatched = false;
+			_ambientLockedReverser = ((_desiredReverser != 0f) ? _desiredReverser : TargetDirection);
+			if (_dm3Controller != null && _dm3Controller.IsDM3)
+			{
+				_dm3Controller.SetParked(false);
+			}
 			ReleaseAllConsistHandbrakes();
 			if (_controlsOverrider != null && _controlsOverrider.Handbrake != null)
 			{
@@ -8776,7 +8958,8 @@ namespace AITraffic.Driver
 			_copilotStartIndBrake = _currentIndependentBrake;
 			_copilotStartDynBrake = _currentDynamicBrake;
 			_copilotBlendTimer = CoPilotBlendDuration;
-			_copilotTakeoverGraceTimer = 0.75f;
+			// CRITICAL INVARIANT [AIE-23]: 3.0 s of grace on resume as well as on hire — one constant, one value.
+			_copilotTakeoverGraceTimer = CoPilotTakeoverGraceDuration;
 			_isEmergencyStop = false;
 			_holdAtNextLoopRequested = false;
 			_isHoldingAtLoop = false;
@@ -8810,6 +8993,28 @@ namespace AITraffic.Driver
 			}
 		}
 
+		// ==== Worker lifecycle state (v0.2.9 · D1/D2/D3/D4) — see GRAVEYARD [AIE-21] [AIE-22] [AIE-23] ====
+		private const float CoPilotTakeoverGraceDuration = 3.0f;
+		private const float CoPilotLeverSettleTime = 0.15f;
+		private const float StageProgressResetDistance = 1.0f;
+		private const float StageProgressSpeedKmh = 1.0f;
+		private const int MaxMomentumRunUpAttempts = 3;
+		private Vector3 _stageEntryPosition = Vector3.zero;
+		private bool _hasMadeProgressSinceStageEntry = false;
+		private int _momentumRunUpAttempts = 0;
+		private bool _parkedStateLatched = false;
+		private float _copilotSettleThrottleLast = -1f;
+		private float _copilotSettleThrottleTimer = 0f;
+		private float _copilotSettleBrakeLast = -1f;
+		private float _copilotSettleBrakeTimer = 0f;
+		private float _copilotSettleIndBrakeLast = -1f;
+		private float _copilotSettleIndBrakeTimer = 0f;
+		private float _copilotSettleDynBrakeLast = -1f;
+		private float _copilotSettleDynBrakeTimer = 0f;
+		private float _copilotSettleReverserLast = -1f;
+		private float _copilotSettleReverserTimer = 0f;
+		// ==== end worker lifecycle state ====
+
 		private void SyncCurrentControlsFromCabLevers()
 		{
 			if (_controlsOverrider == null)
@@ -8833,6 +9038,47 @@ namespace AITraffic.Driver
 			{
 				_currentDynamicBrake = _controlsOverrider.DynamicBrake.Value;
 			}
+			// CRITICAL INVARIANT [AIE-23]: the reverser baseline must be seeded from the physical notch, using the
+			// exact inverse of MapDirectionToReverserControl (0.5f = neutral, >0.1f forward, <-0.1f reverse).
+			// Without this, a parked train with an off-centre reverser trips the 0.18f takeover deadzone on frame 1.
+			if (_controlsOverrider.Reverser != null)
+			{
+				float reverserDir = (_controlsOverrider.Reverser.Value - 0.5f) * 2f;
+				_currentReverser = ((reverserDir > 0.1f) ? 1f : ((reverserDir < -0.1f) ? (-1f) : 0f));
+			}
+			_copilotSettleThrottleLast = _currentThrottle;
+			_copilotSettleThrottleTimer = 0f;
+			_copilotSettleBrakeLast = _currentTrainBrake;
+			_copilotSettleBrakeTimer = 0f;
+			_copilotSettleIndBrakeLast = _currentIndependentBrake;
+			_copilotSettleIndBrakeTimer = 0f;
+			_copilotSettleDynBrakeLast = _currentDynamicBrake;
+			_copilotSettleDynBrakeTimer = 0f;
+			_copilotSettleReverserLast = ((_controlsOverrider.Reverser != null) ? _controlsOverrider.Reverser.Value : 0.5f);
+			_copilotSettleReverserTimer = 0f;
+		}
+
+		// CRITICAL INVARIANT [AIE-23]: the ONLY legal way for a worker session to start. WorkerManager calls this once
+		// per attach, in the same frame as AddComponent, so the control baselines, the upgrade-safety levers and the
+		// 3.0 s takeover grace window are all armed BEFORE the first UpdatePlayerCoPilotHandover tick.
+		public void BeginWorkerCoPilotSession()
+		{
+			if (_controlsOverrider == null && _trainCar != null && _trainCar.SimController != null)
+			{
+				_controlsOverrider = _trainCar.SimController.controlsOverrider;
+			}
+			if (_controlsOverrider == null || _trainCar == null)
+			{
+				return;
+			}
+			SyncCurrentControlsFromCabLevers();
+			_copilotBlendTimer = 0f;
+			_copilotTakeoverGraceTimer = CoPilotTakeoverGraceDuration;
+			_parkedStateLatched = false;
+			if (Main.ModEntry != null)
+			{
+				Main.ModEntry.Logger.Log(string.Format("[AITraffic] [CoPilot] Worker session armed on '{0}': grace {1:0.0}s, baseline throttle {2:0.00} / brake {3:0.00} / ind {4:0.00} / rev {5:0.00}.", LocoId, CoPilotTakeoverGraceDuration, _currentThrottle, _currentTrainBrake, _currentIndependentBrake, _currentReverser));
+			}
 		}
 
 		private bool IsPlayerInConsistOrCab()
@@ -8848,15 +9094,25 @@ namespace AITraffic.Driver
 			return _trainCar.trainset != null && PlayerManager.Car.trainset == _trainCar.trainset;
 		}
 
+		// CRITICAL INVARIANT [AIE-23]: never accuse a lever the mod itself is still driving. A lever only becomes
+		// eligible for the 0.18f takeover test once it has been byte-stable for CoPilotLeverSettleTime (0.15 s).
+		private bool IsLeverTakeoverArmed(ref float lastValue, ref float settleTimer, float currentValue, float dt)
+		{
+			if (Mathf.Abs(currentValue - lastValue) > 0.001f)
+			{
+				lastValue = currentValue;
+				settleTimer = 0f;
+				return false;
+			}
+			settleTimer += dt;
+			return settleTimer >= CoPilotLeverSettleTime;
+		}
+
 		private void UpdatePlayerCoPilotHandover(float dt)
 		{
-			if (!IsWorkerDriven || _trainCar == null || _controlsOverrider == null || State == EngineState.TerminusStop)
+			if (!IsWorkerDriven || _trainCar == null || _controlsOverrider == null || State == EngineState.TerminusStop || _parkedStateLatched)
 			{
 				return;
-			}
-			if (_copilotTakeoverGraceTimer > 0f)
-			{
-				_copilotTakeoverGraceTimer = Mathf.Max(0f, _copilotTakeoverGraceTimer - dt);
 			}
 			if (State == EngineState.PlayerCoPilotStandby)
 			{
@@ -8866,6 +9122,8 @@ namespace AITraffic.Driver
 				}
 				return;
 			}
+			// CRITICAL INVARIANT [AIE-23]: these masks are evaluated before any lever test, so a hire can never
+			// produce a takeover. The grace countdown itself is ticked exactly once per frame in Update().
 			if (_isStartingEngine || _copilotBlendTimer > 0f || _copilotTakeoverGraceTimer > 0f)
 			{
 				return;
@@ -8878,31 +9136,63 @@ namespace AITraffic.Driver
 			bool flag2 = (_isEmergencyStop || _isHoldingAtLoop || (_isWorkerApproachStaging && _isWaitingOutsideStationThroat)) && CurrentSpeedKmh < 0.2f;
 			float num = (flag2 ? 1f : _currentTrainBrake);
 			float num2 = (flag2 ? 1f : _currentIndependentBrake);
-			bool playerTouchedControl = false;
-			if (_controlsOverrider.Throttle != null && Mathf.Abs(_controlsOverrider.Throttle.Value - _currentThrottle) > 0.18f)
+			float throttleValue = ((_controlsOverrider.Throttle != null) ? _controlsOverrider.Throttle.Value : _currentThrottle);
+			float brakeValue = ((_controlsOverrider.Brake != null) ? _controlsOverrider.Brake.Value : num);
+			float indBrakeValue = ((_controlsOverrider.IndependentBrake != null) ? _controlsOverrider.IndependentBrake.Value : num2);
+			float dynBrakeValue = ((_hasDynamicBrake && _controlsOverrider.DynamicBrake != null) ? _controlsOverrider.DynamicBrake.Value : _currentDynamicBrake);
+			float reverserValue = ((_controlsOverrider.Reverser != null) ? _controlsOverrider.Reverser.Value : MapDirectionToReverserControl(_currentReverser));
+			bool throttleArmed = (_controlsOverrider.Throttle != null) && IsLeverTakeoverArmed(ref _copilotSettleThrottleLast, ref _copilotSettleThrottleTimer, throttleValue, dt);
+			bool brakeArmed = (_controlsOverrider.Brake != null) && IsLeverTakeoverArmed(ref _copilotSettleBrakeLast, ref _copilotSettleBrakeTimer, brakeValue, dt);
+			bool indBrakeArmed = (_controlsOverrider.IndependentBrake != null) && IsLeverTakeoverArmed(ref _copilotSettleIndBrakeLast, ref _copilotSettleIndBrakeTimer, indBrakeValue, dt);
+			bool dynBrakeArmed = (_hasDynamicBrake && _controlsOverrider.DynamicBrake != null) && IsLeverTakeoverArmed(ref _copilotSettleDynBrakeLast, ref _copilotSettleDynBrakeTimer, dynBrakeValue, dt);
+			bool reverserArmed = (_controlsOverrider.Reverser != null) && IsLeverTakeoverArmed(ref _copilotSettleReverserLast, ref _copilotSettleReverserTimer, reverserValue, dt);
+			string touchedLever = null;
+			float touchedActual = 0f;
+			float touchedExpected = 0f;
+			if (throttleArmed && Mathf.Abs(throttleValue - _currentThrottle) > 0.18f)
 			{
-				playerTouchedControl = true;
+				touchedLever = "throttle";
+				touchedActual = throttleValue;
+				touchedExpected = _currentThrottle;
 			}
-			else if (_controlsOverrider.Brake != null && Mathf.Abs(_controlsOverrider.Brake.Value - num) > 0.18f)
+			else if (brakeArmed && Mathf.Abs(brakeValue - num) > 0.18f)
 			{
-				playerTouchedControl = true;
+				touchedLever = "train brake";
+				touchedActual = brakeValue;
+				touchedExpected = num;
 			}
-			else if (_controlsOverrider.IndependentBrake != null && Mathf.Abs(_controlsOverrider.IndependentBrake.Value - num2) > 0.18f)
+			else if (indBrakeArmed && Mathf.Abs(indBrakeValue - num2) > 0.18f)
 			{
-				playerTouchedControl = true;
+				touchedLever = "independent brake";
+				touchedActual = indBrakeValue;
+				touchedExpected = num2;
 			}
-			else if (_hasDynamicBrake && _controlsOverrider.DynamicBrake != null && Mathf.Abs(_controlsOverrider.DynamicBrake.Value - _currentDynamicBrake) > 0.18f)
+			else if (dynBrakeArmed && Mathf.Abs(dynBrakeValue - _currentDynamicBrake) > 0.18f)
 			{
-				playerTouchedControl = true;
+				touchedLever = "dynamic brake";
+				touchedActual = dynBrakeValue;
+				touchedExpected = _currentDynamicBrake;
 			}
-			else if (CurrentSpeedMs < 0.15f && _controlsOverrider.Reverser != null && Mathf.Abs(_controlsOverrider.Reverser.Value - MapDirectionToReverserControl(_currentReverser)) > 0.18f)
+			else if (CurrentSpeedMs < 0.15f && reverserArmed && Mathf.Abs(reverserValue - MapDirectionToReverserControl(_currentReverser)) > 0.18f)
 			{
-				playerTouchedControl = true;
+				touchedLever = "reverser";
+				touchedActual = reverserValue;
+				touchedExpected = MapDirectionToReverserControl(_currentReverser);
 			}
-
-			if (playerTouchedControl)
+			if (touchedLever != null)
 			{
+				LogCoPilotTakeover(touchedLever, touchedActual, touchedExpected);
 				EnterPlayerCoPilotStandby();
+			}
+		}
+
+		// CRITICAL INVARIANT [AIE-23]: every takeover leaves exactly one Player.log line naming the lever and both
+		// values, so the next playtest can be diagnosed without a debug build (R1.6).
+		private void LogCoPilotTakeover(string lever, float actual, float expected)
+		{
+			if (Main.ModEntry != null)
+			{
+				Main.ModEntry.Logger.Warning(string.Format("[AITraffic] [CoPilot] Takeover on '{0}': {1} lever {2:0.00} vs expected {3:0.00} (grace inactive).", LocoId, lever, actual, expected));
 			}
 		}
 
@@ -8935,6 +9225,12 @@ namespace AITraffic.Driver
 				BrakePID.Reset();
 			}
 			State = EngineState.PlayerCoPilotStandby;
+			// CRITICAL INVARIANT [AIE-23]: standby entry is a state transition, not a rendering event — log it once,
+			// with the loco id, so the takeover is visible in Player.log (it was toast-only and therefore invisible).
+			if (Main.ModEntry != null)
+			{
+				Main.ModEntry.Logger.Warning(string.Format("[AITraffic] [CoPilot] '{0}' handed over to the player at {1:0.0} km/h (state PlayerCoPilotStandby).", LocoId, CurrentSpeedKmh));
+			}
 			if (WorkerManager.Instance != null)
 			{
 				string hotkey = (IniConfigManager.Instance != null && IniConfigManager.Instance.Economy != null && !string.IsNullOrEmpty(IniConfigManager.Instance.Economy.CoPilotResumeHotkey))

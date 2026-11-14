@@ -143,6 +143,11 @@ namespace AITraffic.Driver
         {
             if (!IsDM3 || _trainCar == null) return;
 
+            // CRITICAL INVARIANT [AIE-22]: halted forever once the train is parked. This is what stops the
+            // "shifts → throttle cut → brake → shift" cycle that was audible after the permanent-stall clamp, and it
+            // is the only thing that keeps a 0 km/h gearbox from upshifting out of gear 1 (UpshiftKmh == 0.0f).
+            if (_parked) return;
+
             // Lazy initialization retry (single-attempt latch)
             if (!_initialized && (_portGearboxA == null || _portGearboxB == null))
             {
@@ -224,6 +229,15 @@ namespace AITraffic.Driver
 
             int current = CurrentGearIndex;
             if (current <= 0) current = 1;
+
+            // CRITICAL INVARIANT [AIE-21]: no gear change at a standstill. Gear 1 has UpshiftKmh == 0.0f, so
+            // `speedKmh >= curDef.UpshiftKmh` is trivially true at 0 km/h and the controller upshifts the moment the
+            // train stops — the mechanical half of the Issue 3 loop. Downshifting is likewise pointless while the
+            // wheels are not turning; the neutral-management branch above already covers a genuine stop.
+            if (speedKmh < 0.5f)
+            {
+                return current;
+            }
 
             // Cap maximum gear so the DM3 does not upshift beyond target line speed
             int maxAllowedGear = s_gearTable.Length;
@@ -311,6 +325,20 @@ namespace AITraffic.Driver
             }
         }
 
+        // CRITICAL INVARIANT [AIE-22]: a parked controller must never shift again. Set once by
+        // AIEngineer.SecureTrainForTerminalStop() and cleared only by AIEngineer.Resume().
+        private bool _parked = false;
+
+        public bool IsParked
+        {
+            get { return _parked; }
+        }
+
+        public void SetParked(bool parked)
+        {
+            _parked = parked;
+        }
+
         public void ApplyGearsInstant(int gearA, int gearB)
         {
             // Derail Valley ManualTransmissionInput uses a normalized 0.0 to 1.0 range:
@@ -330,6 +358,22 @@ namespace AITraffic.Driver
             {
                 _portGearboxB.Value = valB;
             }
+        }
+
+        // CRITICAL INVARIANT [AIE-22]: ApplyGearsInstant() writes the ports but never updates CurrentGearIndex /
+        // CurrentGearA / CurrentGearB / IsInNeutral, so every external caller leaves the controller lying about its
+        // physical state and the next Update re-shifts (the port-flap described in the scout report). This helper is
+        // the single, index-consistent neutralisation used when parking a train.
+        public void ForceNeutral()
+        {
+            ApplyGearsInstant(0, 0);
+            CurrentGearIndex = 0;
+            CurrentGearA = 0;
+            CurrentGearB = 0;
+            IsInNeutral = true;
+            IsShifting = false;
+            _shiftStep = 0;
+            _shiftCooldown = 0.0f;
         }
     }
 }
