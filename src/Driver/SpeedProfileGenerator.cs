@@ -467,17 +467,26 @@ namespace AITraffic.Driver
         /// <returns>Allowable speed in m/s.</returns>
         public static float CalculateStopBrakingSpeed(float distanceToStop, float deceleration)
         {
-            // Within 4 meters of the mast / buffer stop: absolute halt
-            if (distanceToStop <= StopBufferDistance)
+            if (distanceToStop <= 3.0f)
             {
                 return 0.0f;
             }
 
-            // Final deceleration zone (4m to 12m): smoothly taper from 10 km/h down to 0 km/h
+            // Terminal crawl zone (<= 15m): maintain 5 km/h crawl down to 6m, then taper to 0 at 3m
+            if (distanceToStop <= 15.0f)
+            {
+                if (distanceToStop >= 6.0f)
+                {
+                    return KmHToMs(5.0f);
+                }
+                return KmHToMs(Mathf.Lerp(0.0f, 5.0f, (distanceToStop - 3.0f) / 3.0f));
+            }
+
+            // Final deceleration zone (15m to 40m): smoothly taper from CrawlSpeedKmh down to 5 km/h
             if (distanceToStop <= FinalDecelDistance)
             {
-                float t = Mathf.Clamp01((distanceToStop - StopBufferDistance) / (FinalDecelDistance - StopBufferDistance));
-                return KmHToMs(CrawlSpeedKmh * t);
+                float t = Mathf.Clamp01((distanceToStop - 15.0f) / (FinalDecelDistance - 15.0f));
+                return KmHToMs(Mathf.Lerp(5.0f, CrawlSpeedKmh, t));
             }
 
             // Crawl zone (12m to 75m): maintain steady 10 km/h crawl to bring the train right to the signal

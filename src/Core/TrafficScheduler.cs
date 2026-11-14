@@ -2206,6 +2206,11 @@ namespace AITraffic.Core
                     if (t.curve == null || (!isPax && IsDeadEndTrack(t))) continue;
 
                     string name = t.name ?? "";
+                    bool isDeadEnd = IsDeadEndTrack(t) || t.inJunction == null || t.outJunction == null;
+                    float len = t.curve != null ? t.curve.length : 0f;
+                    bool isFreightExcluded = name.Contains("-SP") || (isDeadEnd && len < 180f);
+                    if (!isPax && isFreightExcluded) continue;
+
                     if (!string.IsNullOrEmpty(yardId) && name.IndexOf(yardId, StringComparison.OrdinalIgnoreCase) >= 0)
                     {
                         if (isPax)
@@ -2256,19 +2261,32 @@ namespace AITraffic.Core
             if (destStation == null) return results;
 
             bool isPax = (consistType == ConsistType.PassengerCommuter);
+            float minLen = isPax ? 125f : 180f;
             var staticTracks = GetStaticDestinationTracks(destStation, isPax);
+            var eligibleAll = new List<RailTrack>();
             if (staticTracks != null)
             {
                 for (int i = 0; i < staticTracks.Count; i++)
                 {
                     var t = staticTracks[i];
-                    if (!IsTrackOccupied(t, occupiedSnapshot))
+                    if (t == null) continue;
+                    string name = t.name ?? "";
+                    if (!isPax && name.Contains("-SP")) continue;
+                    float trackLength = t.curve != null ? t.curve.length : 0f;
+                    if (trackLength >= minLen)
                     {
-                        results.Add(t);
+                        eligibleAll.Add(t);
+                        if (!IsTrackOccupied(t, occupiedSnapshot))
+                        {
+                            results.Add(t);
+                        }
                     }
                 }
             }
 
+            if (results.Count > 0) return results;
+            if (eligibleAll.Count > 0) return eligibleAll;
+            if (staticTracks != null && staticTracks.Count > 0) return new List<RailTrack>(staticTracks);
             return results;
         }
 

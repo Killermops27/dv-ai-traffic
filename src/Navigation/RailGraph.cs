@@ -687,7 +687,7 @@ namespace AITraffic.Navigation
                                     edge.IsIndustrialYardOrStorageTrack = false;
                                     edge.IsStrictlyAvoidedThroughTrack = false;
                                 }
-                                else if (tName.Contains("[--]") || tName.EndsWith("--", StringComparison.OrdinalIgnoreCase) || tName.EndsWith("--]", StringComparison.OrdinalIgnoreCase) || Pathfinder.IsPassingOrSidingTrack(edge.Track))
+                                else if (tName.Contains("[--]") || tName.EndsWith("--", StringComparison.OrdinalIgnoreCase) || tName.EndsWith("--]", StringComparison.OrdinalIgnoreCase) || Pathfinder.IsPassingOrSidingTrack(edge.Track) || Pathfinder.IsFarmThroughTrack(edge.Track))
                                 {
                                     edge.IsYardTrack = false;
                                 }
@@ -739,7 +739,7 @@ namespace AITraffic.Navigation
                                 edge.IsIndustrialYardOrStorageTrack = false;
                                 edge.IsStrictlyAvoidedThroughTrack = false;
                             }
-                            else if (tName.Contains("[--]") || tName.EndsWith("--", StringComparison.OrdinalIgnoreCase) || tName.EndsWith("--]", StringComparison.OrdinalIgnoreCase) || Pathfinder.IsPassingOrSidingTrack(edge.Track))
+                            else if (tName.Contains("[--]") || tName.EndsWith("--", StringComparison.OrdinalIgnoreCase) || tName.EndsWith("--]", StringComparison.OrdinalIgnoreCase) || Pathfinder.IsPassingOrSidingTrack(edge.Track) || Pathfinder.IsFarmThroughTrack(edge.Track))
                             {
                                 edge.IsYardTrack = false;
                             }
@@ -814,6 +814,7 @@ namespace AITraffic.Navigation
                                          (tName.StartsWith("Road ", StringComparison.OrdinalIgnoreCase) ||
                                           tName.StartsWith("[#]", StringComparison.OrdinalIgnoreCase) ||
                                           tName.Contains("[#]") ||
+                                          Pathfinder.IsFarmThroughTrack(edge.Track) ||
                                           IsCrossoverTrackName(tName)) && !isDeadEnd;
                 if (isOpenCountryRoad)
                 {
