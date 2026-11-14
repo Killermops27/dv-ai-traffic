@@ -16,6 +16,9 @@ namespace AITraffic
         public static bool Enabled { get; private set; }
         public static int MainThreadId { get; private set; }
 
+        // CRITICAL INVARIANT [WRK-GATE-2]: main-thread probe used by Pathfinder.IsFarmThroughTrack to skip the main-thread-only logic-track lookup (D5, from the Main.cs:66 idiom)
+        public static bool IsBackgroundThread => MainThreadId != 0 && System.Threading.Thread.CurrentThread.ManagedThreadId != MainThreadId;
+
         private static readonly object s_logLock = new object();
 
         // CRITICAL INVARIANT [LOG-01]: Build-aware diagnostic logging gate & background-thread-safe logger ([RGR-03]).

@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using AITraffic.Compat;
 using DV.Simulation.Cars;
+using Signals.Game.Railway;
 using UnityEngine;
 using DVSignal = Signals.Game.Signal;
 
@@ -633,6 +634,7 @@ namespace AITraffic.Navigation
 
         /// <summary>
         /// Finds the first governing home/main signal in the upcoming signals list, bypassing advance distant signals.
+        /// Prioritizes Main Signals over Dwarf/Shunt signals to prevent premature shunt-signal reservations.
         /// </summary>
         public static DVSignal FindFirstGoverningSignal(IList<UpcomingSignal> upcomingSignals, out float distance)
         {
@@ -643,10 +645,21 @@ namespace AITraffic.Navigation
                 var sigEntry = upcomingSignals[i];
                 if (sigEntry.Signal == null) continue;
                 var rawSig = sigEntry.Signal.Parent != null ? sigEntry.Signal.Parent : sigEntry.Signal;
-                if (IsGoverningSignal(rawSig))
+                if (IsGoverningSignal(rawSig) && IsMainSignal(rawSig))
                 {
                     distance = sigEntry.Distance;
                     return rawSig;
+                }
+            }
+            for (int j = 0; j < upcomingSignals.Count; j++)
+            {
+                var sigEntry2 = upcomingSignals[j];
+                if (sigEntry2.Signal == null) continue;
+                var rawSig2 = sigEntry2.Signal.Parent != null ? sigEntry2.Signal.Parent : sigEntry2.Signal;
+                if (IsGoverningSignal(rawSig2))
+                {
+                    distance = sigEntry2.Distance;
+                    return rawSig2;
                 }
             }
             return null;
@@ -939,6 +952,110 @@ namespace AITraffic.Navigation
         }
 
         /// <summary>
+        /// Determines whether a signal guards or loops through a topological balloon/reverse loop.
+        /// When detected, route reservation via TrackReserver is bypassed to prevent self-locking Hp 0 deadlocks.
+        /// </summary>
+        public static bool IsBalloonLoopSignal(DVSignal signal)
+        {
+            if (signal == null)
+            {
+                return false;
+            }
+            var effSig = signal.Parent != null ? signal.Parent : signal;
+            TrackBlock trackBlock = effSig.Block ?? signal.Block;
+            if (trackBlock != null && trackBlock.IsSelfLoop)
+            {
+                return true;
+            }
+            RailTrack track;
+            double span;
+            if (!TryGetSignalPlacement(effSig, out track, out span) || track == null)
+            {
+                return false;
+            }
+            Initialize(force: false);
+            Junction guardedJunction = null;
+            if (effSig.Controller != null && effSig.Controller.PlacementInfo.HasValue)
+            {
+                var pInfo = effSig.Controller.PlacementInfo.Value;
+                guardedJunction = (pInfo.Direction == Signals.Game.TrackDirection.In) ? track.outJunction : track.inJunction;
+            }
+            if (guardedJunction == null)
+            {
+                guardedJunction = track.outJunction ?? track.inJunction;
+            }
+            if (guardedJunction == null)
+            {
+                return false;
+            }
+            RailTrack val = null;
+            if (guardedJunction.inBranch != null && guardedJunction.inBranch.track == track)
+            {
+                if (guardedJunction.outBranches != null && guardedJunction.selectedBranch >= 0 && guardedJunction.selectedBranch < guardedJunction.outBranches.Count)
+                {
+                    val = guardedJunction.outBranches[guardedJunction.selectedBranch]?.track;
+                }
+            }
+            else if (guardedJunction.inBranch != null)
+            {
+                val = guardedJunction.inBranch.track;
+            }
+            if (val == null)
+            {
+                return false;
+            }
+            HashSet<RailTrack> hashSet = new HashSet<RailTrack>();
+            RailTrack val2 = val;
+            Junction val3 = guardedJunction;
+            for (int i = 0; i < 6; i++)
+            {
+                if (val2 == null || !hashSet.Add(val2))
+                {
+                    break;
+                }
+                if (s_trackSignals.TryGetValue(val2, out var value) && value != null)
+                {
+                    for (int j = 0; j < value.Count; j++)
+                    {
+                        DVSignal signalInfo = value[j];
+                        if (signalInfo != null && signalInfo != effSig && signalInfo != signal && IsMainSignal(signalInfo))
+                        {
+                            return false;
+                        }
+                    }
+                }
+                Junction val4 = ((val2.inJunction == val3) ? val2.outJunction : val2.inJunction);
+                if (val4 == null)
+                {
+                    break;
+                }
+                if (val4 == guardedJunction)
+                {
+                    return true;
+                }
+                RailTrack val5 = null;
+                if (val4.inBranch != null && val4.inBranch.track == val2)
+                {
+                    if (val4.outBranches != null && val4.selectedBranch >= 0 && val4.selectedBranch < val4.outBranches.Count)
+                    {
+                        val5 = val4.outBranches[val4.selectedBranch]?.track;
+                    }
+                }
+                else if (val4.inBranch != null)
+                {
+                    val5 = val4.inBranch.track;
+                }
+                if (val5 == track)
+                {
+                    return true;
+                }
+                val3 = val4;
+                val2 = val5;
+            }
+            return false;
+        }
+
+        /// <summary>
         /// Attempts to reserve a DVSignal route via DVSignals TrackReserver.
         /// This satisfies SpecialRequireReservationAspect and turns station entry/exit signals from Hp 0 to Hp 1/Hp 2.
         /// </summary>
@@ -946,6 +1063,11 @@ namespace AITraffic.Navigation
         {
             if (signal == null || !ModCompatManager.IsDVSignalsLoaded) return false;
             if (signal.Parent != null) signal = signal.Parent;
+            if (IsBalloonLoopSignal(signal))
+            {
+                ClearDVSignalReservation(signal);
+                return false;
+            }
             try
             {
                 bool reserved = Signals.Game.Railway.TrackReserver.HasReservation(signal);
@@ -1450,7 +1572,7 @@ namespace AITraffic.Navigation
                     var sig = aheadSignals[i].Signal;
                     float dist = aheadSignals[i].Distance;
                     var effectiveSig = (sig != null && sig.Parent != null) ? sig.Parent : sig;
-                    if (IsGoverningSignal(effectiveSig))
+                    if (IsGoverningSignal(effectiveSig) && IsMainSignal(effectiveSig))
                     {
                         sig = effectiveSig;
                         if (currentBlock.BlockIndex == 1)
@@ -1566,7 +1688,7 @@ namespace AITraffic.Navigation
                             float sigDist = trackAheadSignals[i].Distance;
                             var effectiveSig = (sig != null && sig.Parent != null) ? sig.Parent : sig;
 
-                            if (IsGoverningSignal(effectiveSig))
+                            if (IsGoverningSignal(effectiveSig) && IsMainSignal(effectiveSig))
                             {
                                 sig = effectiveSig;
                                 currentBlock.ExitSignal = sig;

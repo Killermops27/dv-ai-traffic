@@ -1925,6 +1925,46 @@ namespace AITraffic.Navigation
             return edge.IsGatedMilitaryTrack || IsGatedMilitaryTrack(edge.Track);
         }
 
+        // TrackID.trackType / TrackID.yardId are FIELDS (not properties) on DV.Logic.Job.TrackID; AccessTools.PropertyGetter returns null for both.
+        private static readonly Func<DV.Logic.Job.TrackID, string> s_trackTypeGetter =
+            CreateTrackIdFieldReader("trackType");
+
+        private static readonly Func<DV.Logic.Job.TrackID, string> s_trackYardIdGetter =
+            CreateTrackIdFieldReader("yardId");
+
+        private static Func<DV.Logic.Job.TrackID, string> CreateTrackIdFieldReader(string fieldName)
+        {
+            System.Reflection.FieldInfo field = HarmonyLib.AccessTools.Field(typeof(DV.Logic.Job.TrackID), fieldName);
+            if (field == null)
+            {
+                return delegate(DV.Logic.Job.TrackID id)
+                {
+                    return null;
+                };
+            }
+            System.Linq.Expressions.ParameterExpression param = System.Linq.Expressions.Expression.Parameter(typeof(DV.Logic.Job.TrackID), "id");
+            return System.Linq.Expressions.Expression.Lambda<Func<DV.Logic.Job.TrackID, string>>(System.Linq.Expressions.Expression.Field(param, field), param).Compile();
+        }
+
+        /// <summary>
+        /// Determines whether a given track is a through-track at Farm (FM) that connects across yard boundaries.
+        /// </summary>
+        public static bool IsFarmThroughTrack(RailTrack track)
+        {
+            if (track == null) return false;
+            if (track.inJunction == null || track.outJunction == null) return false;
+            string tName = track.name ?? string.Empty;
+            if (tName.EndsWith("-L]", StringComparison.OrdinalIgnoreCase)) return false;
+            bool isFmTrack = tName.Contains("[FM]") || tName.Contains(" FM ") || tName.Contains("_FM_");
+            var logicTrack = (Main.IsBackgroundThread ? null : AITraffic.Compat.ModCompatManager.GetLogicTrack(track));
+            if (logicTrack?.ID != null)
+            {
+                if (s_trackTypeGetter(logicTrack.ID) == "L") return false;
+                if (s_trackYardIdGetter(logicTrack.ID) == "FM") isFmTrack = true;
+            }
+            return isFmTrack;
+        }
+
         /// <summary>
         /// Determines whether a track is an industrial or station yard storage/shunting track (e.g. [Y]_[OWN]_[A-01-S]).
         /// </summary>
@@ -1948,7 +1988,7 @@ namespace AITraffic.Navigation
             }
 
             // Station central running/bypass lines (ending in [--]) are through-tracks, NOT shunting/storage tracks
-            if (tName.Contains("[--]") || tName.EndsWith("--", StringComparison.OrdinalIgnoreCase) || tName.EndsWith("--]", StringComparison.OrdinalIgnoreCase))
+            if (tName.Contains("[--]") || tName.EndsWith("--", StringComparison.OrdinalIgnoreCase) || tName.EndsWith("--]", StringComparison.OrdinalIgnoreCase) || IsFarmThroughTrack(track))
             {
                 return false;
             }
@@ -2109,7 +2149,7 @@ namespace AITraffic.Navigation
             }
 
             // Station central running/bypass lines (ending in [--]) are through-tracks, NOT avoided tracks
-            if (tName.Contains("[--]") || tName.EndsWith("--", StringComparison.OrdinalIgnoreCase) || tName.EndsWith("--]", StringComparison.OrdinalIgnoreCase))
+            if (tName.Contains("[--]") || tName.EndsWith("--", StringComparison.OrdinalIgnoreCase) || tName.EndsWith("--]", StringComparison.OrdinalIgnoreCase) || IsFarmThroughTrack(track))
             {
                 return false;
             }
@@ -2205,7 +2245,7 @@ namespace AITraffic.Navigation
             }
 
             // Station central running/bypass lines (ending in [--]) are through-tracks, NOT industrial yard tracks
-            if (tName.Contains("[--]") || tName.EndsWith("--", StringComparison.OrdinalIgnoreCase) || tName.EndsWith("--]", StringComparison.OrdinalIgnoreCase))
+            if (tName.Contains("[--]") || tName.EndsWith("--", StringComparison.OrdinalIgnoreCase) || tName.EndsWith("--]", StringComparison.OrdinalIgnoreCase) || IsFarmThroughTrack(track))
             {
                 return false;
             }

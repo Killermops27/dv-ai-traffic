@@ -703,6 +703,7 @@ namespace AITraffic.Workers.Radio
                 else if (selectedTask.Engineer != null && selectedTask.Engineer.State == EngineState.PlayerCoPilotStandby) stateTag = "CO-PILOT";
                 else if (selectedTask.Engineer != null && selectedTask.Engineer.IsEmergencyStopped) stateTag = "E-STOP";
                 else if (selectedTask.Engineer != null && selectedTask.Engineer.IsHoldingAtLoop) stateTag = "HOLD-LOOP";
+                else if (selectedTask.Engineer != null && selectedTask.Engineer.IsWorkerApproachStaging) stateTag = "STAGING";
                 else if (selectedTask.IsInfiniteIntermediateHold) stateTag = "HOLD-WPT";
                 else if (selectedTask.Status == HaulTaskStatus.WaitingAtIntermediate) stateTag = "DWELL";
                 else if (selectedTask.CurrentSpeedKmh < 0.5f) stateTag = "WAIT";
@@ -820,6 +821,7 @@ namespace AITraffic.Workers.Radio
             else if (task.Engineer != null && task.Engineer.State == EngineState.PlayerCoPilotStandby) stateInfo = "CO-PILOT STANDBY";
             else if (task.Engineer != null && task.Engineer.IsEmergencyStopped) stateInfo = "E-STOP (MAX BRK)";
             else if (task.Engineer != null && task.Engineer.IsHoldingAtLoop) stateInfo = "HOLD AT LOOP";
+            else if (task.Engineer != null && task.Engineer.IsWorkerApproachStaging) stateInfo = "STAGING (TRACK OCCUPIED)";
             else if (task.IsInfiniteIntermediateHold) stateInfo = "HOLD AT WAYPOINT";
 
             return new CommsRadioState(

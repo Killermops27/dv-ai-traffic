@@ -49,6 +49,10 @@
       <HintPath>$(DVInstallPath)\DerailValley_Data\Managed\UnityEngine.dll</HintPath>
       <Private>False</Private>
     </Reference>
+    <Reference Include="UnityEngine.AudioModule">
+      <HintPath>$(DVInstallPath)\DerailValley_Data\Managed\UnityEngine.AudioModule.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
     <Reference Include="UnityEngine.CoreModule">
       <HintPath>$(DVInstallPath)\DerailValley_Data\Managed\UnityEngine.CoreModule.dll</HintPath>
       <Private>False</Private>

@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using UnityEngine;
 using AITraffic.Driver;
+using AITraffic.Navigation;
 
 namespace AITraffic.Workers
 {
@@ -137,6 +138,38 @@ namespace AITraffic.Workers
         public float StartTime { get; private set; }
         public float CompletedTime { get; internal set; }
         public float IntermediateDwellExpireTime { get; internal set; }
+
+        // CRITICAL INVARIANT [WRK-12]: Non-blocking waypoint exit search state. Only WorkerManager mutates it; CancelTask and every terminal path must call ClearAdvanceSearch().
+        public System.Threading.Tasks.Task<RailPath> AdvancePathTask { get; internal set; }
+        public List<RailTrack> AdvanceCandidates { get; internal set; }
+        public int AdvanceCandidateIndex { get; internal set; }
+        internal int AdvanceLegIndex { get; set; }
+        internal RailTrack AdvanceOriginTrack { get; set; }
+        internal RailTrack AdvanceTargetTrack { get; set; }
+        internal bool AdvanceForward { get; set; }
+        internal bool AdvanceSpurPhase { get; set; }
+        internal bool AdvanceSpurResolved { get; set; }
+        internal bool AdvanceSpurAvailable { get; set; }
+        internal Junction AdvanceSpurSwitch { get; set; }
+        internal RailTrack AdvanceSpurStem { get; set; }
+        internal bool AdvanceSpurStemForward { get; set; }
+
+        internal void ClearAdvanceSearch()
+        {
+            AdvancePathTask = null;
+            AdvanceCandidates = null;
+            AdvanceCandidateIndex = 0;
+            AdvanceLegIndex = -1;
+            AdvanceOriginTrack = null;
+            AdvanceTargetTrack = null;
+            AdvanceForward = true;
+            AdvanceSpurPhase = false;
+            AdvanceSpurResolved = false;
+            AdvanceSpurAvailable = false;
+            AdvanceSpurSwitch = null;
+            AdvanceSpurStem = null;
+            AdvanceSpurStemForward = true;
+        }
         public Vector3 InitialWorldPosition { get; private set; }
         public AIEngineer Engineer { get; internal set; }
         public HaulTaskStatus Status { get; internal set; }

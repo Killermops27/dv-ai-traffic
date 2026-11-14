@@ -289,6 +289,13 @@ MANDATORY_INVARIANTS = [
         "graveyard_ref": "GRAVEYARD.md Section 1 [AIE-19]"
     },
     {
+        "tag": "AIE-20",
+        "description": "TerminusStop must unconditionally release and never re-lock junctions or track reservations",
+        "expected_files": ["Driver/AIEngineer.cs"],
+        "min_count": 1,
+        "graveyard_ref": "GRAVEYARD.md Section 1 [AIE-20]"
+    },
+    {
         "tag": "RGR-11",
         "description": "Per-Train SignalBlockInfo Instance Isolation in CalculateUpcomingSignalBlocks",
         "expected_files": ["Navigation/SignalRegistry.cs"],
@@ -1260,6 +1267,72 @@ def verify_v029_invariants(src_dir: Path) -> Tuple[bool, List[str]]:
     check_file("Workers/Radio/WorkerRadioStates.cs",
                ["RESUME AI DRIVING", "CO-PILOT"],
                [], "WRK-09")
+
+    # WRK-10: AIEngineer.cs — restored approach-staging surface (property, backing field, six methods)
+    check_file("Driver/AIEngineer.cs",
+               ["public bool IsWorkerApproachStaging",
+                "private bool _isWorkerApproachStaging",
+                "AuditWorkerApproachCongestion",
+                "ClearWorkerApproachStaging",
+                "IsWorkerStagingTrackBlocked",
+                "GetWorkerStagingLiveStopDistance",
+                "ComputeWorkerStagingStopDistance",
+                "TryAdoptWorkerAlternateArrivalTrack"],
+               [], "WRK-10")
+
+    # WRK-GATE-1: both reservation gates carry the D-GATE disjunct exactly once (D2/Q4: Count == 0 stays unconditional)
+    target_aie = src_dir / "Driver/AIEngineer.cs"
+    if target_aie.exists():
+        with open(target_aie, "r", encoding="utf-8", errors="replace") as f:
+            aie_text = f.read()
+        gate_token = "(!_hasClearedOriginYard && SignalRegistry.RequiresRouteReservation("
+        cnt_gate = aie_text.count(gate_token)
+        if cnt_gate != 2:
+            err = f"{red('[FAIL]')} AIEngineer.cs has {cnt_gate} occurrences of the D-GATE disjunct (expected exactly 2) [WRK-GATE-1]"
+            errors.append(err)
+            print(f"  {err}")
+        else:
+            print(f"  {green('[PASS]')} AIEngineer.cs gates A+B carry the D-GATE disjunct exactly 2x [WRK-GATE-1]")
+        if aie_text.count("_reservedDVSignals.Count == 0") < 2:
+            err = f"{red('[FAIL]')} AIEngineer.cs no longer keeps '_reservedDVSignals.Count == 0' unconditional in both gates [WRK-GATE-1]"
+            errors.append(err)
+            print(f"  {err}")
+        else:
+            print(f"  {green('[PASS]')} AIEngineer.cs keeps '_reservedDVSignals.Count == 0' unconditional in both gates [WRK-GATE-1]")
+        if "[WRK-10]" not in aie_text:
+            err = f"{red('[FAIL]')} AIEngineer.cs carries no '[WRK-10]' CRITICAL INVARIANT tag [WRK-10]"
+            errors.append(err)
+            print(f"  {err}")
+        else:
+            print(f"  {green('[PASS]')} AIEngineer.cs carries '[WRK-10]' CRITICAL INVARIANT tags [WRK-10]")
+        if "AccessTools.PropertyGetter(typeof(DV.Logic.Job.TrackID)" in aie_text:
+            err = f"{red('[FAIL]')} AIEngineer.cs reads TrackID via AccessTools.PropertyGetter (TrackID members are fields) [WRK-GATE-1]"
+            errors.append(err)
+            print(f"  {err}")
+        else:
+            print(f"  {green('[PASS]')} AIEngineer.cs avoids AccessTools.PropertyGetter on TrackID [WRK-GATE-1]")
+        cnt_wrk10 = aie_text.count("[WRK-10]")
+        if cnt_wrk10 < 7:
+            err = f"{red('[FAIL]')} AIEngineer.cs has only {cnt_wrk10} '[WRK-10]' tags (expected >= 7: one per CS-1..CS-7 anchor) [WRK-10]"
+            errors.append(err)
+            print(f"  {err}")
+        else:
+            print(f"  {green('[PASS]')} AIEngineer.cs tags every CS-1..CS-7 anchor ({cnt_wrk10} occurrences of '[WRK-10]') [WRK-10]")
+
+    # D4 TrackID field readers live in Pathfinder.cs (same reflection contract as [WRK-GATE-1])
+    check_file("Navigation/Pathfinder.cs",
+               ["CreateTrackIdFieldReader(\"trackType\")", "CreateTrackIdFieldReader(\"yardId\")", "s_trackTypeGetter(logicTrack.ID)", "s_trackYardIdGetter(logicTrack.ID)"],
+               ["AccessTools.PropertyGetter(typeof(DV.Logic.Job.TrackID)"], "WRK-GATE-1")
+
+    # WRK-GATE-2: Main.cs background-thread probe
+    check_file("Main.cs",
+               ["public static bool IsBackgroundThread"],
+               [], "WRK-GATE-2")
+
+    # WRK-GATE-3: SignalRegistry.cs balloon-loop detection (TrackBlock namespace + Initialize(force: false))
+    check_file("Navigation/SignalRegistry.cs",
+               ["using Signals.Game.Railway;", "Initialize(force: false)"],
+               ["EnsureInitialized()"], "WRK-GATE-3")
 
     # RGR-10: TrafficScheduler.cs
     target_sch = src_dir / "Core/TrafficScheduler.cs"
