@@ -281,6 +281,74 @@ namespace AITraffic.Driver
             return 0.4f; // Fallback to HeadlightsControlBase.NEUTRAL_VALUE
         }
 
+        // CRITICAL INVARIANT [FLT-14]: Native DV MultipleUnitModule propagates lead locomotive headlight settings across connected MU cables
+        // (inverting Front/Rear when coupled back-to-back) while HeadlightsSubControllerStandard.MUAllowsHeadlight() automatically extinguishes
+        // physical lamps on any coupler with an active MU cable. Never call HeadlightsFront/Rear.Set() directly on MU-connected trailing units,
+        // and evaluate attached cars beyond the contiguous MU-cabled locomotive group without spurious IsHoseConnected checks.
+        private bool IsLocoMUConnectedToLead(TrainCar targetCar)
+        {
+            if (Locomotive == null || targetCar == null || !targetCar.IsLoco) return false;
+            if (targetCar == Locomotive) return true;
+            if (Locomotive.muModule == null || targetCar.muModule == null) return false;
+
+            for (int dir = 0; dir < 2; dir++)
+            {
+                TrainCar curr = Locomotive;
+                bool checkFront = (dir == 0);
+                for (int step = 0; step < 16 && curr != null; step++)
+                {
+                    Coupler c = checkFront ? curr.frontCoupler : curr.rearCoupler;
+                    if (c == null || !c.IsCoupled()) break;
+                    Coupler other = c.GetCoupled();
+                    if (other == null || other.train == null) break;
+                    TrainCar nextCar = other.train;
+                    if (!nextCar.IsLoco || curr.muModule == null || nextCar.muModule == null) break;
+
+                    var cableA = c.isFrontCoupler ? curr.muModule.FrontCable : curr.muModule.RearCable;
+                    var cableB = other.isFrontCoupler ? nextCar.muModule.FrontCable : nextCar.muModule.RearCable;
+                    if (cableA == null || cableB == null || !cableA.IsConnected || !cableB.IsConnected) break;
+
+                    if (nextCar == targetCar) return true;
+                    curr = nextCar;
+                    checkFront = !other.isFrontCoupler;
+                }
+            }
+            return false;
+        }
+
+        private bool HasCarsBeyondMUGroup(bool startFront)
+        {
+            if (Locomotive == null) return false;
+            TrainCar curr = Locomotive;
+            bool checkFront = startFront;
+
+            for (int step = 0; step < 64 && curr != null; step++)
+            {
+                Coupler c = checkFront ? curr.frontCoupler : curr.rearCoupler;
+                if (c == null || !c.IsCoupled()) return false;
+                Coupler other = c.GetCoupled();
+                if (other == null || other.train == null) return false;
+                TrainCar nextCar = other.train;
+
+                bool muConnected = false;
+                if (curr.muModule != null && nextCar.IsLoco && nextCar.muModule != null)
+                {
+                    var cableA = c.isFrontCoupler ? curr.muModule.FrontCable : curr.muModule.RearCable;
+                    var cableB = other.isFrontCoupler ? nextCar.muModule.FrontCable : nextCar.muModule.RearCable;
+                    muConnected = (cableA != null && cableB != null && cableA.IsConnected && cableB.IsConnected);
+                }
+
+                if (!muConnected)
+                {
+                    return true;
+                }
+
+                curr = nextCar;
+                checkFront = !other.isFrontCoupler;
+            }
+            return false;
+        }
+
         private void UpdateForwardHeadlights(float desiredIntensity)
         {
             if (_controlsOverrider == null) return;
@@ -321,31 +389,10 @@ namespace AITraffic.Driver
 
             bool isForward = direction >= 0f;
 
-            // Physical coupler checks: determine if cars are physically coupled to the front or rear of this locomotive
-            bool frontHasCars = (Locomotive.frontCoupler != null &&
-                (Locomotive.frontCoupler.IsCoupled() || (Locomotive.frontCoupler.hoseAndCock != null && Locomotive.frontCoupler.hoseAndCock.IsHoseConnected)));
-
-            bool rearHasCars = (Locomotive.rearCoupler != null &&
-                (Locomotive.rearCoupler.IsCoupled() || (Locomotive.rearCoupler.hoseAndCock != null && Locomotive.rearCoupler.hoseAndCock.IsHoseConnected)));
-
-            // Additional trainset consistency check: if the trainset contains other cars, verify connection
-            if (Locomotive.trainset != null && Locomotive.trainset.cars != null && Locomotive.trainset.cars.Count > 1)
-            {
-                var cars = Locomotive.trainset.cars;
-                for (int i = 0; i < cars.Count; i++)
-                {
-                    var c = cars[i];
-                    if (c == null || c == Locomotive) continue;
-                    if (Locomotive.frontCoupler != null && Locomotive.frontCoupler.GetCoupled() != null && Locomotive.frontCoupler.GetCoupled().train == c)
-                    {
-                        frontHasCars = true;
-                    }
-                    if (Locomotive.rearCoupler != null && Locomotive.rearCoupler.GetCoupled() != null && Locomotive.rearCoupler.GetCoupled().train == c)
-                    {
-                        rearHasCars = true;
-                    }
-                }
-            }
+            // CRITICAL INVARIANT [FLT-14]: Evaluate coupled non-MU cars beyond the contiguous MU-cabled locomotive group
+            // without checking hoseAndCock.IsHoseConnected on uncoupled ends.
+            bool frontHasCars = HasCarsBeyondMUGroup(true);
+            bool rearHasCars = HasCarsBeyondMUGroup(false);
 
             float frontControlVal;
             float rearControlVal;
@@ -357,8 +404,8 @@ namespace AITraffic.Driver
                 frontControlVal = frontHasCars ? offValFront : desiredIntensity;
 
                 // Rear end is trailing:
-                // Taillight is ONLY on/red (0.0f) when there aren't any cars attached behind this locomotive
-                // (e.g. solo light engine or locomotive at the rear of the train).
+                // Taillight is ONLY on/red (0.0f) when there aren't any non-MU cars attached behind the MU locomotive group
+                // (e.g. solo light engine, MU light-engine lashup, or locomotive at the rear of the train).
                 // If consist has cars attached behind, rear headlights are strictly turned OFF (offValRear = 0.4f).
                 rearControlVal = rearHasCars ? offValRear : 0.0f;
             }
@@ -369,7 +416,7 @@ namespace AITraffic.Driver
                 rearControlVal = rearHasCars ? offValRear : desiredIntensity;
 
                 // Front end is trailing:
-                // Taillight is ONLY on/red (0.0f) when there aren't any cars attached in front of this locomotive.
+                // Taillight is ONLY on/red (0.0f) when there aren't any non-MU cars attached in front of the MU locomotive group.
                 // If consist has cars attached in front, front headlights are strictly turned OFF (offValFront = 0.4f).
                 frontControlVal = frontHasCars ? offValFront : 0.0f;
             }
@@ -444,7 +491,8 @@ namespace AITraffic.Driver
                     if (c != null && c != rearCar)
                     {
                         ConsistEOTMarker.RemoveFromCar(c);
-                        if (IsPassengerCar(c) || c.IsLoco)
+                        // CRITICAL INVARIANT [FLT-14]: Never call ExtinguishRearCarNativeLights on trailing locomotives MU-connected to the lead unit.
+                        if (IsPassengerCar(c) || (c.IsLoco && !IsLocoMUConnectedToLead(c)))
                         {
                             ExtinguishRearCarNativeLights(c);
                         }
@@ -584,9 +632,9 @@ namespace AITraffic.Driver
         {
             if (car == null) return;
 
-            // If the rear car is the lead locomotive itself, UpdateForwardHeadlights already
-            // handles its direction-aware headlights and uncoupled taillights.
-            if (car == Locomotive) return;
+            // CRITICAL INVARIANT [FLT-14]: If the rear car is the lead locomotive itself or is MU-connected to the lead locomotive,
+            // UpdateForwardHeadlights and native DV MU cable propagation already govern its outer marker lights.
+            if (car == Locomotive || IsLocoMUConnectedToLead(car)) return;
 
             if (car.SimController != null && car.SimController.controlsOverrider != null)
             {
@@ -620,8 +668,9 @@ namespace AITraffic.Driver
         {
             if (car == null) return;
 
-            // Turn off locomotive lights if trailing
-            if (car.IsLoco && car != Locomotive && car.SimController != null && car.SimController.controlsOverrider != null)
+            // CRITICAL INVARIANT [FLT-14]: Turn off trailing locomotive lights only if NOT MU-connected to the lead locomotive;
+            // calling Set() on an MU-connected trailing unit transmits an MU override back to the lead locomotive.
+            if (car.IsLoco && car != Locomotive && !IsLocoMUConnectedToLead(car) && car.SimController != null && car.SimController.controlsOverrider != null)
             {
                 var overrider = car.SimController.controlsOverrider;
                 if (overrider.HeadlightsFront != null) overrider.HeadlightsFront.Set(GetOffControlValue(car, true));

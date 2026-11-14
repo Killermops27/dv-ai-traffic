@@ -776,17 +776,6 @@ namespace AITraffic.Workers
             // Ensure couplers connected and angle cocks open across all consist cars
             TrainSpawner.ConfigureConsistCouplers(consist);
 
-            // Connect Multiple Unit (MU) cables between all adjacent MU-capable locomotives/slugs
-            for (int i = 0; i < consist.Count - 1; i++)
-            {
-                var carA = consist[i];
-                var carB = consist[i + 1];
-                if (carA != null && carB != null && carA.IsMultipleUnit && carB.IsMultipleUnit)
-                {
-                    TrainSpawner.ConnectMUCablesBetween(carA, carB);
-                }
-            }
-
             // Release handbrakes across the entire consist
             for (int i = 0; i < consist.Count; i++)
             {
@@ -817,29 +806,37 @@ namespace AITraffic.Workers
                 }
             }
 
-            // Traverse all locomotives in the consist:
-            // Start trailing engines and ensure trailing locomotives have BrakeCutout.Set(0f) and IndependentBrake.Set(0f)
+            // CRITICAL INVARIANT [FLT-14]: Initialize trailing helper locomotives BEFORE connecting MU cables and BEFORE initializing leadLoco
+            // so trailing headlight/brake/reverser resets never back-propagate over MU cables and extinguish leadLoco headlights.
             for (int i = 0; i < consist.Count; i++)
             {
                 var car = consist[i];
-                if (car != null && car.IsLoco)
+                if (car != null && car.IsLoco && car != leadLoco)
                 {
-                    bool isLead = (car == leadLoco);
-                    TrainSpawner.InitializeLocomotive(car, isLead);
-
-                    if (!isLead)
+                    TrainSpawner.InitializeLocomotive(car, false);
+                    var locoControls = (car.SimController != null) ? car.SimController.controlsOverrider : car.GetComponent<BaseControlsOverrider>();
+                    if (locoControls != null)
                     {
-                        var locoControls = (car.SimController != null) ? car.SimController.controlsOverrider : car.GetComponent<BaseControlsOverrider>();
-                        if (locoControls != null)
-                        {
-                            if (locoControls.BrakeCutout != null) locoControls.BrakeCutout.Set(0f);
-                            if (locoControls.IndependentBrake != null) locoControls.IndependentBrake.Set(0f);
-                            if (locoControls.Brake != null) locoControls.Brake.Set(0f);
-                            if (locoControls.Handbrake != null) locoControls.Handbrake.Set(0f);
-                        }
+                        if (locoControls.BrakeCutout != null) locoControls.BrakeCutout.Set(0f);
+                        if (locoControls.IndependentBrake != null) locoControls.IndependentBrake.Set(0f);
+                        if (locoControls.Handbrake != null) locoControls.Handbrake.Set(0f);
                     }
                 }
             }
+
+            // Connect Multiple Unit (MU) cables between all adjacent MU-capable locomotives/slugs
+            for (int i = 0; i < consist.Count - 1; i++)
+            {
+                var carA = consist[i];
+                var carB = consist[i + 1];
+                if (carA != null && carB != null && carA.IsMultipleUnit && carB.IsMultipleUnit)
+                {
+                    TrainSpawner.ConnectMUCablesBetween(carA, carB);
+                }
+            }
+
+            // Initialize lead locomotive after MU cables are connected so lead settings propagate authoritatively to helpers
+            TrainSpawner.InitializeLocomotive(leadLoco, true);
 
             // 8. Attach and initialize AIEngineer
             var engineer = leadLoco.gameObject.GetComponent<AIEngineer>();
@@ -866,6 +863,13 @@ namespace AITraffic.Workers
             else
             {
                 engineer.SetLockedPullingReverser(pullingReverser);
+            }
+
+            // Re-evaluate lead locomotive lighting immediately after pullingReverser is locked on the engineer
+            var leadLighting = AILocomotiveLighting.GetOrCreate(leadLoco, engineer);
+            if (leadLighting != null)
+            {
+                leadLighting.UpdateLightingInstant();
             }
 
             // Hook terminus arrival event

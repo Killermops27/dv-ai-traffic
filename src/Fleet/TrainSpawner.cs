@@ -918,16 +918,21 @@ namespace AITraffic.Fleet
             // Yield 1 frame before heavy loco init (SimController port discovery, brake system init, engine startup)
             yield return null;
 
-            // Initialize locomotives (startup prime movers, reverser, lights), staggered 1 loco per frame
+            // CRITICAL INVARIANT [FLT-14]: Initialize trailing helper units BEFORE the lead locomotive so trailing lever setups
+            // never back-propagate across connected MU cables and overwrite the lead locomotive's headlight or brake settings.
             for (int i = 0; i < spawnedCars.Count; i++)
             {
                 var car = spawnedCars[i];
-                if (car != null && car.IsLoco)
+                if (car != null && car.IsLoco && car != leadLoco)
                 {
-                    bool isLead = (car == leadLoco);
-                    InitializeLocomotive(car, isLead);
+                    InitializeLocomotive(car, false);
                     yield return null;
                 }
+            }
+            if (leadLoco != null)
+            {
+                InitializeLocomotive(leadLoco, true);
+                yield return null;
             }
 
             // Yield 1 frame for SimController to settle before AIEngineer component initialization
@@ -1539,12 +1544,21 @@ namespace AITraffic.Fleet
                         // Trailing helper units: cut out brake valve, release independent/train/hand brakes
                         if (controls.BrakeCutout != null) controls.BrakeCutout.Set(0f);
                         if (controls.IndependentBrake != null) controls.IndependentBrake.Set(0f);
-                        if (controls.Brake != null) controls.Brake.Set(0f);
                         if (controls.Handbrake != null) controls.Handbrake.Set(0f);
                         if (controls.DynamicBrake != null) controls.DynamicBrake.Set(0f);
-                        if (controls.Reverser != null) controls.Reverser.Set(1f);
-                        if (controls.HeadlightsFront != null) controls.HeadlightsFront.Set(0.4f); // Off (neutral)
-                        if (controls.HeadlightsRear != null) controls.HeadlightsRear.Set(0.4f); // Off (neutral)
+                        // CRITICAL INVARIANT [FLT-14]: If this trailing unit already has an active MU cable connected,
+                        // do not call Brake.Set(0f), Reverser.Set(1f), or HeadlightsFront/Rear.Set(0.4f) directly on its overrider,
+                        // as native MultipleUnitModule immediately transmits those values across the MU cable and overwrites the lead locomotive.
+                        bool hasMUCableConnected = (loco.muModule != null &&
+                            ((loco.muModule.FrontCable != null && loco.muModule.FrontCable.IsConnected) ||
+                             (loco.muModule.RearCable != null && loco.muModule.RearCable.IsConnected)));
+                        if (!hasMUCableConnected)
+                        {
+                            if (controls.Brake != null) controls.Brake.Set(0f);
+                            if (controls.Reverser != null) controls.Reverser.Set(1f);
+                            if (controls.HeadlightsFront != null) controls.HeadlightsFront.Set(0.4f); // Off (neutral)
+                            if (controls.HeadlightsRear != null) controls.HeadlightsRear.Set(0.4f); // Off (neutral)
+                        }
                     }
 
                     // Ensure engine starter was primed if not already on
