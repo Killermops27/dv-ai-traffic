@@ -184,6 +184,14 @@ namespace AITraffic.Navigation
                     return true;
                 }
 
+                // A train waiting for a single-track corridor token can't pass this junction yet; throwing it would only
+                // set it against a train that can (switch flip-flop).
+                var waitingEng = requester as AITraffic.Driver.AIEngineer;
+                if (waitingEng != null && waitingEng.IsWaitingForCorridorToken)
+                {
+                    return false;
+                }
+
                 // 1. Strict Physical Occupancy Safety Interlock: NEVER throw a switch under rolling stock!
                 Trainset requesterTrainset = GetTrainsetFromRequester(requester);
                 TrainCar occupyingCar;
@@ -297,6 +305,10 @@ namespace AITraffic.Navigation
         public bool TryLockJunction(Junction junction, object requester, float timeoutSeconds = 30f)
         {
             if (junction == null || requester == null) return false;
+
+            // A train waiting for a single-track corridor token can't pass this junction yet; don't let it hold one.
+            var waitingEng = requester as AITraffic.Driver.AIEngineer;
+            if (waitingEng != null && waitingEng.IsWaitingForCorridorToken) return false;
 
             lock (_lock)
             {
@@ -836,6 +848,16 @@ namespace AITraffic.Navigation
             if (holderEng.CurrentSpeedKmh >= 1.5f && holderEng.ShouldProtectJunctionLock(junction))
             {
                 return false;
+            }
+
+            // 0. A train waiting for a single-track corridor token can't use the junction: it never preempts, and a lock it
+            //    holds yields to a train that can proceed. Otherwise a higher-priority waiting train keeps taking the
+            //    junction back, throwing the switch against a train with a clear run (flip-flop at single-track merges).
+            bool reqWaiting = reqEng.IsWaitingForCorridorToken;
+            bool holderWaiting = holderEng.IsWaitingForCorridorToken;
+            if (reqWaiting != holderWaiting)
+            {
+                return holderWaiting;
             }
 
             // 1. Direct DVSignals track reservation on any branch of this junction
