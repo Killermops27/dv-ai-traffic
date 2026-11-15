@@ -612,6 +612,21 @@ namespace AITraffic.Navigation
             return true;
         }
 
+        /// <summary>True if <paramref name="signal"/> (or the parent of one of its heads) stands on <paramref name="track"/>.</summary>
+        public static bool IsSignalOnTrack(RailTrack track, DVSignal signal)
+        {
+            if (track == null || signal == null) return false;
+            DVSignal root = signal.Parent ?? signal;
+            if (!s_trackSignals.TryGetValue(track, out var list) || list == null) return false;
+            for (int i = 0; i < list.Count; i++)
+            {
+                DVSignal s = list[i];
+                if (s == null) continue;
+                if ((s.Parent ?? s) == root) return true;
+            }
+            return false;
+        }
+
         /// <summary>
         /// Checks whether a DVSignals signal is a pure distant signal (Vorsignal) or repeater.
         /// Pure distant signals do not command stops at their own mast, but give advance warning of downstream restrictions.

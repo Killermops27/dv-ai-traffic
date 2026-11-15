@@ -499,6 +499,11 @@ namespace AITraffic.Driver
 
 		public bool HasArrivedAtDestination { get; private set; }
 
+		/// <summary>True while the train is held waiting to acquire a single-track corridor token (it cannot move on).</summary>
+		public bool IsWaitingForCorridorToken =>
+			_isHoldingForCorridor && _corridorHoldReason != null &&
+			_corridorHoldReason.IndexOf("corridor token", StringComparison.OrdinalIgnoreCase) >= 0;
+
 		public bool IsShuntingMode
 		{
 			get
@@ -1391,6 +1396,7 @@ namespace AITraffic.Driver
 
 		private void OnDestroy()
 		{
+			ReleaseDestinationTrackReservation();
 			try
 			{
 				if (_trainCar != null)
@@ -1466,6 +1472,230 @@ namespace AITraffic.Driver
 			catch
 			{
 			}
+		}
+
+		/// <summary>
+		/// Reserve a DV Signals signal for this train's route. A train that has arrived at its terminus won't move again,
+		/// so it must not take a new route: EnterTerminusStop releases its reservations, but UpdatePathAndJunctions keeps
+		/// running in TerminusStop and would otherwise re-reserve the signal ahead (typically the exit signal at the far
+		/// end of the terminus track), locking the station's exit for as long as the train stands there.
+		/// </summary>
+		private bool TryReserveRouteSignal(Signals.Game.Signal signal)
+		{
+			if (State == EngineState.TerminusStop)
+			{
+				return false;
+			}
+			if (IsSignalBeyondTerminus(signal))
+			{
+				return false;
+			}
+			return SignalRegistry.TryReserveDVSignal(signal);
+		}
+
+		/// <summary>
+		/// On a terminus run, a signal standing on the destination track (and nowhere earlier on the path) only governs
+		/// leaving that track - typically its exit signal - so it is never part of this train's route. Reserving it
+		/// locks the station's exit for nothing. The path runs along the whole destination track, past that signal, and
+		/// DistanceToDestination isn't measured to the actual stopping point, so neither a path nor a distance check
+		/// excludes it. Left unreserved it may show stop; it stands at the stopping point, so the train arrives there
+		/// (within the arrival window) before any stopped-at-red fallback can start.
+		/// </summary>
+		private bool IsSignalBeyondTerminus(Signals.Game.Signal signal)
+		{
+			if (signal == null || !IsTerminusDestination || CurrentPath == null || CurrentPath.Tracks == null || CurrentPath.Tracks.Count < 2)
+			{
+				return false;
+			}
+			int last = CurrentPath.Tracks.Count - 1;
+			if (!SignalRegistry.IsSignalOnTrack(CurrentPath.Tracks[last], signal))
+			{
+				return false;
+			}
+			for (int i = 0; i < last; i++)
+			{
+				if (SignalRegistry.IsSignalOnTrack(CurrentPath.Tracks[i], signal))
+				{
+					return false;
+				}
+			}
+			return true;
+		}
+
+		private RailTrack _destinationRailChecked;
+		private DV.Logic.Job.Track _destinationYardTrack;
+		private float _destinationYardReserved;
+
+		/// <summary>
+		/// While heading for a station/terminus track, reserve the train's length on it in the base game's
+		/// YardTracksOrganizer. TrafficScheduler checks the destination is free when choosing it, but nothing stopped a job
+		/// generator (vanilla or e.g. PersistentJobsMod) from spawning cars there afterwards; the train then stopped short
+		/// behind them (#15 describes the same lock-up). Every generator picks tracks via the organizer's free space, so a
+		/// reservation keeps them off it. Released on arrival (the train then occupies the track itself), on a new
+		/// destination, and when the engineer is destroyed.
+		/// </summary>
+		private void SyncDestinationTrackReservation()
+		{
+			RailTrack wanted = null;
+			if ((IsTerminusDestination || IsStationDestination) && !HasArrivedAtDestination && State != EngineState.TerminusStop && State != EngineState.StationHold
+				&& CurrentPath != null && CurrentPath.Tracks != null && CurrentPath.Tracks.Count > 0)
+			{
+				wanted = CurrentPath.Tracks[CurrentPath.Tracks.Count - 1];
+			}
+			if (wanted == _destinationRailChecked)
+			{
+				return;
+			}
+			_destinationRailChecked = wanted;
+			ReleaseDestinationTrackReservation();
+			YardTracksOrganizer yto = SingletonBehaviour<YardTracksOrganizer>.Instance;
+			DV.Logic.Job.Track logic = (wanted != null) ? wanted.LogicTrack() : null;
+			if (yto == null || logic == null || !yto.IsTrackManagedByOrganizer(logic))
+			{
+				return;
+			}
+			float length = 0f;
+			if (_trainCar != null && _trainCar.trainset != null && _trainCar.trainset.cars != null)
+			{
+				for (int i = 0; i < _trainCar.trainset.cars.Count; i++)
+				{
+					TrainCar car = _trainCar.trainset.cars[i];
+					if (car != null && car.logicCar != null)
+					{
+						length += car.logicCar.length;
+					}
+				}
+			}
+			float amount = Mathf.Min(length, (float)yto.GetFreeSpaceOnTrack(logic));
+			if (amount <= 0f)
+			{
+				return;
+			}
+			yto.ReserveSpace(logic, amount, false);
+			_destinationYardTrack = logic;
+			_destinationYardReserved = amount;
+		}
+
+		private void ReleaseDestinationTrackReservation()
+		{
+			if (_destinationYardTrack == null)
+			{
+				return;
+			}
+			YardTracksOrganizer yto = SingletonBehaviour<YardTracksOrganizer>.Instance;
+			if (yto != null && yto.IsTrackManagedByOrganizer(_destinationYardTrack))
+			{
+				yto.ReleaseReservedSpace(_destinationYardTrack, _destinationYardReserved);
+			}
+			_destinationYardTrack = null;
+			_destinationYardReserved = 0f;
+		}
+
+		/// <summary>
+		/// The signal that should actually be reserved when the route logic asks for <paramref name="requested"/>.
+		///
+		/// In DV Signals a main signal's block runs through shunting signals up to the next main signal
+		/// (TrackBlock.CreateUntilMainSignal), and TrackReserver rejects a main reservation if any track in its block is
+		/// reserved by another controller. Reserving a shunting signal that lies inside the block of a main signal the
+		/// train hasn't passed yet therefore makes that main signal (typically the station entry signal) show stop for the
+		/// very train that reserved it - a permanent hold (GitHub #18 describes the same pattern).
+		///
+		/// So when a shunting signal has a DV main signal before it on the route, reserve that main signal instead (its
+		/// block covers the shunting signal), provided its whole block lies on our path - a reservation re-aligns the
+		/// block's switches on every update. Otherwise reserve nothing yet. Once the train has passed the main signal the
+		/// shunting signal resolves to itself and is reserved normally. Self-acting-distant main signals count here even
+		/// though SignalRegistry.IsGoverningSignal excludes them; the substitute goes into _reservedDVSignals and the
+		/// desired set like any other route signal, so the normal release logic frees it once passed.
+		/// </summary>
+		private Signals.Game.Signal ResolveRouteSignalToReserve(Signals.Game.Signal requested)
+		{
+			if (requested == null || _isShuntingMode || _upcomingSignals == null)
+			{
+				return requested;
+			}
+			Signals.Game.Signal shunting = (requested.Parent != null) ? requested.Parent : requested;
+			if (!shunting.IsShunting)
+			{
+				return requested;
+			}
+			Signals.Game.Signal mainBefore = null;
+			bool found = false;
+			for (int i = 0; i < _upcomingSignals.Count; i++)
+			{
+				Signals.Game.Signal s = _upcomingSignals[i].Signal;
+				if (s == null) continue;
+				if (s.Parent != null) s = s.Parent;
+				if (s == shunting)
+				{
+					found = true;
+					break;
+				}
+				if (IsBlockMainSignal(s))
+				{
+					mainBefore = s;
+				}
+			}
+			if (!found || mainBefore == null)
+			{
+				return requested;
+			}
+			return IsSignalBlockOnPath(mainBefore) ? mainBefore : null;
+		}
+
+		/// <summary>A signal that ends a main signal's block in DV Signals (TrackWalker.HasMainSignal), excluding distant/repeater heads.</summary>
+		private static bool IsBlockMainSignal(Signals.Game.Signal s)
+		{
+			if (s == null || s.IsShunting || s.Controller == null)
+			{
+				return false;
+			}
+			SignalType type = s.Controller.Type;
+			return type != SignalType.Shunting && type != SignalType.Spacing && type != SignalType.Distant && type != SignalType.Repeater;
+		}
+
+		private readonly HashSet<RailTrack> _pathTrackScratch = new HashSet<RailTrack>();
+
+		/// <summary>Every track of <paramref name="s"/>'s block (as currently aligned) is on our path.</summary>
+		private bool IsSignalBlockOnPath(Signals.Game.Signal s)
+		{
+			if (CurrentPath == null || CurrentPath.Tracks == null || CurrentPath.Tracks.Count == 0 || s.Controller == null)
+			{
+				return false;
+			}
+			s.Controller.UpdateBlocks();
+			TrackInfo[] blockTracks = (s.Block != null) ? s.Block.Tracks : null;
+			if (blockTracks == null || blockTracks.Length == 0)
+			{
+				return false;
+			}
+			HashSet<RailTrack> onPath = _pathTrackScratch;
+			onPath.Clear();
+			onPath.UnionWith(CurrentPath.Tracks);
+			for (int i = 0; i < blockTracks.Length; i++)
+			{
+				if (blockTracks[i].Track == null || !onPath.Contains(blockTracks[i].Track))
+				{
+					return false;
+				}
+			}
+			return true;
+		}
+
+		/// <summary>Reserve the signal the route logic asked for, resolved via ResolveRouteSignalToReserve, and record it.</summary>
+		private bool TryReserveResolvedRouteSignal(Signals.Game.Signal requested)
+		{
+			Signals.Game.Signal target = ResolveRouteSignalToReserve(requested);
+			if (target == null || !TryReserveRouteSignal(target))
+			{
+				return false;
+			}
+			DebouncedWakeAndForceUpdateSignal(target);
+			Signals.Game.Signal root = (target.Parent != null) ? target.Parent : target;
+			if (!_reservedDVSignals.Contains(root))
+			{
+				_reservedDVSignals.Add(root);
+			}
+			return true;
 		}
 
 		public void ReleaseAllSignalReservations()
@@ -1590,10 +1820,12 @@ namespace AITraffic.Driver
 				return;
 			}
 			UpdatePathAndJunctions(deltaTime);
+			SyncDestinationTrackReservation();
 			if (!(_trainCar == null))
 			{
 				UpdateSensors(deltaTime);
 				UpdateSingleTrackCorridorProtection(deltaTime);
+				ReleaseCorridorReservationsBehindTrain();
 				UpdateWheelTractionAndSlideProtection(deltaTime);
 				UpdatePowertrainProtection(deltaTime);
 				UpdateLevelCrossingHorn(deltaTime);
@@ -2168,6 +2400,17 @@ namespace AITraffic.Driver
 				_obstacleWaitTimer = 0f;
 			}
 			Signals.Game.Signal signal = ((GoverningSignal != null && DistanceToGoverningSignal < 350f) ? GoverningSignal : ApproachingSignal);
+			// Self-acting-distant block signals are not "governing", but the speed profile still stops the train at them.
+			// When such a signal is the nearer one and shows stop, use it here, otherwise the stopped-at-red fallbacks
+			// (shunting mode, red-signal / shunting detour) never start and a train stopped in front of a block occupied by
+			// something that never moves waits for the emergency despawn (e.g. block signal at Hp 0 at 45 m while the
+			// governing shunting signal 150 m on shows CLEAR).
+			if (ApproachingSignal != null && ApproachingSignal != signal && DistanceToSignal < 350f && !SignalRegistry.IsDistantSignal(ApproachingSignal)
+				&& (signal != GoverningSignal || DistanceToSignal < DistanceToGoverningSignal)
+				&& ApproachingSignal.CurrentAspect != null && ApproachingSignal.CurrentAspect.DisallowPassing)
+			{
+				signal = ApproachingSignal;
+			}
 			float num6 = ((signal == GoverningSignal) ? DistanceToGoverningSignal : DistanceToSignal);
 			Signals.Game.Signal signal3;
 			if (railTrack != null && signal != null && num6 < 350f)
@@ -2254,15 +2497,7 @@ namespace AITraffic.Driver
 							_signalWaitRetryTimer = 5f;
 							if (!(CurrentSpeedKmh < 1.5f) || !(DistanceToObstacle < 150f))
 							{
-								if (SignalRegistry.TryReserveDVSignal(signal))
-								{
-									DebouncedWakeAndForceUpdateSignal(signal);
-									Signals.Game.Signal signal4 = ((signal != null && signal.Parent != null) ? signal.Parent : signal);
-									if (signal4 != null && !_reservedDVSignals.Contains(signal4))
-									{
-										_reservedDVSignals.Add(signal4);
-									}
-								}
+								TryReserveResolvedRouteSignal(signal);
 							}
 							else if (signal != null)
 							{
@@ -2875,15 +3110,7 @@ namespace AITraffic.Driver
 					{
 						Main.ModEntry.Logger.Log(string.Format("[AITraffic] Train '{0}' held at Entry Signal '{1}' with Hp 0. Purged downstream reservations ({2} signals). Retrying Entry Signal...", LocoId, SignalRegistry.GetSignalName(signal5), hashSet.Count + num29));
 					}
-					if (SignalRegistry.TryReserveDVSignal(signal5))
-					{
-						DebouncedWakeAndForceUpdateSignal(signal5);
-						Signals.Game.Signal signal7 = ((signal5 != null && signal5.Parent != null) ? signal5.Parent : signal5);
-						if (signal7 != null && !_reservedDVSignals.Contains(signal7))
-						{
-							_reservedDVSignals.Add(signal7);
-						}
-					}
+					TryReserveResolvedRouteSignal(signal5);
 					if (signal5.IsOn && signal5.CurrentAspect != null)
 					{
 						flag11 = signal5.CurrentAspect.DisallowPassing;
@@ -2904,15 +3131,7 @@ namespace AITraffic.Driver
 				}
 				else if (signal5 != null)
 				{
-					if (SignalRegistry.TryReserveDVSignal(signal5))
-					{
-						DebouncedWakeAndForceUpdateSignal(signal5);
-						Signals.Game.Signal signal7 = ((signal5 != null && signal5.Parent != null) ? signal5.Parent : signal5);
-						if (signal7 != null && !_reservedDVSignals.Contains(signal7))
-						{
-							_reservedDVSignals.Add(signal7);
-						}
-					}
+					TryReserveResolvedRouteSignal(signal5);
 					if (signal5.IsOn && signal5.CurrentAspect != null)
 					{
 						flag11 = signal5.CurrentAspect.DisallowPassing;
@@ -3064,6 +3283,7 @@ namespace AITraffic.Driver
 						desiredSignalReservationsScratch.Add(signal7);
 					}
 				}
+				signal9 = ResolveRouteSignalToReserve(signal9);
 				if (signal9 != null)
 				{
 					desiredSignalReservationsScratch.Add(signal9);
@@ -3105,7 +3325,7 @@ namespace AITraffic.Driver
 					_reservedDVSignals.Remove(_yieldGoverningSignal);
 				}
 			}
-			if (_playerYieldWaitTimer <= 0f && signal9 != null && !_reservedDVSignals.Contains(signal9) && SignalRegistry.TryReserveDVSignal(signal9))
+			if (_playerYieldWaitTimer <= 0f && signal9 != null && !_reservedDVSignals.Contains(signal9) && TryReserveRouteSignal(signal9))
 			{
 				DebouncedWakeAndForceUpdateSignal(signal9);
 				_reservedDVSignals.Add(signal9);
@@ -4929,6 +5149,95 @@ namespace AITraffic.Driver
 				_reservedTracks.Remove(activeCorridorTrack);
 			}
 			_activeCorridorTracks.Clear();
+		}
+
+		private readonly HashSet<RailTrack> _corridorKeepScratch = new HashSet<RailTrack>();
+		private readonly List<RailTrack> _corridorStaleScratch = new List<RailTrack>();
+
+		/// <summary>
+		/// Release single-track corridor reservations the train has left behind.
+		///
+		/// UpdateSingleTrackCorridorProtection only calls ReleaseActiveCorridorToken() when no car is on an active corridor
+		/// track AND there is no single-track corridor anywhere ahead on the path (scanned up to 15 km), and returns early
+		/// without releasing when the corridor cache is empty. On a long route the second condition is rarely true, so
+		/// every corridor passed stays reserved (track reservations + token) behind the train. Other trains then hold for
+		/// track that is already free: "Opposing AI train in corridor", and - for worker trains, whose reservations hold
+		/// every AI train regardless of direction - "Player worker train in corridor ahead", until the ambient train is
+		/// emergency-despawned.
+		///
+		/// Keep only tracks in the corridor ahead and tracks under the train; release the rest, and release the tokens of
+		/// corridors the train has completely left. A corridor the train is still in keeps its token.
+		/// </summary>
+		private void ReleaseCorridorReservationsBehindTrain()
+		{
+			if (_activeCorridorTracks.Count == 0 || _reverseProtocolStage != SingleTrackReverseStage.None)
+			{
+				return;
+			}
+			RailGraph graph = RailGraph.Instance;
+			if (graph == null || !graph.IsInitialized)
+			{
+				return;
+			}
+			HashSet<RailTrack> keep = _corridorKeepScratch;
+			keep.Clear();
+			keep.UnionWith(_corridorTracksCache);
+			if (_trainCar != null && _trainCar.trainset != null && _trainCar.trainset.cars != null)
+			{
+				List<TrainCar> cars = _trainCar.trainset.cars;
+				for (int i = 0; i < cars.Count; i++)
+				{
+					TrainCar car = cars[i];
+					if (car == null) continue;
+					if (car.FrontBogie != null && car.FrontBogie.track != null) keep.Add(car.FrontBogie.track);
+					if (car.RearBogie != null && car.RearBogie.track != null) keep.Add(car.RearBogie.track);
+				}
+			}
+			List<RailTrack> stale = _corridorStaleScratch;
+			stale.Clear();
+			foreach (RailTrack track in _activeCorridorTracks)
+			{
+				if (track != null && !keep.Contains(track))
+				{
+					stale.Add(track);
+				}
+			}
+			if (stale.Count == 0)
+			{
+				return;
+			}
+			for (int i = 0; i < stale.Count; i++)
+			{
+				RailTrack track = stale[i];
+				_activeCorridorTracks.Remove(track);
+				if (_desiredReservationsScratch.Contains(track))
+				{
+					continue; // still wanted for an upcoming signal block; released by the block logic later
+				}
+				graph.ReleaseTrackReservation(track, this);
+				_reservedTracks.Remove(track);
+			}
+			List<string> heldTokens = graph.GetCorridorTokensHeldBy(this);
+			for (int i = 0; i < heldTokens.Count; i++)
+			{
+				List<RailTrack> corridorTracks = graph.GetTracksForCorridor(heldTokens[i]);
+				bool stillInOrAhead = false;
+				if (corridorTracks != null)
+				{
+					for (int t = 0; t < corridorTracks.Count; t++)
+					{
+						if (corridorTracks[t] != null && keep.Contains(corridorTracks[t]))
+						{
+							stillInOrAhead = true;
+							break;
+						}
+					}
+				}
+				if (!stillInOrAhead)
+				{
+					graph.ReleaseCorridorToken(heldTokens[i], this);
+				}
+			}
 		}
 
 		private bool FindNearestTrailingSiding(out Junction trailingSwitch, out byte sidingBranch, out RailTrack sidingTrack, out byte mainlineBranch)
@@ -7049,15 +7358,20 @@ namespace AITraffic.Driver
 				}
 			}
 			bool flag2 = false;
+			// The speed profile brings the train to 0 km/h StopBufferDistance (20 m) before the stop, and obstacle braking
+			// targets 25 m before the obstacle plus the same buffer (~45 m). The arrival windows must cover those stopping
+			// points, otherwise a train that has stopped for good never enters TerminusStop / StationHold.
+			const float arrivalTolerance = SpeedProfileGenerator.StopBufferDistance + 8f;
+			const float obstacleArrivalWindow = 25f + SpeedProfileGenerator.StopBufferDistance + 5f;
 			if ((IsStationDestination || IsTerminusDestination) && CurrentSpeedKmh < 0.5f && StationaryTimer >= 2f)
 			{
-				if (DistanceToDestination <= 12f)
+				if (DistanceToDestination <= arrivalTolerance)
 				{
 					flag2 = true;
 				}
 				else if (flag)
 				{
-					bool flag3 = DistanceToObstacle < 35f;
+					bool flag3 = DistanceToObstacle < obstacleArrivalWindow;
 					bool flag4 = DistanceToDestination <= 35f;
 					bool flag5 = false;
 					TrainCar trainCar = ((_trainCar != null && _trainCar.trainset != null && _trainCar.trainset.cars != null && _trainCar.trainset.cars.Count > 0) ? _trainCar.trainset.cars[_trainCar.trainset.cars.Count - 1] : _trainCar);

@@ -2582,6 +2582,24 @@ namespace AITraffic.Navigation
         /// <summary>
         /// Releases all corridor tokens held by the specified train.
         /// </summary>
+        /// <summary>Ids of the corridor tokens currently held by <paramref name="train"/>.</summary>
+        public List<string> GetCorridorTokensHeldBy(object train)
+        {
+            var result = new List<string>();
+            if (train == null) return result;
+            lock (_corridorLock)
+            {
+                foreach (var kvp in _corridorTokenHolders)
+                {
+                    if (kvp.Value == train)
+                    {
+                        result.Add(kvp.Key);
+                    }
+                }
+            }
+            return result;
+        }
+
         public void ReleaseAllCorridorTokensFor(object train)
         {
             if (train == null) return;
