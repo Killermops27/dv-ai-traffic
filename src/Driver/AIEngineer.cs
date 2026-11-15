@@ -1391,6 +1391,7 @@ namespace AITraffic.Driver
 
 		private void OnDestroy()
 		{
+			ReleaseDestinationTrackReservation();
 			try
 			{
 				if (_trainCar != null)
@@ -1516,6 +1517,75 @@ namespace AITraffic.Driver
 			return true;
 		}
 
+		private RailTrack _destinationRailChecked;
+		private DV.Logic.Job.Track _destinationYardTrack;
+		private float _destinationYardReserved;
+
+		/// <summary>
+		/// While heading for a station/terminus track, reserve the train's length on it in the base game's
+		/// YardTracksOrganizer. TrafficScheduler checks the destination is free when choosing it, but nothing stopped a job
+		/// generator (vanilla or e.g. PersistentJobsMod) from spawning cars there afterwards; the train then stopped short
+		/// behind them (#15 describes the same lock-up). Every generator picks tracks via the organizer's free space, so a
+		/// reservation keeps them off it. Released on arrival (the train then occupies the track itself), on a new
+		/// destination, and when the engineer is destroyed.
+		/// </summary>
+		private void SyncDestinationTrackReservation()
+		{
+			RailTrack wanted = null;
+			if ((IsTerminusDestination || IsStationDestination) && !HasArrivedAtDestination && State != EngineState.TerminusStop && State != EngineState.StationHold
+				&& CurrentPath != null && CurrentPath.Tracks != null && CurrentPath.Tracks.Count > 0)
+			{
+				wanted = CurrentPath.Tracks[CurrentPath.Tracks.Count - 1];
+			}
+			if (wanted == _destinationRailChecked)
+			{
+				return;
+			}
+			_destinationRailChecked = wanted;
+			ReleaseDestinationTrackReservation();
+			YardTracksOrganizer yto = SingletonBehaviour<YardTracksOrganizer>.Instance;
+			DV.Logic.Job.Track logic = (wanted != null) ? wanted.LogicTrack() : null;
+			if (yto == null || logic == null || !yto.IsTrackManagedByOrganizer(logic))
+			{
+				return;
+			}
+			float length = 0f;
+			if (_trainCar != null && _trainCar.trainset != null && _trainCar.trainset.cars != null)
+			{
+				for (int i = 0; i < _trainCar.trainset.cars.Count; i++)
+				{
+					TrainCar car = _trainCar.trainset.cars[i];
+					if (car != null && car.logicCar != null)
+					{
+						length += car.logicCar.length;
+					}
+				}
+			}
+			float amount = Mathf.Min(length, (float)yto.GetFreeSpaceOnTrack(logic));
+			if (amount <= 0f)
+			{
+				return;
+			}
+			yto.ReserveSpace(logic, amount, false);
+			_destinationYardTrack = logic;
+			_destinationYardReserved = amount;
+		}
+
+		private void ReleaseDestinationTrackReservation()
+		{
+			if (_destinationYardTrack == null)
+			{
+				return;
+			}
+			YardTracksOrganizer yto = SingletonBehaviour<YardTracksOrganizer>.Instance;
+			if (yto != null && yto.IsTrackManagedByOrganizer(_destinationYardTrack))
+			{
+				yto.ReleaseReservedSpace(_destinationYardTrack, _destinationYardReserved);
+			}
+			_destinationYardTrack = null;
+			_destinationYardReserved = 0f;
+		}
+
 		public void ReleaseAllSignalReservations()
 		{
 			if (_reservedDVSignals.Count <= 0)
@@ -1638,6 +1708,7 @@ namespace AITraffic.Driver
 				return;
 			}
 			UpdatePathAndJunctions(deltaTime);
+			SyncDestinationTrackReservation();
 			if (!(_trainCar == null))
 			{
 				UpdateSensors(deltaTime);
