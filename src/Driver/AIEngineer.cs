@@ -499,6 +499,11 @@ namespace AITraffic.Driver
 
 		public bool HasArrivedAtDestination { get; private set; }
 
+		/// <summary>True while the train is held waiting to acquire a single-track corridor token (it cannot move on).</summary>
+		public bool IsWaitingForCorridorToken =>
+			_isHoldingForCorridor && _corridorHoldReason != null &&
+			_corridorHoldReason.IndexOf("corridor token", StringComparison.OrdinalIgnoreCase) >= 0;
+
 		public bool IsShuntingMode
 		{
 			get
