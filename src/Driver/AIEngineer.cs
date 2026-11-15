@@ -1586,6 +1586,113 @@ namespace AITraffic.Driver
 			_destinationYardReserved = 0f;
 		}
 
+		/// <summary>
+		/// The signal that should actually be reserved when the route logic asks for <paramref name="requested"/>.
+		///
+		/// In DV Signals a main signal's block runs through shunting signals up to the next main signal
+		/// (TrackBlock.CreateUntilMainSignal), and TrackReserver rejects a main reservation if any track in its block is
+		/// reserved by another controller. Reserving a shunting signal that lies inside the block of a main signal the
+		/// train hasn't passed yet therefore makes that main signal (typically the station entry signal) show stop for the
+		/// very train that reserved it - a permanent hold (GitHub #18 describes the same pattern).
+		///
+		/// So when a shunting signal has a DV main signal before it on the route, reserve that main signal instead (its
+		/// block covers the shunting signal), provided its whole block lies on our path - a reservation re-aligns the
+		/// block's switches on every update. Otherwise reserve nothing yet. Once the train has passed the main signal the
+		/// shunting signal resolves to itself and is reserved normally. Self-acting-distant main signals count here even
+		/// though SignalRegistry.IsGoverningSignal excludes them; the substitute goes into _reservedDVSignals and the
+		/// desired set like any other route signal, so the normal release logic frees it once passed.
+		/// </summary>
+		private Signals.Game.Signal ResolveRouteSignalToReserve(Signals.Game.Signal requested)
+		{
+			if (requested == null || _isShuntingMode || _upcomingSignals == null)
+			{
+				return requested;
+			}
+			Signals.Game.Signal shunting = (requested.Parent != null) ? requested.Parent : requested;
+			if (!shunting.IsShunting)
+			{
+				return requested;
+			}
+			Signals.Game.Signal mainBefore = null;
+			bool found = false;
+			for (int i = 0; i < _upcomingSignals.Count; i++)
+			{
+				Signals.Game.Signal s = _upcomingSignals[i].Signal;
+				if (s == null) continue;
+				if (s.Parent != null) s = s.Parent;
+				if (s == shunting)
+				{
+					found = true;
+					break;
+				}
+				if (IsBlockMainSignal(s))
+				{
+					mainBefore = s;
+				}
+			}
+			if (!found || mainBefore == null)
+			{
+				return requested;
+			}
+			return IsSignalBlockOnPath(mainBefore) ? mainBefore : null;
+		}
+
+		/// <summary>A signal that ends a main signal's block in DV Signals (TrackWalker.HasMainSignal), excluding distant/repeater heads.</summary>
+		private static bool IsBlockMainSignal(Signals.Game.Signal s)
+		{
+			if (s == null || s.IsShunting || s.Controller == null)
+			{
+				return false;
+			}
+			SignalType type = s.Controller.Type;
+			return type != SignalType.Shunting && type != SignalType.Spacing && type != SignalType.Distant && type != SignalType.Repeater;
+		}
+
+		private readonly HashSet<RailTrack> _pathTrackScratch = new HashSet<RailTrack>();
+
+		/// <summary>Every track of <paramref name="s"/>'s block (as currently aligned) is on our path.</summary>
+		private bool IsSignalBlockOnPath(Signals.Game.Signal s)
+		{
+			if (CurrentPath == null || CurrentPath.Tracks == null || CurrentPath.Tracks.Count == 0 || s.Controller == null)
+			{
+				return false;
+			}
+			s.Controller.UpdateBlocks();
+			TrackInfo[] blockTracks = (s.Block != null) ? s.Block.Tracks : null;
+			if (blockTracks == null || blockTracks.Length == 0)
+			{
+				return false;
+			}
+			HashSet<RailTrack> onPath = _pathTrackScratch;
+			onPath.Clear();
+			onPath.UnionWith(CurrentPath.Tracks);
+			for (int i = 0; i < blockTracks.Length; i++)
+			{
+				if (blockTracks[i].Track == null || !onPath.Contains(blockTracks[i].Track))
+				{
+					return false;
+				}
+			}
+			return true;
+		}
+
+		/// <summary>Reserve the signal the route logic asked for, resolved via ResolveRouteSignalToReserve, and record it.</summary>
+		private bool TryReserveResolvedRouteSignal(Signals.Game.Signal requested)
+		{
+			Signals.Game.Signal target = ResolveRouteSignalToReserve(requested);
+			if (target == null || !TryReserveRouteSignal(target))
+			{
+				return false;
+			}
+			DebouncedWakeAndForceUpdateSignal(target);
+			Signals.Game.Signal root = (target.Parent != null) ? target.Parent : target;
+			if (!_reservedDVSignals.Contains(root))
+			{
+				_reservedDVSignals.Add(root);
+			}
+			return true;
+		}
+
 		public void ReleaseAllSignalReservations()
 		{
 			if (_reservedDVSignals.Count <= 0)
@@ -2373,15 +2480,7 @@ namespace AITraffic.Driver
 							_signalWaitRetryTimer = 5f;
 							if (!(CurrentSpeedKmh < 1.5f) || !(DistanceToObstacle < 150f))
 							{
-								if (TryReserveRouteSignal(signal))
-								{
-									DebouncedWakeAndForceUpdateSignal(signal);
-									Signals.Game.Signal signal4 = ((signal != null && signal.Parent != null) ? signal.Parent : signal);
-									if (signal4 != null && !_reservedDVSignals.Contains(signal4))
-									{
-										_reservedDVSignals.Add(signal4);
-									}
-								}
+								TryReserveResolvedRouteSignal(signal);
 							}
 							else if (signal != null)
 							{
@@ -2994,15 +3093,7 @@ namespace AITraffic.Driver
 					{
 						Main.ModEntry.Logger.Log(string.Format("[AITraffic] Train '{0}' held at Entry Signal '{1}' with Hp 0. Purged downstream reservations ({2} signals). Retrying Entry Signal...", LocoId, SignalRegistry.GetSignalName(signal5), hashSet.Count + num29));
 					}
-					if (TryReserveRouteSignal(signal5))
-					{
-						DebouncedWakeAndForceUpdateSignal(signal5);
-						Signals.Game.Signal signal7 = ((signal5 != null && signal5.Parent != null) ? signal5.Parent : signal5);
-						if (signal7 != null && !_reservedDVSignals.Contains(signal7))
-						{
-							_reservedDVSignals.Add(signal7);
-						}
-					}
+					TryReserveResolvedRouteSignal(signal5);
 					if (signal5.IsOn && signal5.CurrentAspect != null)
 					{
 						flag11 = signal5.CurrentAspect.DisallowPassing;
@@ -3023,15 +3114,7 @@ namespace AITraffic.Driver
 				}
 				else if (signal5 != null)
 				{
-					if (TryReserveRouteSignal(signal5))
-					{
-						DebouncedWakeAndForceUpdateSignal(signal5);
-						Signals.Game.Signal signal7 = ((signal5 != null && signal5.Parent != null) ? signal5.Parent : signal5);
-						if (signal7 != null && !_reservedDVSignals.Contains(signal7))
-						{
-							_reservedDVSignals.Add(signal7);
-						}
-					}
+					TryReserveResolvedRouteSignal(signal5);
 					if (signal5.IsOn && signal5.CurrentAspect != null)
 					{
 						flag11 = signal5.CurrentAspect.DisallowPassing;
@@ -3183,6 +3266,7 @@ namespace AITraffic.Driver
 						desiredSignalReservationsScratch.Add(signal7);
 					}
 				}
+				signal9 = ResolveRouteSignalToReserve(signal9);
 				if (signal9 != null)
 				{
 					desiredSignalReservationsScratch.Add(signal9);
