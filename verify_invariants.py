@@ -322,6 +322,41 @@ MANDATORY_INVARIANTS = [
         "expected_files": ["Driver/AIEngineer.cs", "Config/IniConfigManager.cs"],
         "min_count": 5,
         "graveyard_ref": "GRAVEYARD.md Section 5 [WRK-09]"
+    },
+    {
+        "tag": "SIG-CLS-1",
+        "description": "Combined Main/Entry Masts Must Never Be Demoted by SelfActsAsDistant",
+        "expected_files": ["Navigation/SignalRegistry.cs"],
+        "min_count": 1,
+        "graveyard_ref": "GRAVEYARD.md Section 3 [SIG-CLS-1]"
+    },
+    {
+        "tag": "SIG-CLS-2",
+        "description": "Positive Sub-Distant-Aware IsDistantSignal Definition",
+        "expected_files": ["Navigation/SignalRegistry.cs"],
+        "min_count": 1,
+        "graveyard_ref": "GRAVEYARD.md Section 3 [SIG-CLS-2]"
+    },
+    {
+        "tag": "SIG-CLS-3",
+        "description": "Type-Driven Main Signal Classification & Line-Speed Shunting Exclusion",
+        "expected_files": ["Navigation/SignalRegistry.cs"],
+        "min_count": 3,
+        "graveyard_ref": "GRAVEYARD.md Section 3 [SIG-CLS-3]"
+    },
+    {
+        "tag": "SIG-IDX-1",
+        "description": "World-Load / Unload / Toggle Signal Index Invalidation & Bounded Rescan",
+        "expected_files": ["Navigation/SignalRegistry.cs", "Main.cs", "Core/TrafficManager.cs"],
+        "min_count": 6,
+        "graveyard_ref": "GRAVEYARD.md Section 3 [SIG-IDX-1]"
+    },
+    {
+        "tag": "SIG-IDX-2",
+        "description": "Running-Head Signal Indexing from SignalManager.AllControllers",
+        "expected_files": ["Navigation/SignalRegistry.cs"],
+        "min_count": 2,
+        "graveyard_ref": "GRAVEYARD.md Section 3 [SIG-IDX-2]"
     }
 ]
 
@@ -381,6 +416,18 @@ ANTI_PATTERNS = [
             "   Gate passing encounters with '&& _nextDispatchIsEncounter' instead."
         ),
         "graveyard_ref": "GRAVEYARD.md Section 5 [FLT-10]"
+    },
+    {
+        "name": "SelfActsAsDistant reference in C# code",
+        "regex": re.compile(r'\bSelfActsAsDistant\b'),
+        "allowed_files": [],
+        "message": (
+            "Checking Definition.SelfActsAsDistant in C# code is forbidden (SIG-CLS-1).\n"
+            "   In DVSignals this flag marks a combined Main/Entry mast that also shows distant indications;\n"
+            "   pure distant/repeater masts are identified positively via DistantSignalController,\n"
+            "   SignalType.Distant, SignalType.Repeater, and Signal.Parent != null."
+        ),
+        "graveyard_ref": "GRAVEYARD.md Section 3 [SIG-CLS-1]"
     }
 ]
 

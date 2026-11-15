@@ -66,6 +66,15 @@ namespace AITraffic.Navigation
         private static bool s_isInitialized = false;
         private static float s_lastScanTime = 0f;
 
+        // CRITICAL INVARIANT [SIG-IDX-1]: world-load invalidation + bounded main-thread re-scan state.
+        // s_worldLoadTime < 0 means "no re-scan window armed"; MaybeRescan() is a no-op until ResetForWorldLoad(armRescan: true).
+        private static int s_indexedSignalCount = 0;
+        private static int s_skippedNoPlacement = 0;
+        private static int s_skippedNoTrack = 0;
+        private static float s_worldLoadTime = -1f;
+        private static bool s_rescan2sDone = false;
+        private static bool s_rescan15sDone = false;
+
         private static RailTrackBogiesOnTrack GetBogiesOnTrack(RailTrack track)
         {
             if (track == null) return null;
@@ -176,6 +185,17 @@ namespace AITraffic.Navigation
             try
             {
                 signal.Controller.RequestUpdate(2);
+                // CRITICAL INVARIANT [RGR-03]: Controller.Update(true, true) touches Unity objects and DVSignals
+                // block state and is main-thread only. Off-thread callers still flag the block dirty and request
+                // an update; the Unity Update loop performs the actual re-evaluation.
+                if (Main.IsBackgroundThread)
+                {
+                    if (signal.Block != null)
+                    {
+                        signal.Block.FlagAsDirty();
+                    }
+                    return;
+                }
                 if (signal.Block != null)
                 {
                     signal.Block.FlagAsDirty();
@@ -453,39 +473,41 @@ namespace AITraffic.Navigation
 
             s_trackSignals.Clear();
             s_lastScanTime = Time.time;
+            s_indexedSignalCount = 0;
+            s_skippedNoPlacement = 0;
+            s_skippedNoTrack = 0;
 
             try
             {
-                var lights = UnityEngine.Object.FindObjectsOfType<Signals.Game.Lights.SignalLight>();
-                if (lights != null)
+                // CRITICAL INVARIANT [SIG-IDX-2]: index ONLY running heads (Controller.Signals[]).
+                // ShuntingSignals[] (dwarf heads) and DisplaySignals[] (repeater plates, AllowReserving == false,
+                // Block == null) must never enter the index -- on combined Entry/Exit masts they share the parent Controller.Type.
+                bool indexedAny = false;
+                var signalManager = Signals.Game.SignalManager.Instance;
+                if (signalManager != null && signalManager.AllControllers != null)
                 {
-                    for (int i = 0; i < lights.Length; i++)
+                    List<Signals.Game.Controllers.BasicSignalController> controllers = signalManager.AllControllers;
+                    for (int c = 0; c < controllers.Count; c++)
                     {
-                        if (lights[i] == null) continue;
-                        var sig = lights[i].Signal;
-                        if (sig == null || sig.Controller == null || !sig.Controller.PlacementInfo.HasValue)
-                            continue;
-
-                        // If this light belongs to a sub-distant signal mounted on a parent main signal,
-                        // map it to the governing parent main signal!
-                        if (sig.Parent != null)
+                        var controller = controllers[c];
+                        if (controller == null || controller.Signals == null) continue;
+                        for (int i = 0; i < controller.Signals.Length; i++)
                         {
-                            sig = sig.Parent;
+                            if (IndexSignal(controller.Signals[i])) indexedAny = true;
                         }
+                    }
+                }
 
-                        var info = sig.Controller.PlacementInfo.Value;
-                        if (info.Track == null) continue;
-
-                        List<DVSignal> list;
-                        if (!s_trackSignals.TryGetValue(info.Track, out list))
+                // Fallback: SignalManager not populated yet -> legacy SignalLight sweep (guarded by IndexSignal).
+                if (!indexedAny)
+                {
+                    var lights = UnityEngine.Object.FindObjectsOfType<Signals.Game.Lights.SignalLight>();
+                    if (lights != null)
+                    {
+                        for (int i = 0; i < lights.Length; i++)
                         {
-                            list = new List<DVSignal>();
-                            s_trackSignals[info.Track] = list;
-                        }
-
-                        if (!list.Contains(sig))
-                        {
-                            list.Add(sig);
+                            if (lights[i] == null) continue;
+                            IndexSignal(lights[i].Signal);
                         }
                     }
                 }
@@ -494,8 +516,9 @@ namespace AITraffic.Navigation
 
                 if (Main.ModEntry != null && Main.ModEntry.Logger != null)
                 {
-                    int sigCount = lights != null ? lights.Length : 0;
-                    Main.ModEntry.Logger.Log(string.Format("[SignalRegistry] Indexed {0} signal lights across {1} tracks.", sigCount, s_trackSignals.Count));
+                    Main.ModEntry.Logger.Log(string.Format(
+                        "[SignalRegistry] Indexed {0} running heads across {1} tracks (skipped: {2} without placement, {3} without track).",
+                        s_indexedSignalCount, s_trackSignals.Count, s_skippedNoPlacement, s_skippedNoTrack));
                 }
             }
             catch (Exception ex)
@@ -504,6 +527,96 @@ namespace AITraffic.Navigation
                     Main.ModEntry.Logger.Warning(string.Format("[SignalRegistry] Error indexing signals: {0}", ex.Message));
             }
         }
+        /// <summary>
+        /// Adds one running signal head to the track index, mapping sub-heads from the legacy SignalLight fallback
+        /// to their parent mast while excluding ShuntingSignals[], DisplaySignals[], BufferStopSignalController,
+        /// and StaticSignalController before counting skips.
+        /// </summary>
+        // CRITICAL INVARIANT [SIG-IDX-2]: reject IsShunting, !AllowReserving, and placement-less BufferStop/Static controllers before counting skips.
+        private static bool IndexSignal(DVSignal sig)
+        {
+            if (sig == null) return false;
+
+            if (sig.Parent != null) sig = sig.Parent;
+            if (sig.IsShunting || !sig.AllowReserving) return false;
+
+            if (sig.Controller == null) return false;
+            if (sig.Controller is Signals.Game.Controllers.BufferStopSignalController ||
+                sig.Controller is Signals.Game.Controllers.StaticSignalController)
+            {
+                return false;
+            }
+            if (!sig.Controller.PlacementInfo.HasValue)
+            {
+                s_skippedNoPlacement++;
+                return false;
+            }
+
+            var info = sig.Controller.PlacementInfo.Value;
+            if (info.Track == null)
+            {
+                s_skippedNoTrack++;
+                return false;
+            }
+
+            List<DVSignal> list;
+            if (!s_trackSignals.TryGetValue(info.Track, out list))
+            {
+                list = new List<DVSignal>();
+                s_trackSignals[info.Track] = list;
+            }
+
+            if (list.Contains(sig)) return false;
+            list.Add(sig);
+            s_indexedSignalCount++;
+            return true;
+        }
+
+        /// <summary>
+        /// Invalidates the signal index on world load, toggle-on, or scene unload, and arms the bounded
+        /// main-thread re-scan window when armRescan is true (post-load TrackChecker shifts PlacementInfo.Span).
+        /// </summary>
+        // CRITICAL INVARIANT [SIG-IDX-1]: clear stale RailTrack/DVSignal references and optionally arm bounded 2s/15s rescan.
+        public static void ResetForWorldLoad(bool armRescan = true)
+        {
+            s_trackSignals.Clear();
+            s_bogiesCache.Clear();
+            s_isInitialized = false;
+            s_lastScanTime = 0f;
+            s_indexedSignalCount = 0;
+            s_skippedNoPlacement = 0;
+            s_skippedNoTrack = 0;
+            s_worldLoadTime = armRescan ? Time.time : -1f;
+            s_rescan2sDone = false;
+            s_rescan15sDone = false;
+        }
+
+        /// <summary>
+        /// Main-thread only. Re-indexes once at ~2s and once at ~15s after a world load so signals whose
+        /// placement data settles late are not permanently missing, then disarms the timer.
+        /// </summary>
+        public static void MaybeRescan()
+        {
+            // CRITICAL INVARIANT [RGR-03]: Unity object traversal / DVSignals scan is main-thread only.
+            if (Main.IsBackgroundThread) return;
+            if (s_worldLoadTime < 0f || s_rescan15sDone) return;
+
+            float elapsed = Time.time - s_worldLoadTime;
+            if (!s_rescan2sDone && elapsed >= 2f)
+            {
+                s_rescan2sDone = true;
+                Initialize(force: true);
+                return;
+            }
+            if (!s_rescan15sDone && elapsed >= 15f)
+            {
+                s_rescan15sDone = true;
+                s_worldLoadTime = -1f;
+                Initialize(force: true);
+            }
+        }
+
+
 
         public struct UpcomingSignal
         {
@@ -569,6 +682,7 @@ namespace AITraffic.Navigation
         {
             if (signal == null) return false;
             if (signal.Parent != null) return false; // Sub-distant repeater head mounted on main mast
+            if (!signal.AllowReserving || signal.IsShunting) return false;
 
             // 1. Controller type & flags from DVSignals
             if (signal.Controller != null)
@@ -580,6 +694,19 @@ namespace AITraffic.Navigation
                 if (signal.Controller is Signals.Game.Controllers.DistantSignalController)
                 {
                     return false;
+                }
+
+                // CRITICAL INVARIANT [SIG-CLS-3]: type precedence. A positively-typed running head is governing
+                // regardless of name/NameOverride/Definition. Standalone SignalType.Shunting dwarfs remain eligible
+                // below (for FindFirstGoverningSignal pass-2 fallback) while DisplaySignals/IsShunting are rejected above.
+                if (signal.Controller.Type == Signals.Game.SignalType.Mainline ||
+                    signal.Controller.Type == Signals.Game.SignalType.Entry ||
+                    signal.Controller.Type == Signals.Game.SignalType.Exit ||
+                    signal.Controller.Type == Signals.Game.SignalType.ExitPax ||
+                    signal.Controller.Type == Signals.Game.SignalType.ExitMainline ||
+                    signal.Controller.Type == Signals.Game.SignalType.Spacing)
+                {
+                    return true;
                 }
 
                 // NOTICE: Do NOT check signal.Controller.ActingAsDistant!
@@ -594,11 +721,10 @@ namespace AITraffic.Navigation
                 }
             }
 
-            // 2. Definition properties
-            if (signal.Definition != null && signal.Definition.SelfActsAsDistant)
-            {
-                return false;
-            }
+            // CRITICAL INVARIANT [SIG-CLS-1]: a mast flagged on its SignalDefinition as combining distant aspects
+            // with Main/Entry indications is NOT a pure distant signal. Pure distant and repeater masts are already
+            // rejected above via SignalType.Distant, SignalType.Repeater and DistantSignalController. Never demote
+            // station entry signals (e.g. OWC east 'A') via that definition flag -- doing so blocks reservation (Hp 0).
 
             // 3. Signal name / prefix (DVSignals German pack uses "Ps {0}" format for distant signals / Vorsignale)
             string sigName = signal.NameOverride ?? "";
@@ -614,21 +740,87 @@ namespace AITraffic.Navigation
         }
 
         /// <summary>
-        /// Checks whether a DVSignals signal is a pure distant signal (Vorsignal) or repeater.
+        /// Checks whether a DVSignals signal is a pure distant signal (Vorsignal), sub-distant board, or repeater.
         /// Pure distant signals do not command stops at their own mast, but give advance warning of downstream restrictions.
         /// </summary>
+        // CRITICAL INVARIANT [SIG-CLS-2]: positive, type-driven definition. Do NOT collapse to '!IsGoverningSignal'
+        // and do NOT normalize signal = signal.Parent first (Parent != null is Signal.DistantSignal, a mounted sub-distant head).
+        // Combined Main/Entry masts intentionally return false so AIEngineer.cs:2444 does not treat green Hp 1 + Vr 0
+        // as a red-signal stop; SpeedProfileGenerator.cs:829 handles Vr 0 braking directly.
         public static bool IsDistantSignal(DVSignal signal)
         {
-            return signal != null && !IsGoverningSignal(signal);
+            if (signal == null) return false;
+            if (signal.Parent != null) return true; // Signal.DistantSignal sub-head mounted on a parent mast
+
+            var ctrl = signal.Controller;
+            if (ctrl != null)
+            {
+                if (ctrl is Signals.Game.Controllers.DistantSignalController) return true;
+                if (ctrl.Type == Signals.Game.SignalType.Distant || ctrl.Type == Signals.Game.SignalType.Repeater) return true;
+                if (ctrl.Type == Signals.Game.SignalType.Mainline ||
+                    ctrl.Type == Signals.Game.SignalType.Entry ||
+                    ctrl.Type == Signals.Game.SignalType.Exit ||
+                    ctrl.Type == Signals.Game.SignalType.ExitPax ||
+                    ctrl.Type == Signals.Game.SignalType.ExitMainline ||
+                    ctrl.Type == Signals.Game.SignalType.Spacing ||
+                    ctrl.Type == Signals.Game.SignalType.Shunting)
+                {
+                    return false;
+                }
+
+                string ctrlName = ctrl.NameOverride ?? "";
+                if (ctrlName.StartsWith("Ps ", StringComparison.OrdinalIgnoreCase) ||
+                    ctrlName.StartsWith("Pp ", StringComparison.OrdinalIgnoreCase) ||
+                    ctrlName.IndexOf("DISTANT", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                    ctrlName.IndexOf("REPEATER", StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    return true;
+                }
+            }
+
+            string sigName = signal.NameOverride ?? "";
+            if (sigName.StartsWith("Ps ", StringComparison.OrdinalIgnoreCase) ||
+                sigName.StartsWith("Pp ", StringComparison.OrdinalIgnoreCase) ||
+                sigName.IndexOf("DISTANT", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                sigName.IndexOf("REPEATER", StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                return true;
+            }
+
+            return false;
         }
 
         /// <summary>
         /// Checks whether a DVSignals signal acts as a Main Signal (governs mainline block entry/exit).
-        /// Filters out shunting signals and distant repeaters.
+        /// Filters out shunting signals, non-reservable display plates, and distant repeaters.
         /// </summary>
+        // CRITICAL INVARIANT [SIG-CLS-3]: a main signal is any running head a train must obey as a mainline block boundary --
+        // Mainline, Entry, Exit, ExitPax, ExitMainline or Spacing. Requires AllowReserving && !IsShunting; Shunting dwarfs and
+        // pure Distant/Repeater heads are excluded. Never gate this back onto IsGoverningSignal alone.
         public static bool IsMainSignal(DVSignal signal)
         {
-            if (signal != null && signal.IsShunting) return false;
+            if (signal == null) return false;
+            if (signal.Parent != null) signal = signal.Parent;
+            if (!signal.AllowReserving || signal.IsShunting) return false;
+            var ctrl = signal.Controller;
+            if (ctrl != null)
+            {
+                if (ctrl is Signals.Game.Controllers.DistantSignalController) return false;
+                switch (ctrl.Type)
+                {
+                    case Signals.Game.SignalType.Mainline:
+                    case Signals.Game.SignalType.Entry:
+                    case Signals.Game.SignalType.Exit:
+                    case Signals.Game.SignalType.ExitPax:
+                    case Signals.Game.SignalType.ExitMainline:
+                    case Signals.Game.SignalType.Spacing:
+                        return true;
+                    case Signals.Game.SignalType.Shunting:
+                    case Signals.Game.SignalType.Distant:
+                    case Signals.Game.SignalType.Repeater:
+                        return false;
+                }
+            }
             return IsGoverningSignal(signal);
         }
 
@@ -778,12 +970,11 @@ namespace AITraffic.Navigation
         /// capable of transitioning an AI movement from Slow Shunting Mode into full Line Speed.
         /// Filters out pure dwarf shunting signals (Sperrsignale) and distant repeaters (Vorsignale).
         /// </summary>
+        // CRITICAL INVARIANT [SIG-CLS-3]: only main running signals (never standalone SignalType.Shunting dwarfs
+        // or DisplaySignals) may transition an AI train out of Slow Shunting Mode into full Line Speed.
         public static bool IsLineSpeedAuthorizingSignal(DVSignal signal)
         {
-            if (signal == null) return false;
-            if (signal.Parent != null) signal = signal.Parent;
-            if (signal.IsShunting) return false;
-            return IsGoverningSignal(signal);
+            return IsMainSignal(signal);
         }
 
         /// <summary>

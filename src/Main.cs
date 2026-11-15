@@ -176,6 +176,12 @@ namespace AITraffic
                 RailGraph.Instance.Initialize();
                 TrafficScheduler.ClearCaches();
 
+                // CRITICAL INVARIANT [SIG-IDX-1]: the DVSignals index holds RailTrack references from the previous
+                // world. Without this reset Initialize() early-returns on a stale non-empty dictionary and NO signal
+                // is ever indexed again for the new world (every reservation gate then fails silently).
+                SignalRegistry.ResetForWorldLoad();
+                SignalRegistry.Initialize(force: true);
+
                 // Start Traffic Manager
                 TrafficManager.Instance.Settings = Settings;
                 TrafficManager.Instance.enabled = true;
@@ -222,6 +228,9 @@ namespace AITraffic
                     if (IsWorldFullyLoaded)
                     {
                         RailGraph.Instance.Initialize();
+                        // CRITICAL INVARIANT [SIG-IDX-1]: rebuild the signal index if the mod is re-enabled after scene unload or toggle-off.
+                        SignalRegistry.ResetForWorldLoad();
+                        SignalRegistry.Initialize(force: true);
                         TrafficManager.Instance.Settings = Settings;
                         TrafficManager.Instance.enabled = true;
                     }

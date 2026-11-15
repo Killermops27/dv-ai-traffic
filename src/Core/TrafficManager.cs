@@ -139,6 +139,8 @@ namespace AITraffic.Core
                 AIEngineer.ClearSignalWakeupCooldowns();
                 // CRITICAL INVARIANT [WRK-01]: Reset Comms Radio registration latch on scene unload.
                 AITraffic.Workers.Radio.WorkerRadioMode.Reset();
+                // CRITICAL INVARIANT [SIG-IDX-1]: Drop destroyed RailTrack/DVSignal references on world unload without arming a rescan.
+                AITraffic.Navigation.SignalRegistry.ResetForWorldLoad(armRescan: false);
 
                 s_stationLocationCache.Clear();
             }
@@ -243,6 +245,10 @@ namespace AITraffic.Core
             try {
 #endif
             float deltaTime = Time.deltaTime;
+
+            // CRITICAL INVARIANT [SIG-IDX-1]: bounded main-thread signal re-scan window after world load
+            // (post-load TrackChecker crossing offsets shift PlacementInfo.Span after SignalManager.CreateSignals).
+            AITraffic.Navigation.SignalRegistry.MaybeRescan();
 
             // Check floating origin shift
             CheckFloatingOriginShift();
