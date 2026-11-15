@@ -7049,15 +7049,20 @@ namespace AITraffic.Driver
 				}
 			}
 			bool flag2 = false;
+			// The speed profile brings the train to 0 km/h StopBufferDistance (20 m) before the stop, and obstacle braking
+			// targets 25 m before the obstacle plus the same buffer (~45 m). The arrival windows must cover those stopping
+			// points, otherwise a train that has stopped for good never enters TerminusStop / StationHold.
+			const float arrivalTolerance = SpeedProfileGenerator.StopBufferDistance + 8f;
+			const float obstacleArrivalWindow = 25f + SpeedProfileGenerator.StopBufferDistance + 5f;
 			if ((IsStationDestination || IsTerminusDestination) && CurrentSpeedKmh < 0.5f && StationaryTimer >= 2f)
 			{
-				if (DistanceToDestination <= 12f)
+				if (DistanceToDestination <= arrivalTolerance)
 				{
 					flag2 = true;
 				}
 				else if (flag)
 				{
-					bool flag3 = DistanceToObstacle < 35f;
+					bool flag3 = DistanceToObstacle < obstacleArrivalWindow;
 					bool flag4 = DistanceToDestination <= 35f;
 					bool flag5 = false;
 					TrainCar trainCar = ((_trainCar != null && _trainCar.trainset != null && _trainCar.trainset.cars != null && _trainCar.trainset.cars.Count > 0) ? _trainCar.trainset.cars[_trainCar.trainset.cars.Count - 1] : _trainCar);
