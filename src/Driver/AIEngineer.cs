@@ -2394,6 +2394,17 @@ namespace AITraffic.Driver
 				_obstacleWaitTimer = 0f;
 			}
 			Signals.Game.Signal signal = ((GoverningSignal != null && DistanceToGoverningSignal < 350f) ? GoverningSignal : ApproachingSignal);
+			// Self-acting-distant block signals are not "governing", but the speed profile still stops the train at them.
+			// When such a signal is the nearer one and shows stop, use it here, otherwise the stopped-at-red fallbacks
+			// (shunting mode, red-signal / shunting detour) never start and a train stopped in front of a block occupied by
+			// something that never moves waits for the emergency despawn (e.g. block signal at Hp 0 at 45 m while the
+			// governing shunting signal 150 m on shows CLEAR).
+			if (ApproachingSignal != null && ApproachingSignal != signal && DistanceToSignal < 350f && !SignalRegistry.IsDistantSignal(ApproachingSignal)
+				&& (signal != GoverningSignal || DistanceToSignal < DistanceToGoverningSignal)
+				&& ApproachingSignal.CurrentAspect != null && ApproachingSignal.CurrentAspect.DisallowPassing)
+			{
+				signal = ApproachingSignal;
+			}
 			float num6 = ((signal == GoverningSignal) ? DistanceToGoverningSignal : DistanceToSignal);
 			Signals.Game.Signal signal3;
 			if (railTrack != null && signal != null && num6 < 350f)
