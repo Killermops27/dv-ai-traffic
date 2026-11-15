@@ -1468,6 +1468,21 @@ namespace AITraffic.Driver
 			}
 		}
 
+		/// <summary>
+		/// Reserve a DV Signals signal for this train's route. A train that has arrived at its terminus won't move again,
+		/// so it must not take a new route: EnterTerminusStop releases its reservations, but UpdatePathAndJunctions keeps
+		/// running in TerminusStop and would otherwise re-reserve the signal ahead (typically the exit signal at the far
+		/// end of the terminus track), locking the station's exit for as long as the train stands there.
+		/// </summary>
+		private bool TryReserveRouteSignal(Signals.Game.Signal signal)
+		{
+			if (State == EngineState.TerminusStop)
+			{
+				return false;
+			}
+			return SignalRegistry.TryReserveDVSignal(signal);
+		}
+
 		public void ReleaseAllSignalReservations()
 		{
 			if (_reservedDVSignals.Count <= 0)
@@ -2254,7 +2269,7 @@ namespace AITraffic.Driver
 							_signalWaitRetryTimer = 5f;
 							if (!(CurrentSpeedKmh < 1.5f) || !(DistanceToObstacle < 150f))
 							{
-								if (SignalRegistry.TryReserveDVSignal(signal))
+								if (TryReserveRouteSignal(signal))
 								{
 									DebouncedWakeAndForceUpdateSignal(signal);
 									Signals.Game.Signal signal4 = ((signal != null && signal.Parent != null) ? signal.Parent : signal);
@@ -2875,7 +2890,7 @@ namespace AITraffic.Driver
 					{
 						Main.ModEntry.Logger.Log(string.Format("[AITraffic] Train '{0}' held at Entry Signal '{1}' with Hp 0. Purged downstream reservations ({2} signals). Retrying Entry Signal...", LocoId, SignalRegistry.GetSignalName(signal5), hashSet.Count + num29));
 					}
-					if (SignalRegistry.TryReserveDVSignal(signal5))
+					if (TryReserveRouteSignal(signal5))
 					{
 						DebouncedWakeAndForceUpdateSignal(signal5);
 						Signals.Game.Signal signal7 = ((signal5 != null && signal5.Parent != null) ? signal5.Parent : signal5);
@@ -2904,7 +2919,7 @@ namespace AITraffic.Driver
 				}
 				else if (signal5 != null)
 				{
-					if (SignalRegistry.TryReserveDVSignal(signal5))
+					if (TryReserveRouteSignal(signal5))
 					{
 						DebouncedWakeAndForceUpdateSignal(signal5);
 						Signals.Game.Signal signal7 = ((signal5 != null && signal5.Parent != null) ? signal5.Parent : signal5);
@@ -3105,7 +3120,7 @@ namespace AITraffic.Driver
 					_reservedDVSignals.Remove(_yieldGoverningSignal);
 				}
 			}
-			if (_playerYieldWaitTimer <= 0f && signal9 != null && !_reservedDVSignals.Contains(signal9) && SignalRegistry.TryReserveDVSignal(signal9))
+			if (_playerYieldWaitTimer <= 0f && signal9 != null && !_reservedDVSignals.Contains(signal9) && TryReserveRouteSignal(signal9))
 			{
 				DebouncedWakeAndForceUpdateSignal(signal9);
 				_reservedDVSignals.Add(signal9);
