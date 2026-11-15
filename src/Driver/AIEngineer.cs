@@ -1594,6 +1594,7 @@ namespace AITraffic.Driver
 			{
 				UpdateSensors(deltaTime);
 				UpdateSingleTrackCorridorProtection(deltaTime);
+				ReleaseCorridorReservationsBehindTrain();
 				UpdateWheelTractionAndSlideProtection(deltaTime);
 				UpdatePowertrainProtection(deltaTime);
 				UpdateLevelCrossingHorn(deltaTime);
@@ -4929,6 +4930,95 @@ namespace AITraffic.Driver
 				_reservedTracks.Remove(activeCorridorTrack);
 			}
 			_activeCorridorTracks.Clear();
+		}
+
+		private readonly HashSet<RailTrack> _corridorKeepScratch = new HashSet<RailTrack>();
+		private readonly List<RailTrack> _corridorStaleScratch = new List<RailTrack>();
+
+		/// <summary>
+		/// Release single-track corridor reservations the train has left behind.
+		///
+		/// UpdateSingleTrackCorridorProtection only calls ReleaseActiveCorridorToken() when no car is on an active corridor
+		/// track AND there is no single-track corridor anywhere ahead on the path (scanned up to 15 km), and returns early
+		/// without releasing when the corridor cache is empty. On a long route the second condition is rarely true, so
+		/// every corridor passed stays reserved (track reservations + token) behind the train. Other trains then hold for
+		/// track that is already free: "Opposing AI train in corridor", and - for worker trains, whose reservations hold
+		/// every AI train regardless of direction - "Player worker train in corridor ahead", until the ambient train is
+		/// emergency-despawned.
+		///
+		/// Keep only tracks in the corridor ahead and tracks under the train; release the rest, and release the tokens of
+		/// corridors the train has completely left. A corridor the train is still in keeps its token.
+		/// </summary>
+		private void ReleaseCorridorReservationsBehindTrain()
+		{
+			if (_activeCorridorTracks.Count == 0 || _reverseProtocolStage != SingleTrackReverseStage.None)
+			{
+				return;
+			}
+			RailGraph graph = RailGraph.Instance;
+			if (graph == null || !graph.IsInitialized)
+			{
+				return;
+			}
+			HashSet<RailTrack> keep = _corridorKeepScratch;
+			keep.Clear();
+			keep.UnionWith(_corridorTracksCache);
+			if (_trainCar != null && _trainCar.trainset != null && _trainCar.trainset.cars != null)
+			{
+				List<TrainCar> cars = _trainCar.trainset.cars;
+				for (int i = 0; i < cars.Count; i++)
+				{
+					TrainCar car = cars[i];
+					if (car == null) continue;
+					if (car.FrontBogie != null && car.FrontBogie.track != null) keep.Add(car.FrontBogie.track);
+					if (car.RearBogie != null && car.RearBogie.track != null) keep.Add(car.RearBogie.track);
+				}
+			}
+			List<RailTrack> stale = _corridorStaleScratch;
+			stale.Clear();
+			foreach (RailTrack track in _activeCorridorTracks)
+			{
+				if (track != null && !keep.Contains(track))
+				{
+					stale.Add(track);
+				}
+			}
+			if (stale.Count == 0)
+			{
+				return;
+			}
+			for (int i = 0; i < stale.Count; i++)
+			{
+				RailTrack track = stale[i];
+				_activeCorridorTracks.Remove(track);
+				if (_desiredReservationsScratch.Contains(track))
+				{
+					continue; // still wanted for an upcoming signal block; released by the block logic later
+				}
+				graph.ReleaseTrackReservation(track, this);
+				_reservedTracks.Remove(track);
+			}
+			List<string> heldTokens = graph.GetCorridorTokensHeldBy(this);
+			for (int i = 0; i < heldTokens.Count; i++)
+			{
+				List<RailTrack> corridorTracks = graph.GetTracksForCorridor(heldTokens[i]);
+				bool stillInOrAhead = false;
+				if (corridorTracks != null)
+				{
+					for (int t = 0; t < corridorTracks.Count; t++)
+					{
+						if (corridorTracks[t] != null && keep.Contains(corridorTracks[t]))
+						{
+							stillInOrAhead = true;
+							break;
+						}
+					}
+				}
+				if (!stillInOrAhead)
+				{
+					graph.ReleaseCorridorToken(heldTokens[i], this);
+				}
+			}
 		}
 
 		private bool FindNearestTrailingSiding(out Junction trailingSwitch, out byte sidingBranch, out RailTrack sidingTrack, out byte mainlineBranch)
