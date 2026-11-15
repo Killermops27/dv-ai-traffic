@@ -1480,7 +1480,40 @@ namespace AITraffic.Driver
 			{
 				return false;
 			}
+			if (IsSignalBeyondTerminus(signal))
+			{
+				return false;
+			}
 			return SignalRegistry.TryReserveDVSignal(signal);
+		}
+
+		/// <summary>
+		/// On a terminus run, a signal standing on the destination track (and nowhere earlier on the path) only governs
+		/// leaving that track - typically its exit signal - so it is never part of this train's route. Reserving it
+		/// locks the station's exit for nothing. The path runs along the whole destination track, past that signal, and
+		/// DistanceToDestination isn't measured to the actual stopping point, so neither a path nor a distance check
+		/// excludes it. Left unreserved it may show stop; it stands at the stopping point, so the train arrives there
+		/// (within the arrival window) before any stopped-at-red fallback can start.
+		/// </summary>
+		private bool IsSignalBeyondTerminus(Signals.Game.Signal signal)
+		{
+			if (signal == null || !IsTerminusDestination || CurrentPath == null || CurrentPath.Tracks == null || CurrentPath.Tracks.Count < 2)
+			{
+				return false;
+			}
+			int last = CurrentPath.Tracks.Count - 1;
+			if (!SignalRegistry.IsSignalOnTrack(CurrentPath.Tracks[last], signal))
+			{
+				return false;
+			}
+			for (int i = 0; i < last; i++)
+			{
+				if (SignalRegistry.IsSignalOnTrack(CurrentPath.Tracks[i], signal))
+				{
+					return false;
+				}
+			}
+			return true;
 		}
 
 		public void ReleaseAllSignalReservations()
