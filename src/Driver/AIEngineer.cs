@@ -74,6 +74,10 @@ namespace AITraffic.Driver
 
 		private const float RerouteConsumedTtlSeconds = 10f;
 
+		private const float DestinationSignalStopOffsetMeters = 10.0f;
+
+		private const float DestinationSwitchStopOffsetMeters = 20.0f;
+
 		[SerializeField]
 		private TrainCar _trainCar;
 
@@ -2228,6 +2232,235 @@ namespace AITraffic.Driver
 			}
 		}
 
+		private bool GetDestinationTrackOrientation(out RailTrack destTrack, out bool destForward, out bool isTwoOpenSides)
+		{
+			destTrack = null;
+			destForward = TargetDirection >= 0f;
+			isTwoOpenSides = false;
+			if (CurrentPath == null || CurrentPath.Tracks == null || CurrentPath.Tracks.Count == 0)
+			{
+				return false;
+			}
+			int lastIdx = CurrentPath.Tracks.Count - 1;
+			destTrack = CurrentPath.Tracks[lastIdx];
+			if (destTrack == null)
+			{
+				return false;
+			}
+			if (lastIdx >= 1)
+			{
+				RailTrack prevTrack = CurrentPath.Tracks[lastIdx - 1];
+				if (prevTrack != null)
+				{
+					bool resolvedDir = false;
+					if (RailGraph.Instance != null && RailGraph.Instance.IsInitialized)
+					{
+						RailEdge prevEdge = RailGraph.Instance.GetEdge(prevTrack);
+						RailEdge destEdge = RailGraph.Instance.GetEdge(destTrack);
+						if (prevEdge != null && destEdge != null)
+						{
+							RailNode sharedNode = RailGraph.Instance.GetConnectingNode(prevEdge, destEdge);
+							if (sharedNode == destEdge.FromNode)
+							{
+								destForward = true;
+								resolvedDir = true;
+							}
+							else if (sharedNode == destEdge.ToNode)
+							{
+								destForward = false;
+								resolvedDir = true;
+							}
+						}
+					}
+					if (!resolvedDir && destTrack.curve != null && prevTrack.curve != null)
+					{
+						Vector3 destStart = destTrack.curve.GetPointAt(0f);
+						Vector3 destEnd = destTrack.curve.GetPointAt(1f);
+						Vector3 prevStart = prevTrack.curve.GetPointAt(0f);
+						Vector3 prevEnd = prevTrack.curve.GetPointAt(1f);
+						float dStart = Mathf.Min(Vector3.Distance(destStart, prevStart), Vector3.Distance(destStart, prevEnd));
+						float dEnd = Mathf.Min(Vector3.Distance(destEnd, prevStart), Vector3.Distance(destEnd, prevEnd));
+						destForward = dStart <= dEnd;
+					}
+				}
+			}
+			if (RailGraph.Instance != null && RailGraph.Instance.IsInitialized)
+			{
+				RailEdge destEdge = RailGraph.Instance.GetEdge(destTrack);
+				if (destEdge != null && destEdge.FromNode != null && destEdge.ToNode != null)
+				{
+					isTwoOpenSides = !destEdge.FromNode.IsDeadEnd && !destEdge.ToNode.IsDeadEnd;
+					return true;
+				}
+			}
+			isTwoOpenSides = destTrack.inJunction != null && destTrack.outJunction != null;
+			return true;
+		}
+
+		private float GetDestinationStopSetback(out Signals.Game.Signal destStopSignal, out bool isTwoOpenSides)
+		{
+			destStopSignal = null;
+			isTwoOpenSides = false;
+			if (!IsStationDestination && !IsTerminusDestination)
+			{
+				return 0f;
+			}
+			RailTrack destTrack;
+			bool destForward;
+			if (!GetDestinationTrackOrientation(out destTrack, out destForward, out isTwoOpenSides) || destTrack == null || destTrack.curve == null)
+			{
+				return 0f;
+			}
+			if (!isTwoOpenSides)
+			{
+				return 0f;
+			}
+			float distFromExit;
+			float setback;
+			if (SignalRegistry.TryGetDestinationStopSignal(destTrack, destForward, out destStopSignal, out distFromExit))
+			{
+				setback = Mathf.Max(distFromExit + DestinationSignalStopOffsetMeters, DestinationSwitchStopOffsetMeters);
+			}
+			else
+			{
+				setback = DestinationSwitchStopOffsetMeters;
+			}
+			float destLen = destTrack.curve.length;
+			return Mathf.Min(setback, Mathf.Max(0f, destLen - 15f));
+		}
+
+		private bool IsDestinationTerminalSignal(Signals.Game.Signal signal, float signalDistance)
+		{
+			if (signal == null || (!IsStationDestination && !IsTerminusDestination))
+			{
+				return false;
+			}
+			Signals.Game.Signal effSig = ((signal.Parent != null) ? signal.Parent : signal);
+			if (SignalRegistry.IsEntrySignal(effSig))
+			{
+				return false;
+			}
+			Signals.Game.Signal destStopSignal;
+			bool unusedTwoOpen;
+			GetDestinationStopSetback(out destStopSignal, out unusedTwoOpen);
+			if (destStopSignal != null)
+			{
+				Signals.Game.Signal effDestSig = ((destStopSignal.Parent != null) ? destStopSignal.Parent : destStopSignal);
+				if (effSig == effDestSig)
+				{
+					return true;
+				}
+			}
+			RailTrack destTrack = ((CurrentPath != null && CurrentPath.Tracks != null && CurrentPath.Tracks.Count > 0) ? CurrentPath.Tracks[CurrentPath.Tracks.Count - 1] : null);
+			RailTrack sigTrack;
+			double sigSpan;
+			if (destTrack != null && SignalRegistry.TryGetSignalPlacement(effSig, out sigTrack, out sigSpan) && sigTrack == destTrack)
+			{
+				return true;
+			}
+			if (!float.IsInfinity(DistanceToDestination) && !float.IsInfinity(signalDistance) && signalDistance > DistanceToDestination + 2.0f)
+			{
+				return true;
+			}
+			return false;
+		}
+
+		private TrainCar GetConsistTailCar()
+		{
+			if (_trainCar == null)
+			{
+				return null;
+			}
+			if (_trainCar.trainset == null || _trainCar.trainset.cars == null || _trainCar.trainset.cars.Count == 0)
+			{
+				return _trainCar;
+			}
+			List<TrainCar> cars = _trainCar.trainset.cars;
+			if (cars.Count == 1)
+			{
+				return cars[0] ?? _trainCar;
+			}
+			int leadIdx = cars.IndexOf(_trainCar);
+			if (leadIdx == 0)
+			{
+				return cars[cars.Count - 1] ?? _trainCar;
+			}
+			if (leadIdx == cars.Count - 1)
+			{
+				return cars[0] ?? _trainCar;
+			}
+			TrainCar first = cars[0];
+			TrainCar last = cars[cars.Count - 1];
+			Vector3 pos = _trainCar.transform.position;
+			float dFirst = ((first != null) ? Vector3.Distance(pos, first.transform.position) : 0f);
+			float dLast = ((last != null) ? Vector3.Distance(pos, last.transform.position) : 0f);
+			return (dFirst > dLast) ? (first ?? _trainCar) : (last ?? _trainCar);
+		}
+
+		private Bogie GetConsistTailBogie(TrainCar tailCar)
+		{
+			if (tailCar == null)
+			{
+				return null;
+			}
+			if (tailCar.FrontBogie != null && tailCar.RearBogie != null)
+			{
+				if (_trainCar != null)
+				{
+					Vector3 pos = _trainCar.transform.position;
+					if (tailCar == _trainCar)
+					{
+						float reverserDir = ((_desiredReverser != 0f) ? _desiredReverser : ((_ambientLockedReverser != 0f) ? _ambientLockedReverser : 1f));
+						Vector3 travelFwd = _trainCar.transform.forward * ((reverserDir >= 0f) ? 1f : -1f);
+						float dotFront = Vector3.Dot(travelFwd, tailCar.FrontBogie.transform.position - pos);
+						float dotRear = Vector3.Dot(travelFwd, tailCar.RearBogie.transform.position - pos);
+						return (dotFront < dotRear) ? tailCar.FrontBogie : tailCar.RearBogie;
+					}
+					float dFront = Vector3.Distance(pos, tailCar.FrontBogie.transform.position);
+					float dRear = Vector3.Distance(pos, tailCar.RearBogie.transform.position);
+					return (dFront > dRear) ? tailCar.FrontBogie : tailCar.RearBogie;
+				}
+				return tailCar.RearBogie;
+			}
+			return tailCar.RearBogie ?? tailCar.FrontBogie;
+		}
+
+		private bool IsConsistClearOnDestinationTrack(RailTrack destTrack, bool destForward, bool isTwoOpenSides)
+		{
+			if (destTrack == null || _trainCar == null || _trainCar.trainset == null)
+			{
+				return true;
+			}
+			TrainCar tailCar = GetConsistTailCar();
+			Bogie tailBogie = GetConsistTailBogie(tailCar);
+			RailTrack tailTrack = ((tailBogie != null) ? tailBogie.track : null);
+			if (tailTrack != destTrack)
+			{
+				return false;
+			}
+			TrainCar occCar;
+			if (isTwoOpenSides)
+			{
+				Junction entryJunction = (destForward ? destTrack.inJunction : destTrack.outJunction);
+				Junction forwardJunction = (destForward ? destTrack.outJunction : destTrack.inJunction);
+				if (entryJunction != null && JunctionController.IsJunctionPhysicallyOccupied(entryJunction, out occCar, null))
+				{
+					return false;
+				}
+				if (forwardJunction != null && JunctionController.IsJunctionPhysicallyOccupied(forwardJunction, out occCar, _trainCar.trainset))
+				{
+					return false;
+				}
+				return true;
+			}
+			if ((destTrack.inJunction != null && JunctionController.IsJunctionPhysicallyOccupied(destTrack.inJunction, out occCar, null)) ||
+			    (destTrack.outJunction != null && JunctionController.IsJunctionPhysicallyOccupied(destTrack.outJunction, out occCar, null)))
+			{
+				return false;
+			}
+			return true;
+		}
+
 		private void UpdatePathAndJunctions(float dt)
 		{
 			if (State == EngineState.TerminusStop)
@@ -2472,8 +2705,9 @@ namespace AITraffic.Driver
 					_shuntingBypassedSignal = null;
 					_isSelfBlockedShunting = false;
 				}
+				bool isDestTerminalSig = IsDestinationTerminalSignal(signal, num6);
 				// CRITICAL INVARIANT [AIE-19]: Decay _stoppedAtRedTimer on transient aspect flicker while stationary; hard-zero on movement or player yield
-				if (_playerYieldWaitTimer > 0f || CurrentSpeedKmh >= 1.5f)
+				if (_playerYieldWaitTimer > 0f || CurrentSpeedKmh >= 1.5f || (isDestTerminalSig && DistanceToDestination <= 25f))
 				{
 					_stoppedAtRedTimer = 0f;
 				}
@@ -2481,7 +2715,7 @@ namespace AITraffic.Driver
 				{
 					_stoppedAtRedTimer = Mathf.Max(0f, _stoppedAtRedTimer - 2f * dt);
 				}
-				if (flag5 && CurrentSpeedKmh < 1f && _playerYieldWaitTimer <= 0f)
+				if (flag5 && CurrentSpeedKmh < 1f && _playerYieldWaitTimer <= 0f && !(isDestTerminalSig && DistanceToDestination <= 25f))
 				{
 					_stoppedAtRedTimer += dt;
 					if (_stoppedAtRedTimer >= 12f && !_isSelfBlockedShunting && !_isHoldingForCorridor && !_isHoldingInMultiTrack && float.IsInfinity(DistanceToObstacle) && (IsSignalBlockedOnlyBySelf(signal) || CanPassBalloonLoopEntrySignalAtHp0(signal)))
@@ -2523,7 +2757,7 @@ namespace AITraffic.Driver
 				{
 					_stoppedAtRedTimer = 0f;
 				}
-				if (flag5 && _playerYieldWaitTimer <= 0f)
+				if (flag5 && _playerYieldWaitTimer <= 0f && !isDestTerminalSig)
 				{
 					if (CurrentSpeedKmh < 1f)
 					{
@@ -2743,7 +2977,10 @@ namespace AITraffic.Driver
 				}
 				if (IsStationDestination || IsTerminusDestination)
 				{
-					DistanceToDestination = Mathf.Max(0f, num13);
+					Signals.Game.Signal unusedDestStopSig;
+					bool unusedTwoOpenSides;
+					float destStopSetback = GetDestinationStopSetback(out unusedDestStopSig, out unusedTwoOpenSides);
+					DistanceToDestination = Mathf.Max(0f, num13 - destStopSetback);
 				}
 				else
 				{
@@ -2831,6 +3068,7 @@ namespace AITraffic.Driver
 			bool flag10 = Main.Settings != null && Main.Settings.RideAlongMode;
 			// CRITICAL INVARIANT [AIE-17]: Resolve governing signal before distant ApproachingSignal so Vr 0 never masks Hp 0
 			Signals.Game.Signal signal5 = null;
+			float signal5Dist = float.PositiveInfinity;
 			bool flag11 = false;
 			Signals.Game.Signal candidateSig = (GoverningSignal != null && DistanceToGoverningSignal < 2000f)
 				? GoverningSignal
@@ -2838,6 +3076,7 @@ namespace AITraffic.Driver
 			if (candidateSig != null)
 			{
 				signal5 = ((candidateSig.Parent != null) ? candidateSig.Parent : candidateSig);
+				signal5Dist = ((candidateSig == GoverningSignal) ? DistanceToGoverningSignal : DistanceToSignal);
 				if (signal5 != null && signal5.IsOn && signal5.CurrentAspect != null)
 				{
 					flag11 = signal5.CurrentAspect.DisallowPassing;
@@ -2850,6 +3089,7 @@ namespace AITraffic.Driver
 			if ((signal5 == null || !SignalRegistry.IsGoverningSignal(signal5)) && _upcomingSignalBlocks != null && _upcomingSignalBlocks.Count > 0 && _upcomingSignalBlocks[0].ExitSignal != null && _upcomingSignalBlocks[0].DistanceToExit < 2000f)
 			{
 				signal5 = _upcomingSignalBlocks[0].ExitSignal;
+				signal5Dist = _upcomingSignalBlocks[0].DistanceToExit;
 				if (signal5 != null && signal5.IsOn && signal5.CurrentAspect != null)
 				{
 					flag11 = signal5.CurrentAspect.DisallowPassing;
@@ -2859,6 +3099,7 @@ namespace AITraffic.Driver
 					}
 				}
 			}
+			bool isDestTerminalSig5 = signal5 != null && IsDestinationTerminalSignal(signal5, signal5Dist);
 			signal3 = ((_shuntingBypassedSignal != null && _shuntingBypassedSignal.Parent != null) ? _shuntingBypassedSignal.Parent : _shuntingBypassedSignal);
 			if (_isShuntingMode && signal5 != null && signal5 == signal3)
 			{
@@ -3191,7 +3432,7 @@ namespace AITraffic.Driver
 						_stoppedSwitchAlignCooldown = 5f;
 					}
 				}
-				else if (signal5 != null)
+				else if (signal5 != null && !isDestTerminalSig5)
 				{
 					if (SignalRegistry.TryReserveDVSignal(signal5))
 					{
@@ -3255,9 +3496,11 @@ namespace AITraffic.Driver
 			if (!flag33)
 			{
 				Signals.Game.Signal signal10 = null;
+				float signal10Dist = float.PositiveInfinity;
 				if (signal5 != null)
 				{
 					signal10 = ((signal5.Parent != null) ? signal5.Parent : signal5);
+					signal10Dist = signal5Dist;
 				}
 				else if (ApproachingSignal != null && DistanceToSignal < 2000f)
 				{
@@ -3265,6 +3508,7 @@ namespace AITraffic.Driver
 					if (SignalRegistry.IsGoverningSignal(signal11))
 					{
 						signal10 = signal11;
+						signal10Dist = DistanceToSignal;
 					}
 				}
 				if (signal10 == null && GoverningSignal != null && DistanceToGoverningSignal < 2000f)
@@ -3273,13 +3517,19 @@ namespace AITraffic.Driver
 					if (SignalRegistry.IsGoverningSignal(signal12))
 					{
 						signal10 = signal12;
+						signal10Dist = DistanceToGoverningSignal;
 					}
 				}
 				if (signal10 == null && _upcomingSignalBlocks.Count > 0 && _upcomingSignalBlocks[0].ExitSignal != null && _upcomingSignalBlocks[0].DistanceToExit < 2000f)
 				{
 					signal10 = _upcomingSignalBlocks[0].ExitSignal;
+					signal10Dist = _upcomingSignalBlocks[0].DistanceToExit;
 				}
 				if (_isShuntingMode && signal10 != null && signal10 == signal3)
+				{
+					signal10 = null;
+				}
+				if (signal10 != null && IsDestinationTerminalSignal(signal10, signal10Dist))
 				{
 					signal10 = null;
 				}
@@ -3317,7 +3567,7 @@ namespace AITraffic.Driver
 				{
 					SignalBlockInfo signalBlockInfo4 = _upcomingSignalBlocks[0];
 					float distanceToExit = signalBlockInfo4.DistanceToExit;
-					if (distanceToExit < 2000f && signalBlockInfo4.AreSwitchesAligned && signalBlockInfo4.IsClear)
+					if (distanceToExit < 2000f && signalBlockInfo4.AreSwitchesAligned && signalBlockInfo4.IsClear && !IsDestinationTerminalSignal(signalBlockInfo4.ExitSignal, distanceToExit))
 					{
 						Signals.Game.Signal exitSignal = signalBlockInfo4.ExitSignal;
 						Signals.Game.Signal signal14 = ((exitSignal.Parent != null) ? exitSignal.Parent : exitSignal);
@@ -3343,7 +3593,7 @@ namespace AITraffic.Driver
 						}
 					}
 				}
-				if (signal5 != null && HoldsSignalReservation(signal5))
+				if (signal5 != null && HoldsSignalReservation(signal5) && !isDestTerminalSig5)
 				{
 					Signals.Game.Signal signal7 = ((signal5.Parent != null) ? signal5.Parent : signal5);
 					SignalBlockInfo signalBlockInfo4 = ((_upcomingSignalBlocks.Count > 0) ? _upcomingSignalBlocks[0] : null);
@@ -7518,36 +7768,30 @@ namespace AITraffic.Driver
 				}
 			}
 			bool flag2 = false;
+			bool arrivedWithEntryOverhang = false;
 			if ((IsStationDestination || IsTerminusDestination) && CurrentSpeedKmh < 0.5f && StationaryTimer >= 2f)
 			{
+				RailTrack resolvedDestTrack;
+				bool destForward;
+				bool isTwoOpenSides;
+				GetDestinationTrackOrientation(out resolvedDestTrack, out destForward, out isTwoOpenSides);
+				if (resolvedDestTrack == null && CurrentPath != null && CurrentPath.Tracks != null && CurrentPath.Tracks.Count > 0)
+				{
+					resolvedDestTrack = CurrentPath.Tracks[CurrentPath.Tracks.Count - 1];
+				}
 				if (DistanceToDestination <= 6f)
 				{
 					flag2 = true;
+					if (flag && resolvedDestTrack != null && !IsConsistClearOnDestinationTrack(resolvedDestTrack, destForward, isTwoOpenSides))
+					{
+						arrivedWithEntryOverhang = true;
+					}
 				}
 				else if (flag)
 				{
 					bool flag3 = DistanceToObstacle < 12f;
 					bool flag4 = DistanceToDestination <= 12f;
-					bool flag5 = true;
-					if (_trainCar != null && _trainCar.trainset != null)
-					{
-						TrainCar tailCar = (_trainCar.trainset.cars != null && _trainCar.trainset.cars.Count > 0) ? _trainCar.trainset.cars[_trainCar.trainset.cars.Count - 1] : _trainCar;
-						RailTrack tailTrack = ((tailCar.RearBogie != null) ? tailCar.RearBogie.track : ((tailCar.FrontBogie != null) ? tailCar.FrontBogie.track : null));
-						RailTrack destTrack = ((CurrentPath != null && CurrentPath.Tracks != null && CurrentPath.Tracks.Count > 0) ? CurrentPath.Tracks[CurrentPath.Tracks.Count - 1] : null);
-						if (tailTrack != destTrack)
-						{
-							flag5 = false;
-						}
-						if (flag5 && destTrack != null)
-						{
-							TrainCar occCar;
-							if ((destTrack.inJunction != null && JunctionController.IsJunctionPhysicallyOccupied(destTrack.inJunction, out occCar, null)) ||
-							    (destTrack.outJunction != null && JunctionController.IsJunctionPhysicallyOccupied(destTrack.outJunction, out occCar, null)))
-							{
-								flag5 = false;
-							}
-						}
-					}
+					bool flag5 = IsConsistClearOnDestinationTrack(resolvedDestTrack, destForward, isTwoOpenSides);
 					if (!flag5 && !flag3 && DistanceToDestination > 6f)
 					{
 						TargetSpeedKmh = Mathf.Max(TargetSpeedKmh, 5f);
@@ -7555,6 +7799,10 @@ namespace AITraffic.Driver
 					if (DistanceToDestination <= 6f || (flag3 && CurrentSpeedKmh < 1.5f) || (flag4 && flag5))
 					{
 						flag2 = true;
+						if (!flag5)
+						{
+							arrivedWithEntryOverhang = true;
+						}
 					}
 				}
 			}
@@ -7564,6 +7812,10 @@ namespace AITraffic.Driver
 			}
 			if (flag2 && State != EngineState.TerminusStop && State != EngineState.StationHold)
 			{
+				if (arrivedWithEntryOverhang && Main.ModEntry != null && Main.ModEntry.Logger != null)
+				{
+					Main.ModEntry.Logger.Warning(string.Format("[AITraffic] Train '{0}' arrived at destination '{1}' at primary stop point with rear overhanging entry switch (consist longer than clear headroom before exit signal/switch).", LocoId, DestinationTrackName ?? "Destination"));
+				}
 				if (IsTerminusDestination)
 				{
 					EnterTerminusStop();
@@ -9802,6 +10054,12 @@ namespace AITraffic.Driver
 					num2 += railTrack.curve.length;
 				}
 			}
+			if (num < tracks.Count - 1)
+			{
+				Signals.Game.Signal unusedDestStopSig;
+				bool unusedTwoOpenSides;
+				num2 = Mathf.Max(0f, num2 - GetDestinationStopSetback(out unusedDestStopSig, out unusedTwoOpenSides));
+			}
 			float num3 = Mathf.Max(0f, DistanceToDestination - num2);
 			RailTrack railTrack2 = tracks[num];
 			List<RailTrack> list = ((station != null) ? station.AllStationTracks : null);
@@ -10006,7 +10264,9 @@ namespace AITraffic.Driver
 			bool hasObstacleHold = DistanceToObstacle < 2500f && (_obstacleTrack != null || DistanceToObstacle < 150f);
 			bool hasCorridorHold = _isHoldingForCorridor || _isHoldingInMultiTrack;
 			bool hasSwitchHold = _switchHoldDistance < 100f;
-			bool hasRedHold = isRedSignalStop || _stoppedAtRedTimer >= 5f;
+			float activeSigDist = ((signal == GoverningSignal) ? DistanceToGoverningSignal : DistanceToSignal);
+			bool isDestStopSig = signal != null && IsDestinationTerminalSignal(signal, activeSigDist) && DistanceToDestination <= 25f;
+			bool hasRedHold = !isDestStopSig && (isRedSignalStop || _stoppedAtRedTimer >= 5f);
 			bool hasThroatHold = _isWaitingOutsideStationThroat;
 			bool isBlockedHold = CurrentSpeedKmh < 0.5f && (hasObstacleHold || hasCorridorHold || hasSwitchHold || hasRedHold || hasThroatHold);
 

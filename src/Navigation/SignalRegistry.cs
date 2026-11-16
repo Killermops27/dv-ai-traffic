@@ -1418,6 +1418,66 @@ namespace AITraffic.Navigation
         }
 
         /// <summary>
+        /// Looks up the primary stopping signal (exit signal, shunting signal, or non-entry governing signal)
+        /// on a destination track facing the arriving train's direction of travel along that track.
+        /// Returns the first such signal encountered along the travel direction and its distance back from
+        /// the exit end of the destination track.
+        /// </summary>
+        public static bool TryGetDestinationStopSignal(RailTrack destTrack, bool forward, out DVSignal stopSignal, out float distFromTrackExit)
+        {
+            stopSignal = null;
+            distFromTrackExit = 0f;
+            if (destTrack == null || destTrack.curve == null || !ModCompatManager.IsDVSignalsLoaded) return false;
+
+            if (!s_isInitialized || s_trackSignals.Count == 0)
+            {
+                Initialize();
+            }
+
+            List<DVSignal> sigList;
+            if (!s_trackSignals.TryGetValue(destTrack, out sigList) || sigList == null || sigList.Count == 0)
+            {
+                return false;
+            }
+
+            float trackLen = destTrack.curve.length;
+            float dir = forward ? 1.0f : -1.0f;
+            float bestDistFromEntry = float.PositiveInfinity;
+
+            for (int i = 0; i < sigList.Count; i++)
+            {
+                var sig = sigList[i];
+                if (sig == null || sig.Controller == null || !sig.Controller.PlacementInfo.HasValue) continue;
+                if (!IsSignalFacingTrain(sig, dir)) continue;
+
+                var effSig = sig.Parent != null ? sig.Parent : sig;
+                if (IsEntrySignal(effSig)) continue;
+                bool isExitOrShunt = IsExitSignal(effSig) ||
+                                     (effSig.Controller != null && effSig.Controller.Type == Signals.Game.SignalType.Shunting) ||
+                                     IsGoverningSignal(effSig);
+                if (!isExitOrShunt) continue;
+
+                double sigSpan = sig.Controller.PlacementInfo.Value.Span;
+                float distFromEntry = forward ? (float)sigSpan : (trackLen - (float)sigSpan);
+                distFromEntry = Mathf.Clamp(distFromEntry, 0f, trackLen);
+
+                if (distFromEntry < bestDistFromEntry)
+                {
+                    bestDistFromEntry = distFromEntry;
+                    stopSignal = effSig;
+                }
+            }
+
+            if (stopSignal != null)
+            {
+                distFromTrackExit = Mathf.Max(0f, trackLen - bestDistFromEntry);
+                return true;
+            }
+
+            return false;
+        }
+
+        /// <summary>
         /// Retrieves the track and placement span for a DVSignal or its parent/controller.
         /// </summary>
         public static bool TryGetSignalPlacement(DVSignal signal, out RailTrack track, out double span)
