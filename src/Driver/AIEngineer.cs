@@ -1627,6 +1627,14 @@ namespace AITraffic.Driver
 				SetLockedPullingReverser(pullingReverser);
 			}
 
+			if (_dm3Controller != null && _dm3Controller.IsDM3)
+			{
+				_dm3Controller.SetParked(false);
+			}
+			// CRITICAL INVARIANT [AIE-23]: re-arm the 3.0 s takeover grace window, unlatch terminal park,
+			// and sync control baselines on multi-leg departure before State becomes Idle / EnsureEngineRunning().
+			BeginWorkerCoPilotSession();
+
 			State = EngineState.Idle;
 			EnsureEngineRunning();
 		}
@@ -1834,6 +1842,10 @@ namespace AITraffic.Driver
 					else if (_offRouteReverseStage != 0)
 					{
 						UpdateOffRouteReverseProtocol(deltaTime);
+					}
+					if (IsWorkerDriven && State != EngineState.PlayerCoPilotStandby)
+					{
+						ClearCoPilotLeverPauseStates();
 					}
 					ExecuteControlOutputs(deltaTime);
 				}
@@ -6787,9 +6799,10 @@ namespace AITraffic.Driver
 					_commandedThrottle = 0f;
 					_rampThrottle = 0f;
 					_currentThrottle = 0f;
-					if (_controlsOverrider != null && _controlsOverrider.Throttle != null)
+					if (_controlsOverrider != null && _controlsOverrider.Throttle != null && CanActuateCoPilotLever(ref _copilotThrottleState))
 					{
 						_controlsOverrider.Throttle.Set(0f);
+						RecordCoPilotPostWrite(ref _copilotThrottleState, _controlsOverrider.Throttle.Value, 0f);
 					}
 					_tmZeroCurrentTimer = 0f;
 					if (_breakerCheckCooldown <= 0f)
@@ -6879,9 +6892,10 @@ namespace AITraffic.Driver
 				_commandedThrottle = 0f;
 				_rampThrottle = 0f;
 				_currentThrottle = 0f;
-				if (_controlsOverrider != null && _controlsOverrider.Throttle != null)
+				if (_controlsOverrider != null && _controlsOverrider.Throttle != null && CanActuateCoPilotLever(ref _copilotThrottleState))
 				{
 					_controlsOverrider.Throttle.Set(0f);
+					RecordCoPilotPostWrite(ref _copilotThrottleState, _controlsOverrider.Throttle.Value, 0f);
 				}
 				_breakerCheckCooldown = 3f;
 				CycleBreakerLever();
@@ -6990,13 +7004,21 @@ namespace AITraffic.Driver
 				BaseControlsOverrider baseControlsOverrider = ((loco.SimController != null) ? loco.SimController.controlsOverrider : loco.GetComponent<BaseControlsOverrider>());
 				if (baseControlsOverrider != null)
 				{
-					if (baseControlsOverrider.Throttle != null)
+					if (baseControlsOverrider.Throttle != null && (!isLead || CanActuateCoPilotLever(ref _copilotThrottleState)))
 					{
 						baseControlsOverrider.Throttle.Set(0f);
+						if (isLead)
+						{
+							RecordCoPilotPostWrite(ref _copilotThrottleState, baseControlsOverrider.Throttle.Value, 0f);
+						}
 					}
-					if (baseControlsOverrider.DynamicBrake != null)
+					if (baseControlsOverrider.DynamicBrake != null && (!isLead || CanActuateCoPilotLever(ref _copilotDynBrakeState)))
 					{
 						baseControlsOverrider.DynamicBrake.Set(0f);
+						if (isLead)
+						{
+							RecordCoPilotPostWrite(ref _copilotDynBrakeState, baseControlsOverrider.DynamicBrake.Value, 0f);
+						}
 					}
 				}
 				PoweredWheelsManager componentInChildren = loco.GetComponentInChildren<PoweredWheelsManager>();
@@ -7053,10 +7075,12 @@ namespace AITraffic.Driver
 					}
 				}
 				StartupHelper.Startup(loco);
-				if (isLead && baseControlsOverrider != null && baseControlsOverrider.Reverser != null)
+				if (isLead && baseControlsOverrider != null && baseControlsOverrider.Reverser != null && CanActuateCoPilotLever(ref _copilotReverserState))
 				{
 					float dir = ((_ambientLockedReverser != 0f) ? _ambientLockedReverser : ((_desiredReverser != 0f) ? _desiredReverser : 1f));
-					baseControlsOverrider.Reverser.Set(MapDirectionToReverserControl(dir));
+					float revCtrl = MapDirectionToReverserControl(dir);
+					baseControlsOverrider.Reverser.Set(revCtrl);
+					RecordCoPilotPostWrite(ref _copilotReverserState, baseControlsOverrider.Reverser.Value, revCtrl);
 				}
 				if (flag && Main.ModEntry != null && Main.ModEntry.Logger != null)
 				{
@@ -8440,15 +8464,18 @@ namespace AITraffic.Driver
 				if (_controlsOverrider.Throttle != null)
 				{
 					_controlsOverrider.Throttle.Set(_currentThrottle);
+					RecordCoPilotPostWrite(ref _copilotThrottleState, _controlsOverrider.Throttle.Value, _currentThrottle);
 				}
 				if (_controlsOverrider.Brake != null)
 				{
 					_controlsOverrider.Brake.Set(_currentTrainBrake);
+					RecordCoPilotPostWrite(ref _copilotBrakeState, _controlsOverrider.Brake.Value, _currentTrainBrake);
 				}
 				if (_hasDynamicBrake && _controlsOverrider.DynamicBrake != null)
 				{
 					_currentDynamicBrake = Mathf.Lerp(_copilotStartDynBrake, _commandedDynamicBrake, blendT);
 					_controlsOverrider.DynamicBrake.Set(_currentDynamicBrake);
+					RecordCoPilotPostWrite(ref _copilotDynBrakeState, _controlsOverrider.DynamicBrake.Value, _currentDynamicBrake);
 				}
 				// CRITICAL INVARIANT [AIE-03]: Decoupled Hill-Start Balanced Bleed & Independent Brake Motion Invariant
 				if (CurrentSpeedKmh >= 0.2f)
@@ -8463,13 +8490,16 @@ namespace AITraffic.Driver
 				if (_controlsOverrider.IndependentBrake != null)
 				{
 					_controlsOverrider.IndependentBrake.Set(_currentIndependentBrake);
+					RecordCoPilotPostWrite(ref _copilotIndBrakeState, _controlsOverrider.IndependentBrake.Value, _currentIndependentBrake);
 				}
 				if (CurrentSpeedMs < 0.15f)
 				{
 					_currentReverser = _commandedReverser;
 					if (_controlsOverrider.Reverser != null)
 					{
-						_controlsOverrider.Reverser.Set(MapDirectionToReverserControl(_currentReverser));
+						float revCtrl = MapDirectionToReverserControl(_currentReverser);
+						_controlsOverrider.Reverser.Set(revCtrl);
+						RecordCoPilotPostWrite(ref _copilotReverserState, _controlsOverrider.Reverser.Value, revCtrl);
 					}
 				}
 				if (_controlsOverrider.Handbrake != null && State != EngineState.TerminusStop && _reverseProtocolStage != SingleTrackReverseStage.SecuredInSiding)
@@ -8480,9 +8510,10 @@ namespace AITraffic.Driver
 			}
 			float num2 = ((IsHillStarting && num > _currentThrottle) ? Mathf.Max(ThrottleSlewRate, 0.16f) : ThrottleSlewRate);
 			_currentThrottle = Mathf.MoveTowards(_currentThrottle, num, num2 * dt);
-			if (_controlsOverrider.Throttle != null)
+			if (_controlsOverrider.Throttle != null && CanActuateCoPilotLever(ref _copilotThrottleState))
 			{
 				_controlsOverrider.Throttle.Set(_currentThrottle);
+				RecordCoPilotPostWrite(ref _copilotThrottleState, _controlsOverrider.Throttle.Value, _currentThrottle);
 			}
 			float trackWetness = GetTrackWetness();
 			float num3 = ((trackWetness > 0.1f) ? 1.2f : 3.5f);
@@ -8496,14 +8527,19 @@ namespace AITraffic.Driver
 			{
 				_currentTrainBrake = Mathf.MoveTowards(_currentTrainBrake, _commandedTrainBrake, num4 * dt);
 			}
-			if (_controlsOverrider.Brake != null)
+			if (_controlsOverrider.Brake != null && CanActuateCoPilotLever(ref _copilotBrakeState))
 			{
 				_controlsOverrider.Brake.Set(_currentTrainBrake);
+				RecordCoPilotPostWrite(ref _copilotBrakeState, _controlsOverrider.Brake.Value, _currentTrainBrake);
 			}
 			if (_hasDynamicBrake && _controlsOverrider.DynamicBrake != null)
 			{
 				_currentDynamicBrake = Mathf.MoveTowards(_currentDynamicBrake, _commandedDynamicBrake, DynamicBrakeSlewRate * dt);
-				_controlsOverrider.DynamicBrake.Set(_currentDynamicBrake);
+				if (CanActuateCoPilotLever(ref _copilotDynBrakeState))
+				{
+					_controlsOverrider.DynamicBrake.Set(_currentDynamicBrake);
+					RecordCoPilotPostWrite(ref _copilotDynBrakeState, _controlsOverrider.DynamicBrake.Value, _currentDynamicBrake);
+				}
 			}
 			// CRITICAL INVARIANT [AIE-03]: Decoupled Hill-Start Balanced Bleed & Independent Brake Motion Invariant
 			if (CurrentSpeedKmh >= 0.2f)
@@ -8520,9 +8556,10 @@ namespace AITraffic.Driver
 			{
 				_currentIndependentBrake = Mathf.MoveTowards(_currentIndependentBrake, _commandedIndependentBrake, num6 * dt);
 			}
-			if (_controlsOverrider.IndependentBrake != null)
+			if (_controlsOverrider.IndependentBrake != null && CanActuateCoPilotLever(ref _copilotIndBrakeState))
 			{
 				_controlsOverrider.IndependentBrake.Set(_currentIndependentBrake);
+				RecordCoPilotPostWrite(ref _copilotIndBrakeState, _controlsOverrider.IndependentBrake.Value, _currentIndependentBrake);
 			}
 			if (IsIntentionalReverseActive)
 			{
@@ -8539,9 +8576,11 @@ namespace AITraffic.Driver
 			if (CurrentSpeedMs < 0.15f)
 			{
 				_currentReverser = _commandedReverser;
-				if (_controlsOverrider.Reverser != null)
+				if (_controlsOverrider.Reverser != null && CanActuateCoPilotLever(ref _copilotReverserState))
 				{
-					_controlsOverrider.Reverser.Set(MapDirectionToReverserControl(_currentReverser));
+					float revCtrl = MapDirectionToReverserControl(_currentReverser);
+					_controlsOverrider.Reverser.Set(revCtrl);
+					RecordCoPilotPostWrite(ref _copilotReverserState, _controlsOverrider.Reverser.Value, revCtrl);
 				}
 			}
 			// CRITICAL INVARIANT [WRK-10]: approach-staging holding brake during stop-line wait; never engages the handbrake (unlike the WRK-08 block below)
@@ -8553,13 +8592,15 @@ namespace AITraffic.Driver
 				_currentIndependentBrake = 1f;
 				if (_controlsOverrider != null)
 				{
-					if (_controlsOverrider.Brake != null)
+					if (_controlsOverrider.Brake != null && CanActuateCoPilotLever(ref _copilotBrakeState))
 					{
 						_controlsOverrider.Brake.Set(1f);
+						RecordCoPilotPostWrite(ref _copilotBrakeState, _controlsOverrider.Brake.Value, 1f);
 					}
-					if (_controlsOverrider.IndependentBrake != null)
+					if (_controlsOverrider.IndependentBrake != null && CanActuateCoPilotLever(ref _copilotIndBrakeState))
 					{
 						_controlsOverrider.IndependentBrake.Set(1f);
+						RecordCoPilotPostWrite(ref _copilotIndBrakeState, _controlsOverrider.IndependentBrake.Value, 1f);
 					}
 				}
 			}
@@ -8570,13 +8611,15 @@ namespace AITraffic.Driver
 				_currentTrainBrake = 1f;
 				_commandedIndependentBrake = 1f;
 				_currentIndependentBrake = 1f;
-				if (_controlsOverrider.Brake != null)
+				if (_controlsOverrider.Brake != null && CanActuateCoPilotLever(ref _copilotBrakeState))
 				{
 					_controlsOverrider.Brake.Set(1f);
+					RecordCoPilotPostWrite(ref _copilotBrakeState, _controlsOverrider.Brake.Value, 1f);
 				}
-				if (_controlsOverrider.IndependentBrake != null)
+				if (_controlsOverrider.IndependentBrake != null && CanActuateCoPilotLever(ref _copilotIndBrakeState))
 				{
 					_controlsOverrider.IndependentBrake.Set(1f);
+					RecordCoPilotPostWrite(ref _copilotIndBrakeState, _controlsOverrider.IndependentBrake.Value, 1f);
 				}
 				if (_controlsOverrider.Handbrake != null)
 				{
@@ -8946,6 +8989,7 @@ namespace AITraffic.Driver
 			{
 				State = EngineState.Starting;
 			}
+			SyncLeverObserversFromCab();
 			EnsureEngineRunning();
 		}
 
@@ -8953,6 +8997,7 @@ namespace AITraffic.Driver
 		public void ResumeAIDriving(bool showToast = false)
 		{
 			SyncCurrentControlsFromCabLevers();
+			_playerWasInCab = (_trainCar != null && PlayerManager.Car == _trainCar);
 			_copilotStartThrottle = _currentThrottle;
 			_copilotStartTrainBrake = _currentTrainBrake;
 			_copilotStartIndBrake = _currentIndependentBrake;
@@ -8995,24 +9040,59 @@ namespace AITraffic.Driver
 
 		// ==== Worker lifecycle state (v0.2.9 · D1/D2/D3/D4) — see GRAVEYARD [AIE-21] [AIE-22] [AIE-23] ====
 		private const float CoPilotTakeoverGraceDuration = 3.0f;
-		private const float CoPilotLeverSettleTime = 0.15f;
+		private const float CoPilotTakeoverThreshold = 0.18f;
+		private const float CoPilotLeverPauseDuration = 0.50f;
+		private const float CoPilotLeverMoveEpsilon = 0.0005f;
 		private const float StageProgressResetDistance = 1.0f;
 		private const float StageProgressSpeedKmh = 1.0f;
 		private const int MaxMomentumRunUpAttempts = 3;
 		private Vector3 _stageEntryPosition = Vector3.zero;
 		private bool _hasMadeProgressSinceStageEntry = false;
 		private int _momentumRunUpAttempts = 0;
+		private struct CoPilotLeverState
+		{
+			public float LastPreWriteValue;
+			public float LastPostWriteValue;
+			public float LastAiCmd;
+			public float BaselineValue;
+			public float LastObserved;
+			public float PauseTimer;
+			public bool HasLastPostWrite;
+
+			public void ResetToValue(float val)
+			{
+				LastPreWriteValue = val;
+				LastPostWriteValue = val;
+				LastAiCmd = val;
+				BaselineValue = val;
+				LastObserved = val;
+				PauseTimer = 0f;
+				HasLastPostWrite = true;
+			}
+
+			public void ClearPause(float currentVal)
+			{
+				if (PauseTimer > 0f)
+				{
+					ResetToValue(currentVal);
+				}
+			}
+
+			public void RecordPostWrite(float postWriteVal, float aiCmd)
+			{
+				LastPostWriteValue = postWriteVal;
+				LastAiCmd = aiCmd;
+				HasLastPostWrite = true;
+			}
+		}
+
 		private bool _parkedStateLatched = false;
-		private float _copilotSettleThrottleLast = -1f;
-		private float _copilotSettleThrottleTimer = 0f;
-		private float _copilotSettleBrakeLast = -1f;
-		private float _copilotSettleBrakeTimer = 0f;
-		private float _copilotSettleIndBrakeLast = -1f;
-		private float _copilotSettleIndBrakeTimer = 0f;
-		private float _copilotSettleDynBrakeLast = -1f;
-		private float _copilotSettleDynBrakeTimer = 0f;
-		private float _copilotSettleReverserLast = -1f;
-		private float _copilotSettleReverserTimer = 0f;
+		private bool _playerWasInCab = false;
+		private CoPilotLeverState _copilotThrottleState;
+		private CoPilotLeverState _copilotBrakeState;
+		private CoPilotLeverState _copilotIndBrakeState;
+		private CoPilotLeverState _copilotDynBrakeState;
+		private CoPilotLeverState _copilotReverserState;
 		// ==== end worker lifecycle state ====
 
 		private void SyncCurrentControlsFromCabLevers()
@@ -9046,21 +9126,57 @@ namespace AITraffic.Driver
 				float reverserDir = (_controlsOverrider.Reverser.Value - 0.5f) * 2f;
 				_currentReverser = ((reverserDir > 0.1f) ? 1f : ((reverserDir < -0.1f) ? (-1f) : 0f));
 			}
-			_copilotSettleThrottleLast = _currentThrottle;
-			_copilotSettleThrottleTimer = 0f;
-			_copilotSettleBrakeLast = _currentTrainBrake;
-			_copilotSettleBrakeTimer = 0f;
-			_copilotSettleIndBrakeLast = _currentIndependentBrake;
-			_copilotSettleIndBrakeTimer = 0f;
-			_copilotSettleDynBrakeLast = _currentDynamicBrake;
-			_copilotSettleDynBrakeTimer = 0f;
-			_copilotSettleReverserLast = ((_controlsOverrider.Reverser != null) ? _controlsOverrider.Reverser.Value : 0.5f);
-			_copilotSettleReverserTimer = 0f;
+			SyncLeverObserversFromCab();
+		}
+
+		private void SyncLeverObserversFromCab()
+		{
+			if (_controlsOverrider == null)
+			{
+				return;
+			}
+			_copilotThrottleState.ResetToValue((_controlsOverrider.Throttle != null) ? _controlsOverrider.Throttle.Value : _currentThrottle);
+			_copilotBrakeState.ResetToValue((_controlsOverrider.Brake != null) ? _controlsOverrider.Brake.Value : _currentTrainBrake);
+			_copilotIndBrakeState.ResetToValue((_controlsOverrider.IndependentBrake != null) ? _controlsOverrider.IndependentBrake.Value : _currentIndependentBrake);
+			_copilotDynBrakeState.ResetToValue((_hasDynamicBrake && _controlsOverrider.DynamicBrake != null) ? _controlsOverrider.DynamicBrake.Value : _currentDynamicBrake);
+			_copilotReverserState.ResetToValue((_controlsOverrider.Reverser != null) ? _controlsOverrider.Reverser.Value : MapDirectionToReverserControl(_currentReverser));
+		}
+
+		private void ClearCoPilotLeverPauseStates()
+		{
+			if (_controlsOverrider == null)
+			{
+				_copilotThrottleState.PauseTimer = 0f;
+				_copilotBrakeState.PauseTimer = 0f;
+				_copilotIndBrakeState.PauseTimer = 0f;
+				_copilotDynBrakeState.PauseTimer = 0f;
+				_copilotReverserState.PauseTimer = 0f;
+				return;
+			}
+			_copilotThrottleState.ClearPause((_controlsOverrider.Throttle != null) ? _controlsOverrider.Throttle.Value : _currentThrottle);
+			_copilotBrakeState.ClearPause((_controlsOverrider.Brake != null) ? _controlsOverrider.Brake.Value : _currentTrainBrake);
+			_copilotIndBrakeState.ClearPause((_controlsOverrider.IndependentBrake != null) ? _controlsOverrider.IndependentBrake.Value : _currentIndependentBrake);
+			_copilotDynBrakeState.ClearPause((_hasDynamicBrake && _controlsOverrider.DynamicBrake != null) ? _controlsOverrider.DynamicBrake.Value : _currentDynamicBrake);
+			_copilotReverserState.ClearPause((_controlsOverrider.Reverser != null) ? _controlsOverrider.Reverser.Value : MapDirectionToReverserControl(_currentReverser));
+		}
+
+		private bool CanActuateCoPilotLever(ref CoPilotLeverState state)
+		{
+			return !IsWorkerDriven || state.PauseTimer <= 0f;
+		}
+
+		private void RecordCoPilotPostWrite(ref CoPilotLeverState state, float postWriteVal, float aiCmd)
+		{
+			if (IsWorkerDriven)
+			{
+				state.RecordPostWrite(postWriteVal, aiCmd);
+			}
 		}
 
 		// CRITICAL INVARIANT [AIE-23]: the ONLY legal way for a worker session to start. WorkerManager calls this once
-		// per attach, in the same frame as AddComponent, so the control baselines, the upgrade-safety levers and the
-		// 3.0 s takeover grace window are all armed BEFORE the first UpdatePlayerCoPilotHandover tick.
+		// per attach, in the same frame as AddComponent, and AssignNextItineraryLeg() calls it on every multi-leg
+		// departure, so the control baselines, lever observers and 3.0 s takeover grace window are all armed BEFORE
+		// the next UpdatePlayerCoPilotHandover tick.
 		public void BeginWorkerCoPilotSession()
 		{
 			if (_controlsOverrider == null && _trainCar != null && _trainCar.SimController != null)
@@ -9072,6 +9188,7 @@ namespace AITraffic.Driver
 				return;
 			}
 			SyncCurrentControlsFromCabLevers();
+			_playerWasInCab = (PlayerManager.Car == _trainCar);
 			_copilotBlendTimer = 0f;
 			_copilotTakeoverGraceTimer = CoPilotTakeoverGraceDuration;
 			_parkedStateLatched = false;
@@ -9094,18 +9211,74 @@ namespace AITraffic.Driver
 			return _trainCar.trainset != null && PlayerManager.Car.trainset == _trainCar.trainset;
 		}
 
-		// CRITICAL INVARIANT [AIE-23]: never accuse a lever the mod itself is still driving. A lever only becomes
-		// eligible for the 0.18f takeover test once it has been byte-stable for CoPilotLeverSettleTime (0.15 s).
-		private bool IsLeverTakeoverArmed(ref float lastValue, ref float settleTimer, float currentValue, float dt)
+		// CRITICAL INVARIANT [AIE-23]: never accuse a lever the simulation notched/damped/clamped itself.
+		// Only genuine player handle movement off LastPostWriteValue pauses AI writes on that lever (0.50 s
+		// accumulation window) and triggers takeover immediately once displacement from BaselineValue exceeds 0.18f.
+		private static bool EvaluateLeverMovementAndTakeover(ref CoPilotLeverState state, float actual, float dt, out float expectedBaseline)
 		{
-			if (Mathf.Abs(currentValue - lastValue) > 0.001f)
+			if (!state.HasLastPostWrite)
 			{
-				lastValue = currentValue;
-				settleTimer = 0f;
+				state.ResetToValue(actual);
+				expectedBaseline = actual;
 				return false;
 			}
-			settleTimer += dt;
-			return settleTimer >= CoPilotLeverSettleTime;
+
+			if (state.PauseTimer > 0f)
+			{
+				if (Mathf.Abs(actual - state.LastObserved) > CoPilotLeverMoveEpsilon)
+				{
+					state.PauseTimer = CoPilotLeverPauseDuration;
+					state.LastObserved = actual;
+				}
+				else
+				{
+					state.PauseTimer = Mathf.Max(0f, state.PauseTimer - dt);
+				}
+
+				if (state.PauseTimer > 0f && Mathf.Abs(actual - state.BaselineValue) > CoPilotTakeoverThreshold)
+				{
+					expectedBaseline = state.BaselineValue;
+					return true;
+				}
+
+				if (state.PauseTimer <= 0f)
+				{
+					state.ResetToValue(actual);
+				}
+				expectedBaseline = state.BaselineValue;
+				return false;
+			}
+
+			float deltaFromPost = actual - state.LastPostWriteValue;
+			if (Mathf.Abs(deltaFromPost) > CoPilotLeverMoveEpsilon)
+			{
+				float remainingToCmd = state.LastAiCmd - state.LastPostWriteValue;
+				bool movedTowardAiCmd = Mathf.Abs(remainingToCmd) > CoPilotLeverMoveEpsilon
+					&& (deltaFromPost * remainingToCmd > 0f)
+					&& (Mathf.Abs(deltaFromPost) <= Mathf.Abs(remainingToCmd) + CoPilotLeverMoveEpsilon);
+				bool snappedBackToPreWrite = Mathf.Abs(state.LastPostWriteValue - state.LastPreWriteValue) > CoPilotLeverMoveEpsilon
+					&& Mathf.Abs(actual - state.LastPreWriteValue) <= CoPilotLeverMoveEpsilon;
+
+				if (!movedTowardAiCmd && !snappedBackToPreWrite)
+				{
+					state.BaselineValue = state.LastPostWriteValue;
+					state.LastObserved = actual;
+					state.PauseTimer = CoPilotLeverPauseDuration;
+					if (Mathf.Abs(actual - state.BaselineValue) > CoPilotTakeoverThreshold)
+					{
+						expectedBaseline = state.BaselineValue;
+						return true;
+					}
+					expectedBaseline = state.BaselineValue;
+					return false;
+				}
+			}
+
+			state.LastPreWriteValue = actual;
+			state.BaselineValue = actual;
+			state.LastObserved = actual;
+			expectedBaseline = actual;
+			return false;
 		}
 
 		private void UpdatePlayerCoPilotHandover(float dt)
@@ -9122,17 +9295,36 @@ namespace AITraffic.Driver
 				}
 				return;
 			}
-			// CRITICAL INVARIANT [AIE-23]: these masks are evaluated before any lever test, so a hire can never
-			// produce a takeover. The grace countdown itself is ticked exactly once per frame in Update().
+			bool inCab = PlayerManager.Car == _trainCar;
+			if (!inCab)
+			{
+				_playerWasInCab = false;
+				ClearCoPilotLeverPauseStates();
+				return;
+			}
+			if (!_playerWasInCab)
+			{
+				_playerWasInCab = true;
+				if (_copilotBlendTimer <= 0f)
+				{
+					SyncCurrentControlsFromCabLevers();
+				}
+				else
+				{
+					SyncLeverObserversFromCab();
+				}
+				_copilotTakeoverGraceTimer = Mathf.Max(_copilotTakeoverGraceTimer, CoPilotTakeoverGraceDuration);
+				return;
+			}
+			// CRITICAL INVARIANT [AIE-23]: these masks are evaluated before any lever test, so a hire, resume,
+			// or cab-entry transition can never produce a takeover. The grace countdown itself is ticked exactly
+			// once per frame in Update().
 			if (_isStartingEngine || _copilotBlendTimer > 0f || _copilotTakeoverGraceTimer > 0f)
 			{
+				SyncLeverObserversFromCab();
 				return;
 			}
-			if (PlayerManager.Car != _trainCar)
-			{
-				return;
-			}
-			// CRITICAL INVARIANT [WRK-10]: staging hold masks train/ind brake so the player never sees a phantom release (IL flag2/num/num2 triple + 0.18f deadzone)
+			// CRITICAL INVARIANT [WRK-10]: staging hold masks train/ind brake baseline context (0.18f deadzone)
 			bool flag2 = (_isEmergencyStop || _isHoldingAtLoop || (_isWorkerApproachStaging && _isWaitingOutsideStationThroat)) && CurrentSpeedKmh < 0.2f;
 			float num = (flag2 ? 1f : _currentTrainBrake);
 			float num2 = (flag2 ? 1f : _currentIndependentBrake);
@@ -9141,43 +9333,56 @@ namespace AITraffic.Driver
 			float indBrakeValue = ((_controlsOverrider.IndependentBrake != null) ? _controlsOverrider.IndependentBrake.Value : num2);
 			float dynBrakeValue = ((_hasDynamicBrake && _controlsOverrider.DynamicBrake != null) ? _controlsOverrider.DynamicBrake.Value : _currentDynamicBrake);
 			float reverserValue = ((_controlsOverrider.Reverser != null) ? _controlsOverrider.Reverser.Value : MapDirectionToReverserControl(_currentReverser));
-			bool throttleArmed = (_controlsOverrider.Throttle != null) && IsLeverTakeoverArmed(ref _copilotSettleThrottleLast, ref _copilotSettleThrottleTimer, throttleValue, dt);
-			bool brakeArmed = (_controlsOverrider.Brake != null) && IsLeverTakeoverArmed(ref _copilotSettleBrakeLast, ref _copilotSettleBrakeTimer, brakeValue, dt);
-			bool indBrakeArmed = (_controlsOverrider.IndependentBrake != null) && IsLeverTakeoverArmed(ref _copilotSettleIndBrakeLast, ref _copilotSettleIndBrakeTimer, indBrakeValue, dt);
-			bool dynBrakeArmed = (_hasDynamicBrake && _controlsOverrider.DynamicBrake != null) && IsLeverTakeoverArmed(ref _copilotSettleDynBrakeLast, ref _copilotSettleDynBrakeTimer, dynBrakeValue, dt);
-			bool reverserArmed = (_controlsOverrider.Reverser != null) && IsLeverTakeoverArmed(ref _copilotSettleReverserLast, ref _copilotSettleReverserTimer, reverserValue, dt);
+			float throttleExpected = throttleValue;
+			float brakeExpected = brakeValue;
+			float indBrakeExpected = indBrakeValue;
+			float dynBrakeExpected = dynBrakeValue;
+			float reverserExpected = reverserValue;
+			bool throttleTakeover = (_controlsOverrider.Throttle != null) && EvaluateLeverMovementAndTakeover(ref _copilotThrottleState, throttleValue, dt, out throttleExpected);
+			bool brakeTakeover = (_controlsOverrider.Brake != null) && EvaluateLeverMovementAndTakeover(ref _copilotBrakeState, brakeValue, dt, out brakeExpected);
+			bool indBrakeTakeover = (_controlsOverrider.IndependentBrake != null) && EvaluateLeverMovementAndTakeover(ref _copilotIndBrakeState, indBrakeValue, dt, out indBrakeExpected);
+			bool dynBrakeTakeover = (_hasDynamicBrake && _controlsOverrider.DynamicBrake != null) && EvaluateLeverMovementAndTakeover(ref _copilotDynBrakeState, dynBrakeValue, dt, out dynBrakeExpected);
+			bool reverserTakeover = false;
+			if (CurrentSpeedMs < 0.15f && _controlsOverrider.Reverser != null)
+			{
+				reverserTakeover = EvaluateLeverMovementAndTakeover(ref _copilotReverserState, reverserValue, dt, out reverserExpected);
+			}
+			else
+			{
+				_copilotReverserState.ResetToValue(reverserValue);
+			}
 			string touchedLever = null;
 			float touchedActual = 0f;
 			float touchedExpected = 0f;
-			if (throttleArmed && Mathf.Abs(throttleValue - _currentThrottle) > 0.18f)
+			if (throttleTakeover)
 			{
 				touchedLever = "throttle";
 				touchedActual = throttleValue;
-				touchedExpected = _currentThrottle;
+				touchedExpected = throttleExpected;
 			}
-			else if (brakeArmed && Mathf.Abs(brakeValue - num) > 0.18f)
+			else if (brakeTakeover)
 			{
 				touchedLever = "train brake";
 				touchedActual = brakeValue;
-				touchedExpected = num;
+				touchedExpected = brakeExpected;
 			}
-			else if (indBrakeArmed && Mathf.Abs(indBrakeValue - num2) > 0.18f)
+			else if (indBrakeTakeover)
 			{
 				touchedLever = "independent brake";
 				touchedActual = indBrakeValue;
-				touchedExpected = num2;
+				touchedExpected = indBrakeExpected;
 			}
-			else if (dynBrakeArmed && Mathf.Abs(dynBrakeValue - _currentDynamicBrake) > 0.18f)
+			else if (dynBrakeTakeover)
 			{
 				touchedLever = "dynamic brake";
 				touchedActual = dynBrakeValue;
-				touchedExpected = _currentDynamicBrake;
+				touchedExpected = dynBrakeExpected;
 			}
-			else if (CurrentSpeedMs < 0.15f && reverserArmed && Mathf.Abs(reverserValue - MapDirectionToReverserControl(_currentReverser)) > 0.18f)
+			else if (reverserTakeover)
 			{
 				touchedLever = "reverser";
 				touchedActual = reverserValue;
-				touchedExpected = MapDirectionToReverserControl(_currentReverser);
+				touchedExpected = reverserExpected;
 			}
 			if (touchedLever != null)
 			{
