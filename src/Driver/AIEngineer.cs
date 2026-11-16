@@ -208,6 +208,8 @@ namespace AITraffic.Driver
 
 		private float _rollbackClearTimer;
 
+		private float _flatRollbackDebounceTimer;
+
 		private float _lastSpeedMs;
 
 		private float _smoothAccMs2;
@@ -6819,6 +6821,7 @@ namespace AITraffic.Driver
 			float forwardSpeed = _trainCar.GetForwardSpeed();
 			float num6 = ((_commandedReverser != 0f) ? _commandedReverser : _desiredReverser);
 			float num7 = forwardSpeed * num6;
+			bool isActiveDriveState = State == EngineState.Accelerating || State == EngineState.Cruising || State == EngineState.Starting;
 			if (Mathf.Abs(forwardSpeed) < 0.15f)
 			{
 				_rollbackClearTimer += dt;
@@ -6827,13 +6830,21 @@ namespace AITraffic.Driver
 			{
 				_rollbackClearTimer = 0f;
 			}
-			if (num7 > 0.15f || (CurrentSpeedKmh > 3f && (State == EngineState.Cruising || State == EngineState.Accelerating)) || IsIntentionalReverseActive)
+			if (!IsHillStarting && HillStage != HillLaunchStage.RollbackDescent && !IsIntentionalReverseActive && (State == EngineState.Accelerating || State == EngineState.Starting) && num7 < -0.25f)
+			{
+				_flatRollbackDebounceTimer += dt;
+			}
+			else
+			{
+				_flatRollbackDebounceTimer = 0f;
+			}
+			if (num7 > 0.15f || (CurrentSpeedKmh > 3f && (State == EngineState.Cruising || State == EngineState.Accelerating)) || IsIntentionalReverseActive || HillStage == HillLaunchStage.RollbackDescent)
 			{
 				_isRollbackDetected = false;
 			}
 			else if (!flag)
 			{
-				if (num7 < -0.3f)
+				if (num7 < -0.3f && isActiveDriveState)
 				{
 					_isRollbackDetected = true;
 				}
@@ -6842,7 +6853,7 @@ namespace AITraffic.Driver
 					_isRollbackDetected = false;
 				}
 			}
-			else if (num7 < -0.6f && (State == EngineState.Accelerating || State == EngineState.Cruising || State == EngineState.Starting))
+			else if (num7 < -0.6f && isActiveDriveState)
 			{
 				_isRollbackDetected = true;
 			}
@@ -6850,15 +6861,16 @@ namespace AITraffic.Driver
 			{
 				_isRollbackDetected = false;
 			}
-			if (IsIntentionalReverseActive)
+			if (IsIntentionalReverseActive || HillStage == HillLaunchStage.RollbackDescent)
 			{
 				_isRollbackDetected = false;
 			}
 			IsRollbackDetected = _isRollbackDetected;
 			if (HillStage != HillLaunchStage.RollbackDescent && !IsIntentionalReverseActive)
 			{
-				float num8 = (IsHillStarting ? (-0.4f) : (-0.08f));
-				if (num7 < num8 && (State == EngineState.Accelerating || State == EngineState.Starting))
+				bool hillImmediateRollback = IsHillStarting && num7 < -0.4f && (State == EngineState.Accelerating || State == EngineState.Starting);
+				bool flatSustainedRollback = !IsHillStarting && _flatRollbackDebounceTimer >= 0.25f && (State == EngineState.Accelerating || State == EngineState.Starting);
+				if (hillImmediateRollback || flatSustainedRollback)
 				{
 					_commandedThrottle = 0f;
 					_rampThrottle = 0f;
@@ -7600,7 +7612,7 @@ namespace AITraffic.Driver
 				{
 					break;
 				}
-				if (num9 > 0.0015f)
+				if (num9 > 0.005f)
 				{
 					if (HillStage == HillLaunchStage.None)
 					{
@@ -7645,7 +7657,7 @@ namespace AITraffic.Driver
 				float num13 = num12 * num10;
 				bool isLocoDM = IsLocoDM3;
 				bool flag9 = isLocoDM && (_dm3Controller == null || _dm3Controller.IsInNeutral || _dm3Controller.IsShifting || _dm3Controller.CurrentGearIndex <= 1);
-				bool flag10 = num11 > 0.0015f;
+				bool flag10 = num11 > 0.005f;
 				bool flag11 = num11 < -0.003f;
 				bool flag12 = flag10 && CurrentSpeedKmh < 5f;
 				bool flag13 = ConsistCarCount <= 1;
@@ -7762,11 +7774,15 @@ namespace AITraffic.Driver
 						}
 						if (HillStage == HillLaunchStage.Stage2_Sanded)
 						{
-							_stage2ContinuousSandingTimer += dt;
+							bool canClockStage2 = !dm3GearboxBusy && _commandedTrainBrake <= 0.15f && _currentTrainBrake <= 0.15f;
+							if (canClockStage2)
+							{
+								_stage2ContinuousSandingTimer += dt;
+							}
 							// CRITICAL INVARIANT [AIE-21]: a rolling, progressing launch is never abandoned for a rollback
 							// just because the sand window expired — that transition manufactured the very rollback →
 							// run-up → stall chain this SPEC removes.
-							if (_stage2ContinuousSandingTimer >= 11f && CurrentSpeedKmh < 1f && !_hasMadeProgressSinceStageEntry)
+							if (_stage2ContinuousSandingTimer >= 11f && CurrentSpeedKmh < 1f && !_hasMadeProgressSinceStageEntry && num11 >= 0.005f)
 							{
 								_stage2ContinuousSandingTimer = 0f;
 								_hillStagnationTimer = 0f;
@@ -7824,9 +7840,9 @@ namespace AITraffic.Driver
 								_rampThrottle = 0f;
 								break;
 							}
-							if (_dm3Controller.CurrentGearIndex > 1)
+							if (_dm3Controller.CurrentGearIndex > 1 && !_dm3Controller.IsShifting)
 							{
-								_dm3Controller.ApplyGearsInstant(1, 1);
+								_dm3Controller.BeginShift(1);
 							}
 						}
 						_commandedThrottle = ComputeAcceleratingThrottle(dt);
@@ -7883,8 +7899,9 @@ namespace AITraffic.Driver
 								_hasMadeProgressSinceStageEntry = true;
 							}
 						}
-						// CRITICAL INVARIANT [AIE-21]: freeze, never decay, the 6 s ground window while the gearbox is busy.
-						if (!dm3GearboxBusy)
+						bool flag17 = _commandedTrainBrake <= 0.15f && _currentTrainBrake <= 0.15f;
+						// CRITICAL INVARIANT [AIE-21]: freeze, never decay, the 6 s ground window while the gearbox is busy or brakes are venting.
+						if (!dm3GearboxBusy && flag17)
 						{
 							_hillGroundProgressWindowTimer += dt;
 						}
@@ -7901,16 +7918,15 @@ namespace AITraffic.Driver
 								_hillGroundWindowStartPos = _trainCar.transform.position;
 							}
 						}
-						bool flag17 = _commandedTrainBrake <= 0.15f;
 						bool flag18 = currentThrottle >= Mathf.Min(0.9f, targetLaunchThrottle * 0.9f);
 						bool flag19 = CurrentAccelerationMs2 <= 0.02f && num13 < 0.2f;
 						bool flag20 = _isWheelSlipping && num13 < 0.2f;
 						bool flag21 = _commandedThrottle > 0.1f;
-						bool flag22 = flag10 && CurrentSpeedKmh < 0.5f && flag21;
-						// CRITICAL INVARIANT [AIE-21]: while the DM3 gearbox is busy the stagnation clock is FROZEN —
+						bool flag22 = flag10 && flag17 && CurrentSpeedKmh < 0.5f && flag21;
+						// CRITICAL INVARIANT [AIE-21]: while the DM3 gearbox is busy or brakes are still venting, the stagnation clock is FROZEN —
 						// neither incremented nor decayed. Adding a `else` decay branch here would re-introduce the
 						// [AIE-01] slip-grip ping-pong; removing this guard re-introduces the L-020 false stall.
-						if (dm3GearboxBusy)
+						if (dm3GearboxBusy || !flag17)
 						{
 							_hillStagnationTimer = _hillStagnationTimer;
 						}
@@ -7954,7 +7970,7 @@ namespace AITraffic.Driver
 							{
 								HillStage = HillLaunchStage.Stage2_Sanded;
 							}
-							else if (HillStage == HillLaunchStage.Stage2_Sanded)
+							else if (HillStage == HillLaunchStage.Stage2_Sanded && num11 >= 0.005f)
 							{
 								HillStage = HillLaunchStage.RollbackDescent;
 								_rollbackStartPosition = ((_trainCar != null) ? _trainCar.transform.position : Vector3.zero);
@@ -8656,7 +8672,7 @@ namespace AITraffic.Driver
 			_isStartingEngine = true;
 			if (_dm3Controller != null && _dm3Controller.IsDM3)
 			{
-				_dm3Controller.ApplyGearsInstant(0, 0);
+				_dm3Controller.ForceNeutral();
 			}
 			try
 			{
@@ -8726,7 +8742,7 @@ namespace AITraffic.Driver
 			_desiredReverser = 0f;
 			if (_dm3Controller != null && _dm3Controller.IsDM3)
 			{
-				_dm3Controller.ApplyGearsInstant(0, 0);
+				_dm3Controller.ForceNeutral();
 			}
 			if (_controlsOverrider != null)
 			{
