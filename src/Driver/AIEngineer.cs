@@ -168,6 +168,12 @@ namespace AITraffic.Driver
 
 		private float _stoppedSwitchAlignCooldown = 0f;
 
+		private readonly Dictionary<Junction, float> _junctionAlignCooldownUntil = new Dictionary<Junction, float>();
+
+		private readonly Dictionary<Junction, byte> _lastRequestedJunctionBranch = new Dictionary<Junction, byte>();
+
+		private readonly Dictionary<Junction, float> _lastRequestedJunctionTime = new Dictionary<Junction, float>();
+
 		// CRITICAL INVARIANT [AIE-18]: Main Signal Yield Protocol State for Player Switch Contention
 		private float _playerYieldWaitTimer = 0f;
 
@@ -399,6 +405,10 @@ namespace AITraffic.Driver
 		private bool _shuntingTargetWasClear;
 
 		private readonly HashSet<Junction> _seenJunctionsThisPass = new HashSet<Junction>();
+
+		private readonly HashSet<RailTrack> _selfOccupiedTracksScratch = new HashSet<RailTrack>();
+
+		private readonly HashSet<string> _keepCorridorIdsScratch = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
 		private float _heavySensorUpdateCooldown = 0f;
 
@@ -1705,6 +1715,9 @@ namespace AITraffic.Driver
 			}
 			_reservedTracks.Clear();
 			_activeCorridorTracks.Clear();
+			_junctionAlignCooldownUntil.Clear();
+			_lastRequestedJunctionBranch.Clear();
+			_lastRequestedJunctionTime.Clear();
 			ReleaseAllSignalReservations();
 			ClearShuntingState();
 			if (TrafficManager.IsRunning && TrafficManager.Instance != null)
@@ -3235,18 +3248,50 @@ namespace AITraffic.Driver
 						}
 					}
 					bool flag26 = false;
+					float jCooldownUntil;
+					if (flag11 && CurrentSpeedKmh < 1.5f && !flag14 && num27 > 600f)
+					{
+						flag21 = false;
+					}
+					if (flag21 && _junctionAlignCooldownUntil.TryGetValue(junction3, out jCooldownUntil) && Time.time < jCooldownUntil)
+					{
+						flag21 = false;
+					}
+					if (!flag20 && flag21 && !flag14 && (CurrentSpeedKmh < 1.5f || (num27 >= 150f && num26 >= 150f)))
+					{
+						byte lastReqBranch;
+						float lastReqTime;
+						if (_lastRequestedJunctionBranch.TryGetValue(junction3, out lastReqBranch) &&
+							lastReqBranch == requiredBranch3 &&
+							_lastRequestedJunctionTime.TryGetValue(junction3, out lastReqTime) &&
+							Time.time - lastReqTime <= 3.0f)
+						{
+							_junctionAlignCooldownUntil[junction3] = Time.time + 6.0f;
+							flag21 = false;
+						}
+					}
 					if (!flag20 && flag21)
 					{
 						int selectedBranch = junction3.selectedBranch;
 						flag20 = JunctionController.Instance.RequestJunctionAlignment(junction3, requiredBranch3, this, false);
-						if (flag20 && junction3.selectedBranch != selectedBranch)
+						if (flag20)
 						{
-							flag26 = true;
+							_lastRequestedJunctionBranch[junction3] = requiredBranch3;
+							_lastRequestedJunctionTime[junction3] = Time.time;
+							if (junction3.selectedBranch != selectedBranch)
+							{
+								flag26 = true;
+							}
 						}
-						else if (!flag20 && _stoppedSwitchAlignCooldown <= 0f)
+						else
 						{
-							// CRITICAL INVARIANT [JNC-09]: Enforce switch alignment retry cooldown when denied (3s moving, 5s stationary) to prevent 0.4s crossover lock thrashing
-							_stoppedSwitchAlignCooldown = ((CurrentSpeedKmh >= 1.5f) ? 3f : 5f);
+							float denyCooldown = (CurrentSpeedKmh >= 1.5f) ? 3f : 5f;
+							_junctionAlignCooldownUntil[junction3] = Time.time + denyCooldown;
+							if (_stoppedSwitchAlignCooldown <= 0f)
+							{
+								// CRITICAL INVARIANT [JNC-09]: Enforce switch alignment retry cooldown when denied (3s moving, 5s stationary) to prevent 0.4s crossover lock thrashing
+								_stoppedSwitchAlignCooldown = denyCooldown;
+							}
 						}
 					}
 					if (_isShuntingMode && _isSelfBlockedShunting)
@@ -3255,6 +3300,7 @@ namespace AITraffic.Driver
 					}
 					if (flag26 && flag11 && signal5 != null)
 					{
+						SignalRegistry.ClearSignalReserveCooldown(signal5);
 						DebouncedWakeAndForceUpdateSignal(signal5);
 						if (signal5.IsOn && signal5.CurrentAspect != null)
 						{
@@ -3746,6 +3792,7 @@ namespace AITraffic.Driver
 					}
 					if ((CurrentSpeedKmh < 1.5f && (flag5 || State == EngineState.StationHold || State == EngineState.TerminusStop)) || flag2 || (flag3 && flag4))
 					{
+						_junctionAlignCooldownUntil[junction] = Time.time + 5f;
 						JunctionController.Instance.ReleaseJunction(junction, this);
 					}
 				}
@@ -5080,7 +5127,7 @@ namespace AITraffic.Driver
 			}
 			for (int i = Math.Max(0, CurrentPathTrackIndex + 1); i < CurrentPath.Tracks.Count; i++)
 			{
-				if (!flag && num2 > 2500f)
+				if (!flag && num2 > 1200f)
 				{
 					break;
 				}
@@ -5118,6 +5165,7 @@ namespace AITraffic.Driver
 			DistToCorridorStart = num;
 			if (corridorTracksCache.Count == 0)
 			{
+				ReleaseClearedCorridorTracksAndTokens(null, false);
 				_isHoldingInMultiTrack = false;
 				_isHoldingForCorridor = false;
 				_corridorHoldReason = null;
@@ -5136,7 +5184,7 @@ namespace AITraffic.Driver
 				if (!flag10 && (SignalRegistry.IsTrackOccupiedByPlayer(track, _trainCar.trainset) || SignalRegistry.IsTrackReservedByPlayerSignal(track)))
 				{
 					flag7 = true;
-					text = "Player train on single track corridor";
+					text = FormatCorridorConflictReason("Player train", track, null);
 					break;
 				}
 				object holder;
@@ -5151,7 +5199,7 @@ namespace AITraffic.Driver
 						{
 							flag8 = true;
 							aIEngineer = aIEngineer2;
-							text = "Player worker train in corridor ahead";
+							text = FormatCorridorConflictReason("Worker " + aIEngineer2.LocoId, track, aIEngineer2);
 							break;
 						}
 						continue;
@@ -5159,7 +5207,7 @@ namespace AITraffic.Driver
 					if (aIEngineer2 == null)
 					{
 						flag9 = true;
-						text = "Corridor reserved by unknown agent";
+						text = FormatCorridorConflictReason("Unknown reservation", track, null);
 						break;
 					}
 					Vector3 lhs = ((_trainCar != null) ? (_trainCar.transform.forward * _desiredReverser) : Vector3.zero);
@@ -5170,7 +5218,8 @@ namespace AITraffic.Driver
 					{
 						flag9 = true;
 						aIEngineer = aIEngineer2;
-						text = (flag11 ? "Opposing AI train in corridor" : "Stopped AI train blocking corridor");
+						string role = (flag11 ? "Opposing AI " : "Stopped AI ") + aIEngineer2.LocoId;
+						text = FormatCorridorConflictReason(role, track, aIEngineer2);
 						break;
 					}
 				}
@@ -5189,7 +5238,7 @@ namespace AITraffic.Driver
 						{
 							flag8 = true;
 							aIEngineer = aIEngineer3;
-							text = "Player worker train on corridor track";
+							text = FormatCorridorConflictReason("Worker " + aIEngineer3.LocoId, aIEngineer3.CurrentTrack, aIEngineer3);
 							break;
 						}
 						continue;
@@ -5453,6 +5502,7 @@ namespace AITraffic.Driver
 			{
 				if (num > 150f)
 				{
+					ReleaseClearedCorridorTracksAndTokens(corridorTracksCache, flag4);
 					if (_isHoldingForCorridor && num > 180f)
 					{
 						_isHoldingForCorridor = false;
@@ -5466,10 +5516,14 @@ namespace AITraffic.Driver
 				{
 					if (!RailGraph.Instance.TryAcquireCorridorToken(corridorTracksCache, this))
 					{
-						ReleaseActiveCorridorToken();
+						ReleaseClearedCorridorTracksAndTokens(null, false);
 						_isHoldingInMultiTrack = true;
 						_isHoldingForCorridor = true;
-						_corridorHoldReason = "Waiting for single-track corridor token";
+						string corridorId = RailGraph.Instance.GetCanonicalCorridorId(corridorTracksCache);
+						object tokHolder;
+						AIEngineer tokEng = (!string.IsNullOrEmpty(corridorId) && RailGraph.Instance.TryGetCorridorTokenHolder(corridorId, out tokHolder)) ? (tokHolder as AIEngineer) : null;
+						string tokenOwner = (tokEng != null) ? ("Token held by " + tokEng.LocoId) : "Waiting for corridor token";
+						_corridorHoldReason = FormatCorridorConflictReason(tokenOwner, corridorTracksCache[0], tokEng);
 						_corridorClearConfirmTimer = 4f;
 						float b2 = Mathf.Max(0f, num - 40f);
 						if (CurrentSpeedKmh < 1.5f && num <= 50f)
@@ -5538,48 +5592,114 @@ namespace AITraffic.Driver
 						_activeCorridorTracks.Add(track);
 					}
 				}
+				ReleaseClearedCorridorTracksAndTokens(corridorTracksCache, flag4 || num <= 150f);
 			}
-			if (_activeCorridorTracks.Count <= 0)
-			{
+		}
+
+		// CRITICAL INVARIANT [AIE-24]: Enforce per-track trailing corridor release behind the rear bogie
+		// and immediate prior-corridor token teardown upon leaving double-track/sidings/yards or entering a new corridor.
+		private void ReleaseClearedCorridorTracksAndTokens(List<RailTrack> currentCorridorTracks, bool keepCurrentCorridorToken)
+		{
+			if (RailGraph.Instance == null || !RailGraph.Instance.IsInitialized)
 				return;
-			}
-			bool flag25 = false;
+
+			_selfOccupiedTracksScratch.Clear();
+			_keepCorridorIdsScratch.Clear();
+
 			if (_trainCar != null && _trainCar.trainset != null && _trainCar.trainset.cars != null)
 			{
 				List<TrainCar> cars = _trainCar.trainset.cars;
 				for (int j = 0; j < cars.Count; j++)
 				{
-					TrainCar trainCar = cars[j];
-					if (!(trainCar == null))
-					{
-						if (trainCar.FrontBogie != null && _activeCorridorTracks.Contains(trainCar.FrontBogie.track))
-						{
-							flag25 = true;
-							break;
-						}
-						if (trainCar.RearBogie != null && _activeCorridorTracks.Contains(trainCar.RearBogie.track))
-						{
-							flag25 = true;
-							break;
-						}
-					}
+					TrainCar car = cars[j];
+					if (car == null) continue;
+					if (car.FrontBogie != null && car.FrontBogie.track != null)
+						_selfOccupiedTracksScratch.Add(car.FrontBogie.track);
+					if (car.RearBogie != null && car.RearBogie.track != null)
+						_selfOccupiedTracksScratch.Add(car.RearBogie.track);
 				}
 			}
-			if (!flag25 && !flag)
+
+			if (keepCurrentCorridorToken && currentCorridorTracks != null && currentCorridorTracks.Count > 0)
 			{
-				ReleaseActiveCorridorToken();
+				string currentId = RailGraph.Instance.GetCanonicalCorridorId(currentCorridorTracks);
+				if (!string.IsNullOrEmpty(currentId))
+					_keepCorridorIdsScratch.Add(currentId);
 			}
+
+			if (_activeCorridorTracks.Count > 0)
+			{
+				_tracksToReleaseScratch.Clear();
+				foreach (RailTrack activeTrack in _activeCorridorTracks)
+				{
+					if (activeTrack == null)
+					{
+						_tracksToReleaseScratch.Add(activeTrack);
+						continue;
+					}
+					bool selfOnTrack = _selfOccupiedTracksScratch.Contains(activeTrack);
+					if (selfOnTrack)
+					{
+						string occCid = RailGraph.Instance.GetCorridorIdForTrack(activeTrack);
+						if (!string.IsNullOrEmpty(occCid))
+							_keepCorridorIdsScratch.Add(occCid);
+					}
+					bool stillAheadInCurrentCorridor = keepCurrentCorridorToken && currentCorridorTracks != null && currentCorridorTracks.Contains(activeTrack);
+					if (!selfOnTrack && !stillAheadInCurrentCorridor)
+					{
+						_tracksToReleaseScratch.Add(activeTrack);
+					}
+				}
+				for (int i = 0; i < _tracksToReleaseScratch.Count; i++)
+				{
+					RailTrack relTrack = _tracksToReleaseScratch[i];
+					if (relTrack != null)
+					{
+						RailGraph.Instance.ReleaseTrackReservation(relTrack, this);
+						_reservedTracks.Remove(relTrack);
+					}
+					_activeCorridorTracks.Remove(relTrack);
+				}
+			}
+
+			if (_keepCorridorIdsScratch.Count == 0)
+			{
+				RailGraph.Instance.ReleaseAllCorridorTokensFor(this);
+			}
+			else
+			{
+				RailGraph.Instance.ReleaseAllCorridorTokensExcept(_keepCorridorIdsScratch, this);
+			}
+		}
+
+		private string FormatCorridorConflictReason(string actorLabel, RailTrack conflictTrack, AIEngineer blockerEng)
+		{
+			string trackName = (conflictTrack != null && !string.IsNullOrEmpty(conflictTrack.name)) ? conflictTrack.name : "corridor";
+			if (_trainCar != null)
+			{
+				if (blockerEng != null && blockerEng.TrainCar != null)
+				{
+					float distM = Vector3.Distance(_trainCar.transform.position, blockerEng.TrainCar.transform.position);
+					return string.Format("{0} ({1:F0}m) on {2}", actorLabel, distM, trackName);
+				}
+				if (conflictTrack != null && conflictTrack.curve != null)
+				{
+					float distM = Vector3.Distance(_trainCar.transform.position, conflictTrack.curve.GetPointAt(0.5f));
+					return string.Format("{0} ({1:F0}m) on {2}", actorLabel, distM, trackName);
+				}
+			}
+			return string.Format("{0} on {1}", actorLabel, trackName);
 		}
 
 		private void ReleaseActiveCorridorToken()
 		{
-			if (_activeCorridorTracks.Count == 0)
-			{
-				return;
-			}
 			if (RailGraph.Instance != null && RailGraph.Instance.IsInitialized)
 			{
 				RailGraph.Instance.ReleaseAllCorridorTokensFor(this);
+			}
+			if (_activeCorridorTracks.Count == 0)
+			{
+				return;
 			}
 			foreach (RailTrack activeCorridorTrack in _activeCorridorTracks)
 			{
@@ -6469,7 +6589,9 @@ namespace AITraffic.Driver
 			}
 			_filteredSignalsCache.Clear();
 			List<SignalRegistry.UpcomingSignal> filteredSignalsCache = _filteredSignalsCache;
-			float num = EffectiveObstacleDistance;
+			float num = DistanceToObstacle;
+			float corridorHoldDist = _corridorHoldDistance;
+			float switchHoldDist = _switchHoldDistance;
 			// CRITICAL INVARIANT [WRK-10]: graded worker staging stop line — clamp the target-approach distance short of the occupied receiving track
 			if (_isWorkerApproachStaging && _workerStagingHasStopLine)
 			{
@@ -6479,7 +6601,7 @@ namespace AITraffic.Driver
 			if (_playerYieldWaitTimer > 0f && !float.IsInfinity(DistanceToGoverningSignal))
 			{
 				float yieldStopDist = ((CurrentSpeedKmh < 1.5f && DistanceToGoverningSignal <= 25f) ? 0f : Mathf.Max(0f, DistanceToGoverningSignal - 15f));
-				num = Mathf.Min(num, yieldStopDist);
+				switchHoldDist = Mathf.Min(switchHoldDist, yieldStopDist);
 			}
 			if (_upcomingSignals != null)
 			{
@@ -6496,7 +6618,8 @@ namespace AITraffic.Driver
 						}
 					}
 					// CRITICAL INVARIANT [AIE-17]: Block occupancy & unaligned switch stop enforcement at governing signal boundary
-					bool flag = false;
+					bool switchesUnalignedHold = false;
+					bool blockOccupiedHold = false;
 					if (item.Distance < 400f && _upcomingSignalBlocks != null && _upcomingSignalBlocks.Count > 0)
 					{
 						SignalBlockInfo signalBlockInfo = _upcomingSignalBlocks[0];
@@ -6504,15 +6627,17 @@ namespace AITraffic.Driver
 						{
 							bool switchesUnaligned = signalBlockInfo.Switches != null && signalBlockInfo.Switches.Count > 0 && !signalBlockInfo.AreSwitchesAligned;
 							bool blockOccupied = !signalBlockInfo.IsClear || signalBlockInfo.IsPlayerOccupied;
-							if (switchesUnaligned || blockOccupied)
-							{
-								flag = true;
-							}
+							blockOccupiedHold = blockOccupied;
+							switchesUnalignedHold = !blockOccupied && switchesUnaligned;
 						}
 					}
-					if (flag)
+					if (blockOccupiedHold)
 					{
 						num = Mathf.Min(num, Mathf.Max(0f, item.Distance - 15f));
+					}
+					else if (switchesUnalignedHold)
+					{
+						switchHoldDist = Mathf.Min(switchHoldDist, Mathf.Max(0f, item.Distance - 15f));
 					}
 					filteredSignalsCache.Add(item);
 				}
@@ -6526,7 +6651,7 @@ namespace AITraffic.Driver
 			float b = ((IniConfigManager.Instance != null && IniConfigManager.Instance.Physics != null) ? IniConfigManager.Instance.Physics.WetDecelerationMultiplier : 0.6f);
 			float num3 = Mathf.Lerp(1f, b, trackWetness);
 			SpeedProfiler.ServiceDeceleration = Mathf.Max(0.2f, num2 * num3);
-			SpeedProfileResult currentSpeedProfile = SpeedProfiler.CalculateTargetSpeed(currentTrack, currentSpan, TargetDirection, UpcomingTracks, filteredSignalsCache, num, DistanceToDestination, IsStationDestination, IsTerminusDestination);
+			SpeedProfileResult currentSpeedProfile = SpeedProfiler.CalculateTargetSpeed(currentTrack, currentSpan, TargetDirection, UpcomingTracks, filteredSignalsCache, num, DistanceToDestination, IsStationDestination, IsTerminusDestination, corridorHoldDist, switchHoldDist);
 			float num4 = 120f;
 			List<TrainCar> list = ((_registeredConsistCars.Count > 0) ? _registeredConsistCars : ((_trainCar != null && _trainCar.trainset != null) ? _trainCar.trainset.cars : null));
 			if (list != null && list.Count > 0 && SpeedProfiler != null)

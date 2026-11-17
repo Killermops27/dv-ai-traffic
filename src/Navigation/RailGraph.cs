@@ -497,20 +497,34 @@ namespace AITraffic.Navigation
         {
             public Vector3 Position;
             public RailNode Node;
-            public PositionNodeEntry(Vector3 pos, RailNode node)
+            public bool IsTurntable;
+            public PositionNodeEntry(Vector3 pos, RailNode node, bool isTurntable)
             {
                 Position = pos;
                 Node = node;
+                IsTurntable = isTurntable;
             }
         }
 
+        private static bool IsTurntableTrackName(string trackName)
+        {
+            if (string.IsNullOrEmpty(trackName)) return false;
+            return trackName.IndexOf("Turntable", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                   trackName.IndexOf("[T]", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                   trackName.EndsWith("-T]", StringComparison.OrdinalIgnoreCase);
+        }
+
+        // CRITICAL INVARIANT [RGR-12]: Use 0.35m endpoint merge threshold for non-turntable tracks so 0.806m-0.906m
+        // diamond crossings (e.g. CWSXCD 24 <-> DT-CWSB 24) never weld into phantom degree-4 nodes, while
+        // preserving 1.2m tolerance when either endpoint belongs to a turntable bridge/pit.
         private void BuildNodesAndEdges(List<RailTrack> allTracks)
         {
             int nodeIdCounter = 1;
             int edgeIdCounter = 1;
 
             var positionToNode = new List<PositionNodeEntry>();
-            const float positionMergeThreshold = 1.2f;
+            const float nonTurntableMergeThreshold = 0.35f;
+            const float turntableMergeThreshold = 1.2f;
 
             for (int tIdx = 0; tIdx < allTracks.Count; tIdx++)
             {
@@ -520,9 +534,10 @@ namespace AITraffic.Navigation
 
                 Vector3 inPos = track.curve[0].position;
                 Vector3 outPos = track.curve.Last().position;
+                bool isTurntable = IsTurntableTrackName(track.name);
 
-                RailNode fromNode = GetOrCreateNode(inPos, track.inJunction, track.inJunction != null ? track.inJunction.name : track.name + "_In", ref nodeIdCounter, positionToNode, positionMergeThreshold);
-                RailNode toNode = GetOrCreateNode(outPos, track.outJunction, track.outJunction != null ? track.outJunction.name : track.name + "_Out", ref nodeIdCounter, positionToNode, positionMergeThreshold);
+                RailNode fromNode = GetOrCreateNode(inPos, track.inJunction, track.inJunction != null ? track.inJunction.name : track.name + "_In", ref nodeIdCounter, positionToNode, isTurntable, nonTurntableMergeThreshold, turntableMergeThreshold);
+                RailNode toNode = GetOrCreateNode(outPos, track.outJunction, track.outJunction != null ? track.outJunction.name : track.name + "_Out", ref nodeIdCounter, positionToNode, isTurntable, nonTurntableMergeThreshold, turntableMergeThreshold);
 
                 var edge = new RailEdge(edgeIdCounter++, track, fromNode, toNode);
                 Edges.Add(edge);
@@ -543,7 +558,9 @@ namespace AITraffic.Navigation
             string namePrefix,
             ref int nodeIdCounter,
             List<PositionNodeEntry> positionToNode,
-            float positionMergeThreshold)
+            bool isTurntable,
+            float nonTurntableMergeThreshold,
+            float turntableMergeThreshold)
         {
             RailNode existingJunctionNode;
             if (junction != null && _junctionToNode.TryGetValue(junction, out existingJunctionNode))
@@ -554,8 +571,14 @@ namespace AITraffic.Navigation
             for (int i = 0; i < positionToNode.Count; i++)
             {
                 var item = positionToNode[i];
-                if (Vector3.Distance(item.Position, pos) <= positionMergeThreshold)
+                float mergeThreshold = (isTurntable || item.IsTurntable) ? turntableMergeThreshold : nonTurntableMergeThreshold;
+                if (Vector3.Distance(item.Position, pos) <= mergeThreshold)
                 {
+                    if (isTurntable && !item.IsTurntable)
+                    {
+                        item.IsTurntable = true;
+                        positionToNode[i] = item;
+                    }
                     if (junction != null)
                     {
                         if (item.Node.Junction == null)
@@ -571,7 +594,7 @@ namespace AITraffic.Navigation
             var newNode = new RailNode(nodeIdCounter++, namePrefix, pos, junction);
             Nodes.Add(newNode);
             _nodesById[newNode.Id] = newNode;
-            positionToNode.Add(new PositionNodeEntry(pos, newNode));
+            positionToNode.Add(new PositionNodeEntry(pos, newNode, isTurntable));
 
             if (junction != null)
             {
@@ -2189,6 +2212,214 @@ namespace AITraffic.Navigation
             return occupied;
         }
 
+        /// <summary>
+        /// Main-thread only ([RGR-03]). Snapshots paired right-hand double-track corridor tracks occupied
+        /// or reserved exclusively by actively moving (>= 1.5 km/h) same-direction AI consists, storing
+        /// spline polarity (+1 FromNode->ToNode, -1 ToNode->FromNode). Any track containing player,
+        /// suspended, stationary, stalled, holding, reversing, or conflicting traffic is excluded.
+        /// </summary>
+        // CRITICAL INVARIANT [RGR-12]: Main-thread-only same-direction moving AI snapshot for paired-corridor following without relaxing [RGR-06].
+        public static void BuildSameDirectionMovingAISnapshots(
+            Trainset ignoreTrainset,
+            object ignoreRequester,
+            out Dictionary<RailTrack, int> occupiedDirs,
+            out Dictionary<RailTrack, int> reservedDirs)
+        {
+            occupiedDirs = new Dictionary<RailTrack, int>();
+            reservedDirs = new Dictionary<RailTrack, int>();
+
+            try
+            {
+                var tm = AITraffic.Core.TrafficManager.Instance;
+                var engineers = (tm != null) ? tm.ActiveEngineers : null;
+                if (engineers == null || engineers.Count == 0)
+                    return;
+
+                Trainset playerTrainset = (PlayerManager.Car != null) ? PlayerManager.Car.trainset : null;
+                var eligibleByTrainset = new Dictionary<Trainset, AITraffic.Driver.AIEngineer>();
+                var eligiblePathDirsByEng = new Dictionary<object, Dictionary<RailTrack, int>>();
+
+                for (int i = 0; i < engineers.Count; i++)
+                {
+                    var eng = engineers[i];
+                    if (eng == null || eng.TrainCar == null || eng.TrainCar.trainset == null)
+                        continue;
+
+                    Trainset ts = eng.TrainCar.trainset;
+                    if (ignoreTrainset != null && ts == ignoreTrainset)
+                        continue;
+                    if (ignoreRequester != null && object.ReferenceEquals(eng, ignoreRequester))
+                        continue;
+                    if (playerTrainset != null && ts == playerTrainset)
+                        continue;
+
+                    if (eng.IsPermanentlyStalled ||
+                        eng.IsEmergencyStopped ||
+                        eng.HasArrivedAtDestination ||
+                        eng.IsHoldingForCorridor ||
+                        eng.IsIntentionalReverseActive ||
+                        eng.IsWorkerApproachStaging)
+                        continue;
+
+                    var st = eng.State;
+                    if (st != AITraffic.Driver.EngineState.Starting &&
+                        st != AITraffic.Driver.EngineState.Accelerating &&
+                        st != AITraffic.Driver.EngineState.Cruising &&
+                        st != AITraffic.Driver.EngineState.Coasting &&
+                        st != AITraffic.Driver.EngineState.Braking)
+                        continue;
+
+                    if (eng.CurrentSpeedKmh < 1.5f)
+                        continue;
+
+                    var path = eng.CurrentPath;
+                    if (path == null || !path.IsValid || path.Edges == null || path.Nodes == null || path.Nodes.Count != path.Edges.Count + 1)
+                        continue;
+
+                    var pathDirs = new Dictionary<RailTrack, int>();
+                    for (int eIdx = 0; eIdx < path.Edges.Count; eIdx++)
+                    {
+                        var e = path.Edges[eIdx];
+                        if (e == null || e.Track == null || !e.IsDoubleTrackMainline || e.ParallelEdge == null || e.IsIndustrialYardOrStorageTrack)
+                            continue;
+
+                        bool fwd = e.IsForward(path.Nodes[eIdx], path.Nodes[eIdx + 1]);
+                        if (fwd != e.PreferredForward)
+                            continue;
+
+                        int d = fwd ? 1 : -1;
+                        int existing;
+                        if (pathDirs.TryGetValue(e.Track, out existing))
+                        {
+                            if (existing != d) pathDirs[e.Track] = 0;
+                        }
+                        else
+                        {
+                            pathDirs[e.Track] = d;
+                        }
+                    }
+
+                    if (pathDirs.Count > 0)
+                    {
+                        eligibleByTrainset[ts] = eng;
+                        eligiblePathDirsByEng[eng] = pathDirs;
+                    }
+                }
+
+                if (eligibleByTrainset.Count == 0)
+                    return;
+
+                var tainted = new HashSet<RailTrack>();
+                AITraffic.Compat.PersistentJobsPatches.AddSuspendedOccupiedTracks(tainted);
+
+                RailGraph graph = s_instance;
+                if (CarSpawner.Instance != null && CarSpawner.Instance.AllCars != null)
+                {
+                    var allCars = CarSpawner.Instance.AllCars;
+                    int carCount = allCars.Count;
+                    for (int c = 0; c < carCount; c++)
+                    {
+                        var car = allCars[c];
+                        if (car == null) continue;
+                        if (ignoreTrainset != null && (car.trainset == ignoreTrainset || (ignoreTrainset.cars != null && ignoreTrainset.cars.Contains(car))))
+                            continue;
+
+                        AITraffic.Driver.AIEngineer carEng = null;
+                        bool isEligible = (car.trainset != null && eligibleByTrainset.TryGetValue(car.trainset, out carEng));
+
+                        for (int bIdx = 0; bIdx < 2; bIdx++)
+                        {
+                            Bogie bogie = (bIdx == 0) ? car.FrontBogie : car.RearBogie;
+                            RailTrack trk = (bogie != null) ? bogie.track : null;
+                            if (trk == null || tainted.Contains(trk))
+                                continue;
+
+                            if (!isEligible)
+                            {
+                                tainted.Add(trk);
+                                occupiedDirs.Remove(trk);
+                                continue;
+                            }
+
+                            int dirSign = 0;
+                            Dictionary<RailTrack, int> engDirs;
+                            if (eligiblePathDirsByEng.TryGetValue(carEng, out engDirs))
+                            {
+                                engDirs.TryGetValue(trk, out dirSign);
+                            }
+
+                            if (dirSign == 0 && car.rb != null && car.rb.velocity.sqrMagnitude > 0.25f &&
+                                trk.curve != null && trk.curve.length > 0.01f && bogie.traveller != null && graph != null)
+                            {
+                                RailEdge re = graph.GetEdge(trk);
+                                if (re != null && re.IsDoubleTrackMainline && re.ParallelEdge != null && !re.IsIndustrialYardOrStorageTrack)
+                                {
+                                    float t = Mathf.Clamp01((float)bogie.traveller.Span / trk.curve.length);
+                                    Vector3 tan = trk.curve.GetTangentAt(t);
+                                    Vector3 vel = car.rb.velocity;
+                                    tan.y = 0f;
+                                    vel.y = 0f;
+                                    if (tan.sqrMagnitude > 0.0001f && vel.sqrMagnitude > 0.25f)
+                                    {
+                                        int velSign = (Vector3.Dot(vel, tan) >= 0f) ? 1 : -1;
+                                        if ((velSign > 0) == re.PreferredForward)
+                                            dirSign = velSign;
+                                    }
+                                }
+                            }
+
+                            if (dirSign == 0)
+                            {
+                                tainted.Add(trk);
+                                occupiedDirs.Remove(trk);
+                                continue;
+                            }
+
+                            int prevDir;
+                            if (occupiedDirs.TryGetValue(trk, out prevDir))
+                            {
+                                if (prevDir != dirSign)
+                                {
+                                    tainted.Add(trk);
+                                    occupiedDirs.Remove(trk);
+                                }
+                            }
+                            else
+                            {
+                                occupiedDirs[trk] = dirSign;
+                            }
+                        }
+                    }
+                }
+
+                if (graph != null)
+                {
+                    lock (graph._lock)
+                    {
+                        foreach (var kvp in graph._trackReservations)
+                        {
+                            RailTrack trk = kvp.Key;
+                            object holder = kvp.Value;
+                            if (trk == null || holder == null || tainted.Contains(trk))
+                                continue;
+                            if (ignoreRequester != null && object.ReferenceEquals(holder, ignoreRequester))
+                                continue;
+
+                            Dictionary<RailTrack, int> resPathDirs;
+                            int resDir;
+                            if (eligiblePathDirsByEng.TryGetValue(holder, out resPathDirs) &&
+                                resPathDirs.TryGetValue(trk, out resDir) &&
+                                resDir != 0)
+                            {
+                                reservedDirs[trk] = resDir;
+                            }
+                        }
+                    }
+                }
+            }
+            catch { }
+        }
+
         private static void EnsureSuspendedTracksFrameCache()
         {
             int frame = Time.frameCount;
@@ -2592,6 +2823,45 @@ namespace AITraffic.Navigation
                 foreach (var kvp in _corridorTokenHolders)
                 {
                     if (kvp.Value == train)
+                    {
+                        keysToRemove.Add(kvp.Key);
+                    }
+                }
+
+                for (int i = 0; i < keysToRemove.Count; i++)
+                {
+                    string id = keysToRemove[i];
+                    _corridorTokenHolders.Remove(id);
+                    _corridorTokenAcquiredTime.Remove(id);
+
+                    var tracks = GetTracksForCorridor(id);
+                    if (tracks != null)
+                    {
+                        for (int t = 0; t < tracks.Count; t++)
+                        {
+                            if (tracks[t] != null)
+                            {
+                                ReleaseTrackReservation(tracks[t], train);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        /// <summary>
+        /// Releases all corridor tokens held by train except those in keepCorridorIds.
+        /// Used for immediate token teardown upon exiting a corridor into double-track, yards, sidings, or a new corridor.
+        /// </summary>
+        public void ReleaseAllCorridorTokensExcept(HashSet<string> keepCorridorIds, object train)
+        {
+            if (train == null) return;
+            lock (_corridorLock)
+            {
+                var keysToRemove = new List<string>();
+                foreach (var kvp in _corridorTokenHolders)
+                {
+                    if (kvp.Value == train && (keepCorridorIds == null || !keepCorridorIds.Contains(kvp.Key)))
                     {
                         keysToRemove.Add(kvp.Key);
                     }

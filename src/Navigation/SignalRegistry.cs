@@ -75,6 +75,10 @@ namespace AITraffic.Navigation
         private static bool s_rescan2sDone = false;
         private static bool s_rescan15sDone = false;
 
+        // CRITICAL INVARIANT [SIG-RSV-1]: Bounded per-signal failure retry cooldown preventing per-tick DVSignals reservation storms.
+        private static readonly Dictionary<DVSignal, float> s_signalReserveCooldownUntil = new Dictionary<DVSignal, float>();
+        private const float SignalReserveFailureCooldownSec = 5.0f;
+
         private static RailTrackBogiesOnTrack GetBogiesOnTrack(RailTrack track)
         {
             if (track == null) return null;
@@ -581,6 +585,7 @@ namespace AITraffic.Navigation
         {
             s_trackSignals.Clear();
             s_bogiesCache.Clear();
+            s_signalReserveCooldownUntil.Clear();
             s_isInitialized = false;
             s_lastScanTime = 0f;
             s_indexedSignalCount = 0;
@@ -1044,36 +1049,116 @@ namespace AITraffic.Navigation
             return false;
         }
 
+        private struct AspectPresentation
+        {
+            public readonly string DisplayName;
+            public readonly string ColorHex;
+            public readonly Color ColorValue;
+
+            public AspectPresentation(string displayName, string colorHex, Color colorValue)
+            {
+                DisplayName = displayName;
+                ColorHex = colorHex;
+                ColorValue = colorValue;
+            }
+        }
+
+        // CRITICAL INVARIANT [SIG-DSP-1]: Classify combined/distant expectation aspects (NEXT_STOP, RESTRICTED_NEXT_STOP, VR0, ExpectStop)
+        // when DisallowPassing == false BEFORE matching bare "STOP" tokens so passable amber indications never render as Hp 0 (Red / Stop).
+        private static AspectPresentation GetAspectPresentation(DVSignal signal)
+        {
+            if (signal == null)
+                return new AspectPresentation("Clear / Open Route", "#AAAAAA", new Color(0.7f, 0.7f, 0.7f));
+            if (signal.IsOff)
+                return new AspectPresentation("Off", "#AAAAAA", new Color(0.7f, 0.7f, 0.7f));
+            if (signal.CurrentAspect == null)
+                return new AspectPresentation("Off / Clear", "#AAAAAA", new Color(0.7f, 0.7f, 0.7f));
+
+            string id = signal.CurrentAspect.Id ?? string.Empty;
+            bool disallow = signal.CurrentAspect.DisallowPassing;
+
+            // Shunting stop / clear
+            if (id.IndexOf("SH0", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                id.IndexOf("SHUNTING_DISALLOWED", StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                return new AspectPresentation("Sh 0 (Red / Stop)", "#FF4444", new Color(1.0f, 0.25f, 0.25f));
+            }
+            if (id.IndexOf("SH1", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                id.IndexOf("WHITE", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                (!disallow && id.IndexOf("SHUNTING", StringComparison.OrdinalIgnoreCase) >= 0))
+            {
+                return new AspectPresentation("Sh 1 (White / Shunt)", "#E0E0FF", new Color(0.9f, 0.9f, 1.0f));
+            }
+
+            // Combined main+distant & pure distant expectation aspects (when mast itself is passable)
+            if (!disallow)
+            {
+                if (id.IndexOf("RESTRICTED_NEXT_STOP", StringComparison.OrdinalIgnoreCase) >= 0)
+                    return new AspectPresentation("Hp 2+Vr 0 (Slow / Expect Stop)", "#FFA500", new Color(1.0f, 0.65f, 0.0f));
+
+                if (id.IndexOf("NEXT_STOP", StringComparison.OrdinalIgnoreCase) >= 0)
+                    return new AspectPresentation("Hp 1+Vr 0 (Proceed / Expect Stop)", "#FFA500", new Color(1.0f, 0.65f, 0.0f));
+
+                if (id.IndexOf("RESTRICTED_NEXT_RESTRICTED", StringComparison.OrdinalIgnoreCase) >= 0)
+                    return new AspectPresentation("Hp 2+Vr 2 (Slow / Expect Slow)", "#FFD700", new Color(1.0f, 0.85f, 0.1f));
+
+                if (id.IndexOf("NEXT_RESTRICTED", StringComparison.OrdinalIgnoreCase) >= 0)
+                    return new AspectPresentation("Hp 1+Vr 2 (Proceed / Expect Slow)", "#FFD700", new Color(1.0f, 0.85f, 0.1f));
+
+                if (id.IndexOf("VR0", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                    (id.IndexOf("EXPECT", StringComparison.OrdinalIgnoreCase) >= 0 && id.IndexOf("STOP", StringComparison.OrdinalIgnoreCase) >= 0))
+                {
+                    return new AspectPresentation("Vr 0 (Expect Stop)", "#FFA500", new Color(1.0f, 0.65f, 0.0f));
+                }
+
+                if (id.IndexOf("VR2", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                    (id.IndexOf("EXPECT", StringComparison.OrdinalIgnoreCase) >= 0 &&
+                     (id.IndexOf("RESTRICTED", StringComparison.OrdinalIgnoreCase) >= 0 || id.IndexOf("SLOW", StringComparison.OrdinalIgnoreCase) >= 0)))
+                {
+                    return new AspectPresentation("Vr 2 (Expect Slow)", "#FFD700", new Color(1.0f, 0.85f, 0.1f));
+                }
+
+                if (id.IndexOf("VR1", StringComparison.OrdinalIgnoreCase) >= 0)
+                    return new AspectPresentation("Vr 1 (Expect Clear)", "#00FF88", new Color(0.0f, 1.0f, 0.55f));
+            }
+
+            // Absolute stop aspects
+            if (disallow ||
+                id.IndexOf("HP0", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                id.IndexOf("AGAINST_PATH", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                string.Equals(id, "STOP", StringComparison.OrdinalIgnoreCase) ||
+                id.StartsWith("STOP_", StringComparison.OrdinalIgnoreCase))
+            {
+                return new AspectPresentation("Hp 0 (Red / Stop)", "#FF4444", new Color(1.0f, 0.25f, 0.25f));
+            }
+
+            // Slow / restricted aspects
+            if (id.IndexOf("HP2", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                id.IndexOf("RESTRICTED", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                id.IndexOf("YELLOW", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                id.IndexOf("CAUTION", StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                return new AspectPresentation("Hp 2 (Yellow / Slow)", "#FFD700", new Color(1.0f, 0.85f, 0.1f));
+            }
+
+            // Clear aspects
+            if (id.IndexOf("HP1", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                id.IndexOf("GREEN", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                id.IndexOf("CLEAR", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                string.Equals(id, "GO", StringComparison.OrdinalIgnoreCase))
+            {
+                return new AspectPresentation("Hp 1 (Green / Clear)", "#00FF88", new Color(0.0f, 1.0f, 0.55f));
+            }
+
+            return new AspectPresentation(id, "#FFFFFF", Color.white);
+        }
+
         /// <summary>
         /// Gets a clean display string for a signal's current aspect (e.g. "Hp 1 (Green)", "Hp 0 (Red)", "Hp 2 (Yellow)").
         /// </summary>
         public static string GetAspectDisplayName(DVSignal signal)
         {
-            if (signal == null) return "Clear / Open Route";
-            if (signal.IsOff) return "Off";
-            if (signal.CurrentAspect == null) return "Off / Clear";
-
-            string id = signal.CurrentAspect.Id ?? string.Empty;
-            bool disallow = signal.CurrentAspect.DisallowPassing;
-
-            if (disallow || id.IndexOf("HP0", StringComparison.OrdinalIgnoreCase) >= 0 || id.IndexOf("STOP", StringComparison.OrdinalIgnoreCase) >= 0)
-                return "Hp 0 (Red / Stop)";
-            if (id.IndexOf("HP2", StringComparison.OrdinalIgnoreCase) >= 0 || id.IndexOf("YELLOW", StringComparison.OrdinalIgnoreCase) >= 0 || id.IndexOf("CAUTION", StringComparison.OrdinalIgnoreCase) >= 0)
-                return "Hp 2 (Yellow / Slow)";
-            if (id.IndexOf("HP1", StringComparison.OrdinalIgnoreCase) >= 0 || id.IndexOf("GREEN", StringComparison.OrdinalIgnoreCase) >= 0 || id.IndexOf("CLEAR", StringComparison.OrdinalIgnoreCase) >= 0)
-                return "Hp 1 (Green / Clear)";
-            if (id.IndexOf("SH0", StringComparison.OrdinalIgnoreCase) >= 0)
-                return "Sh 0 (Red / Stop)";
-            if (id.IndexOf("SH1", StringComparison.OrdinalIgnoreCase) >= 0 || id.IndexOf("WHITE", StringComparison.OrdinalIgnoreCase) >= 0)
-                return "Sh 1 (White / Shunt)";
-            if (id.IndexOf("VR0", StringComparison.OrdinalIgnoreCase) >= 0)
-                return "Vr 0 (Expect Stop)";
-            if (id.IndexOf("VR1", StringComparison.OrdinalIgnoreCase) >= 0)
-                return "Vr 1 (Expect Clear)";
-            if (id.IndexOf("VR2", StringComparison.OrdinalIgnoreCase) >= 0)
-                return "Vr 2 (Expect Slow)";
-
-            return id;
+            return GetAspectPresentation(signal).DisplayName;
         }
 
         /// <summary>
@@ -1081,21 +1166,7 @@ namespace AITraffic.Navigation
         /// </summary>
         public static string GetAspectColorHex(DVSignal signal)
         {
-            if (signal == null || signal.IsOff || signal.CurrentAspect == null) return "#AAAAAA";
-
-            string id = signal.CurrentAspect.Id ?? string.Empty;
-            bool disallow = signal.CurrentAspect.DisallowPassing;
-
-            if (disallow || id.IndexOf("HP0", StringComparison.OrdinalIgnoreCase) >= 0 || id.IndexOf("STOP", StringComparison.OrdinalIgnoreCase) >= 0 || id.IndexOf("SH0", StringComparison.OrdinalIgnoreCase) >= 0 || id.IndexOf("VR0", StringComparison.OrdinalIgnoreCase) >= 0)
-                return "#FF4444";
-            if (id.IndexOf("HP2", StringComparison.OrdinalIgnoreCase) >= 0 || id.IndexOf("YELLOW", StringComparison.OrdinalIgnoreCase) >= 0 || id.IndexOf("CAUTION", StringComparison.OrdinalIgnoreCase) >= 0 || id.IndexOf("VR2", StringComparison.OrdinalIgnoreCase) >= 0)
-                return "#FFD700";
-            if (id.IndexOf("HP1", StringComparison.OrdinalIgnoreCase) >= 0 || id.IndexOf("GREEN", StringComparison.OrdinalIgnoreCase) >= 0 || id.IndexOf("CLEAR", StringComparison.OrdinalIgnoreCase) >= 0 || id.IndexOf("VR1", StringComparison.OrdinalIgnoreCase) >= 0)
-                return "#00FF88";
-            if (id.IndexOf("SH1", StringComparison.OrdinalIgnoreCase) >= 0 || id.IndexOf("WHITE", StringComparison.OrdinalIgnoreCase) >= 0)
-                return "#E0E0FF";
-
-            return "#FFFFFF";
+            return GetAspectPresentation(signal).ColorHex;
         }
 
         /// <summary>
@@ -1103,21 +1174,7 @@ namespace AITraffic.Navigation
         /// </summary>
         public static Color GetAspectColor(DVSignal signal)
         {
-            if (signal == null || signal.IsOff || signal.CurrentAspect == null) return new Color(0.7f, 0.7f, 0.7f);
-
-            string id = signal.CurrentAspect.Id ?? string.Empty;
-            bool disallow = signal.CurrentAspect.DisallowPassing;
-
-            if (disallow || id.IndexOf("HP0", StringComparison.OrdinalIgnoreCase) >= 0 || id.IndexOf("STOP", StringComparison.OrdinalIgnoreCase) >= 0 || id.IndexOf("SH0", StringComparison.OrdinalIgnoreCase) >= 0 || id.IndexOf("VR0", StringComparison.OrdinalIgnoreCase) >= 0)
-                return new Color(1.0f, 0.25f, 0.25f);
-            if (id.IndexOf("HP2", StringComparison.OrdinalIgnoreCase) >= 0 || id.IndexOf("YELLOW", StringComparison.OrdinalIgnoreCase) >= 0 || id.IndexOf("CAUTION", StringComparison.OrdinalIgnoreCase) >= 0 || id.IndexOf("VR2", StringComparison.OrdinalIgnoreCase) >= 0)
-                return new Color(1.0f, 0.85f, 0.1f);
-            if (id.IndexOf("HP1", StringComparison.OrdinalIgnoreCase) >= 0 || id.IndexOf("GREEN", StringComparison.OrdinalIgnoreCase) >= 0 || id.IndexOf("CLEAR", StringComparison.OrdinalIgnoreCase) >= 0 || id.IndexOf("VR1", StringComparison.OrdinalIgnoreCase) >= 0)
-                return new Color(0.0f, 1.0f, 0.55f);
-            if (id.IndexOf("SH1", StringComparison.OrdinalIgnoreCase) >= 0 || id.IndexOf("WHITE", StringComparison.OrdinalIgnoreCase) >= 0)
-                return new Color(0.9f, 0.9f, 1.0f);
-
-            return Color.white;
+            return GetAspectPresentation(signal).ColorValue;
         }
 
         /// <summary>
@@ -1246,10 +1303,36 @@ namespace AITraffic.Navigation
             return false;
         }
 
+        private static void RecordSignalReserveFailureCooldown(DVSignal signal)
+        {
+            if (signal == null) return;
+            float now = Time.time;
+            if (s_signalReserveCooldownUntil.Count > 256)
+            {
+                var expired = new List<DVSignal>();
+                foreach (var kvp in s_signalReserveCooldownUntil)
+                {
+                    if (kvp.Key == null || kvp.Value <= now)
+                        expired.Add(kvp.Key);
+                }
+                for (int i = 0; i < expired.Count; i++)
+                    s_signalReserveCooldownUntil.Remove(expired[i]);
+            }
+            s_signalReserveCooldownUntil[signal] = now + SignalReserveFailureCooldownSec;
+        }
+
+        public static void ClearSignalReserveCooldown(DVSignal signal)
+        {
+            if (signal == null) return;
+            if (signal.Parent != null) signal = signal.Parent;
+            s_signalReserveCooldownUntil.Remove(signal);
+        }
+
         /// <summary>
         /// Attempts to reserve a DVSignal route via DVSignals TrackReserver.
         /// This satisfies SpecialRequireReservationAspect and turns station entry/exit signals from Hp 0 to Hp 1/Hp 2.
         /// </summary>
+        // CRITICAL INVARIANT [SIG-RSV-1]: Pre-check overlap and enforce per-signal cooldown on reservation failure to suppress per-tick warning storms.
         public static bool TryReserveDVSignal(DVSignal signal)
         {
             if (signal == null || !ModCompatManager.IsDVSignalsLoaded) return false;
@@ -1264,16 +1347,35 @@ namespace AITraffic.Navigation
                 bool reserved = Signals.Game.Railway.TrackReserver.HasReservation(signal);
                 if (!reserved)
                 {
+                    float cooldownUntil;
+                    if (s_signalReserveCooldownUntil.TryGetValue(signal, out cooldownUntil) && Time.time < cooldownUntil)
+                    {
+                        return false;
+                    }
+                    if (Signals.Game.Railway.TrackReserver.IsSignalReservedByAnother(signal))
+                    {
+                        RecordSignalReserveFailureCooldown(signal);
+                        return false;
+                    }
                     reserved = Signals.Game.Railway.TrackReserver.ReserveForSignal(signal);
+                    if (!reserved)
+                    {
+                        RecordSignalReserveFailureCooldown(signal);
+                    }
                 }
-                if (reserved && signal.Controller != null)
+                if (reserved)
                 {
-                    signal.Controller.RequestUpdate(1);
+                    s_signalReserveCooldownUntil.Remove(signal);
+                    if (signal.Controller != null)
+                    {
+                        signal.Controller.RequestUpdate(1);
+                    }
                 }
                 return reserved;
             }
             catch (Exception ex)
             {
+                RecordSignalReserveFailureCooldown(signal);
                 if (Main.ModEntry != null && Main.ModEntry.Logger != null)
                     Main.ModEntry.Logger.Warning(string.Format("[SignalRegistry] Error reserving DVSignal '{0}': {1}", GetSignalName(signal), ex.Message));
                 return false;
@@ -1287,6 +1389,7 @@ namespace AITraffic.Navigation
         {
             if (signal == null || !ModCompatManager.IsDVSignalsLoaded) return;
             if (signal.Parent != null) signal = signal.Parent;
+            s_signalReserveCooldownUntil.Remove(signal);
             try
             {
                 Signals.Game.Railway.TrackReserver.ClearFromSignal(signal);

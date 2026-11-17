@@ -196,6 +196,18 @@ namespace AITraffic.Navigation
         public HashSet<RailTrack> PlayerOccupiedTracksSnapshot { get; set; }
 
         /// <summary>
+        /// Main-thread snapshot of paired right-hand double-track corridor tracks occupied exclusively by
+        /// actively moving same-direction AI consists (+1/-1 spline polarity) for safe following.
+        /// </summary>
+        public Dictionary<RailTrack, int> SameDirectionMovingAITracksSnapshot { get; set; }
+
+        /// <summary>
+        /// Main-thread snapshot of paired right-hand double-track corridor tracks reserved exclusively by
+        /// actively moving same-direction AI consists (+1/-1 spline polarity).
+        /// </summary>
+        public Dictionary<RailTrack, int> SameDirectionMovingReservedTracksSnapshot { get; set; }
+
+        /// <summary>
         /// Snapshot of player position in world space for proximity checks during A*.
         /// </summary>
         public Vector3 PlayerPosition { get; set; }
@@ -229,6 +241,8 @@ namespace AITraffic.Navigation
             ExcludedTracks = null;
             OccupiedTracksSnapshot = null;
             PlayerOccupiedTracksSnapshot = null;
+            SameDirectionMovingAITracksSnapshot = null;
+            SameDirectionMovingReservedTracksSnapshot = null;
             PlayerPosition = Vector3.zero;
             HasMilitaryLicenseSnapshot = null;
             TurnoutDivergingPenalty = 40f;
@@ -259,6 +273,8 @@ namespace AITraffic.Navigation
                 ExcludedTracks = this.ExcludedTracks != null ? new HashSet<RailTrack>(this.ExcludedTracks) : null,
                 OccupiedTracksSnapshot = this.OccupiedTracksSnapshot,
                 PlayerOccupiedTracksSnapshot = this.PlayerOccupiedTracksSnapshot != null ? new HashSet<RailTrack>(this.PlayerOccupiedTracksSnapshot) : null,
+                SameDirectionMovingAITracksSnapshot = this.SameDirectionMovingAITracksSnapshot,
+                SameDirectionMovingReservedTracksSnapshot = this.SameDirectionMovingReservedTracksSnapshot,
                 PlayerPosition = this.PlayerPosition,
                 HasMilitaryLicenseSnapshot = this.HasMilitaryLicenseSnapshot,
                 TurnoutDivergingPenalty = this.TurnoutDivergingPenalty,
@@ -473,6 +489,17 @@ namespace AITraffic.Navigation
             if (options.OccupiedTracksSnapshot == null && graph != null)
             {
                 options.OccupiedTracksSnapshot = RailGraph.BuildOccupiedTracksSnapshot(options.RequesterTrainset);
+            }
+            if (options.AvoidOccupiedTracks &&
+                (options.SameDirectionMovingAITracksSnapshot == null || options.SameDirectionMovingReservedTracksSnapshot == null))
+            {
+                Dictionary<RailTrack, int> occDirs;
+                Dictionary<RailTrack, int> resDirs;
+                RailGraph.BuildSameDirectionMovingAISnapshots(options.RequesterTrainset, options.Requester, out occDirs, out resDirs);
+                if (options.SameDirectionMovingAITracksSnapshot == null)
+                    options.SameDirectionMovingAITracksSnapshot = occDirs;
+                if (options.SameDirectionMovingReservedTracksSnapshot == null)
+                    options.SameDirectionMovingReservedTracksSnapshot = resDirs;
             }
             if (options.PlayerOccupiedTracksSnapshot == null)
             {
@@ -1240,8 +1267,19 @@ namespace AITraffic.Navigation
             // Check if track is occupied by requester's own train cars (O(1))
             bool isOccupiedByRequester = (requesterTracks != null && requesterTracks.Contains(edge.Track));
 
+            // CRITICAL INVARIANT [RGR-12]: On verified paired right-hand double-track corridors, allow following
+            // exclusively same-direction active moving AI traffic (+150f bias) instead of crossing over onto
+            // wrong-way left track, while preserving [RGR-06] hard avoidance everywhere else.
+            bool isRightHandCorridorFollow = (edge != null &&
+                                              edge.IsDoubleTrackMainline &&
+                                              edge.ParallelEdge != null &&
+                                              !edge.IsIndustrialYardOrStorageTrack &&
+                                              edge.IsForward(fromNode, toNode) == edge.PreferredForward);
+            int traversalDirSign = (edge != null && edge.IsForward(fromNode, toNode)) ? 1 : -1;
+            bool followedSameDirectionAI = false;
+
             // Occupancy checks:
-            // Intermediate tracks that are physically occupied MUST NEVER be chosen.
+            // Intermediate tracks that are physically occupied MUST NEVER be chosen (except verified right-hand corridor following).
             if (options.AvoidOccupiedTracks && !isStartOrDest && !isOccupiedByRequester)
             {
                 bool isOccupied = (occupiedSnapshot != null)
@@ -1250,12 +1288,25 @@ namespace AITraffic.Navigation
 
                 if (isOccupied)
                 {
-                    if (options.StrictlyAvoidOccupied)
-                        return false;
+                    int occDir;
+                    bool allowFollowing = isRightHandCorridorFollow &&
+                                          options.SameDirectionMovingAITracksSnapshot != null &&
+                                          options.SameDirectionMovingAITracksSnapshot.TryGetValue(edge.Track, out occDir) &&
+                                          occDir == traversalDirSign;
+                    if (allowFollowing)
+                    {
+                        followedSameDirectionAI = true;
+                        cost += 150f;
+                    }
+                    else
+                    {
+                        if (options.StrictlyAvoidOccupied)
+                            return false;
 
-                    // Insurmountable penalty (+10,000,000m) to guarantee an occupied track is NEVER chosen
-                    // over an empty siding or bypass track
-                    cost += options.OccupiedTrackPenalty;
+                        // Insurmountable penalty (+10,000,000m) to guarantee an occupied track is NEVER chosen
+                        // over an empty siding or bypass track
+                        cost += options.OccupiedTrackPenalty;
+                    }
                 }
             }
 
@@ -1265,10 +1316,23 @@ namespace AITraffic.Navigation
                 bool isReservedByOther = _graph.IsTrackReservedByOther(edge.Track, options.Requester);
                 if (isReservedByOther)
                 {
-                    if (options.StrictlyAvoidReserved)
-                        return false;
+                    int resDir;
+                    bool allowReservedFollowing = isRightHandCorridorFollow &&
+                                                  options.SameDirectionMovingReservedTracksSnapshot != null &&
+                                                  options.SameDirectionMovingReservedTracksSnapshot.TryGetValue(edge.Track, out resDir) &&
+                                                  resDir == traversalDirSign;
+                    if (allowReservedFollowing)
+                    {
+                        if (!followedSameDirectionAI)
+                            cost += 150f;
+                    }
+                    else
+                    {
+                        if (options.StrictlyAvoidReserved)
+                            return false;
 
-                    cost += options.ReservedTrackPenalty;
+                        cost += options.ReservedTrackPenalty;
+                    }
                 }
             }
 
