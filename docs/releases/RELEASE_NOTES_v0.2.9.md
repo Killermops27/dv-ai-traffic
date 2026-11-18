@@ -2,7 +2,7 @@
 
 > ⚠️ **RELEASE NOTE: PULLED FORWARD FOR URGENT FIXES**
 > This **v0.2.9** update was **pulled forward ahead of schedule** to deliver urgent fixes for signaling, right-hand double-track running, DM3 transmission & thermal handling, MU headlight cross-talk, and AI worker stability.
-> Because of this expedited release, **not all new features originally planned for v0.2.9 made it in**—remaining Phase 2 features (such as Intermediate Tail-Cut Wagon Drop-Offs, Diegetic Station Paperwork / Itinerary Sheets, and full Autonomous Run-Around / Reverse Shoving) are deferred to a follow-up update.
+> Because of this expedited release, **not all new features originally planned for v0.2.9 made it in**—remaining Phase 2 features (such as in-game selection for Multi-Stop Itineraries, Intermediate Tail-Cut Wagon Drop-Offs, Diegetic Station Paperwork / Itinerary Sheets, and full Autonomous Run-Around / Reverse Shoving) are deferred to a follow-up update.
 
 > ⚠️ **EXPERIMENTAL ALPHA:** Always back up your save files before using or updating this mod. Report reproducible bugs on [GitHub Issues](https://github.com/Killermops27/dv-ai-traffic/issues) or the [Nexus Mods Bug Tracker](https://www.nexusmods.com/derailvalley/mods/1685?tab=bugs).
 
@@ -11,11 +11,9 @@
 ### 🌟 What's New & Fixed in v0.2.9
 
 #### 👷 Player-Employed AI Workers (Phase 2 — Included Features)
-* **Multi-Stop Itineraries & Non-Blocking Waypoint Departure (`[WRK-07]`, `[WRK-11]`, `[WRK-12]`):**
-  * Workers now support multi-leg itineraries (`ItineraryLeg` list) with intermediate station dwells (or infinite radio-resumed holds) while keeping prime movers running at intermediate waypoints.
-  * Waypoint departures run via non-blocking async pathfinding (`Pathfinder.FindPathAsync`) with dead-end spur switchback support (`[WRK-02]`), eliminating main-thread hitches.
-  * Transiently obstructed waypoint exits hold non-destructively in `WaitingAtIntermediate` with a 15-second retry loop and a single Comms Radio alert ping instead of cancelling the haul.
-  * Upfront multi-leg wage billing with a **10s / 25m 100% refund grace period** and pro-rated mid-transit cancellation refunds calculated before driver teardown.
+* **Worker Cancellation Refunds & Multi-Stop Architecture (`[WRK-07]`, `[WRK-11]`, `[WRK-12]`) *(Multi-Stop: Backend Architecture Only — Not Selectable In-Game Yet)*:**
+  * **Active In-Game:** Pro-rated cancellation refunds with a **10s / 25m 100% refund grace period** calculated before driver teardown.
+  * **Backend Architecture Only (Not Yet Selectable In-Game):** The underlying multi-leg `ItineraryLeg` engine, intermediate station dwells, non-blocking async waypoint departures (`Pathfinder.FindPathAsync`) with dead-end spur switchback support (`[WRK-02]`), and non-destructive 15s waypoint exit retries are implemented at the architecture level, **but in-game Comms Radio dispatch currently remains single A-to-B leg only** until the multi-stop UI/paperwork is completed in a future update.
 * **Valley-Wide Comms Radio Active Worker Channel (`[WRK-08]`):**
   * Monitor active worker trains remotely from anywhere on the map via the **AI Worker** Comms Radio channel without line-of-sight targeting.
   * Issue remote in-flight orders: **Resume Run**, **Hold at Next Loop**, **Emergency Stop** (locks Train, Independent, and Handbrake once stopped), or inspect **30s Blocked-Track Escalation** options (*Wait 1/3/5 Min*, *Reroute Bypass*, *Backup to Siding*, *Hand Over Control*) backed by async option pre-evaluation.
@@ -26,7 +24,7 @@
 * **Destination Approach Congestion Staging (`[WRK-10]`):**
   * Worker trains audit their destination arrival track within 2,000m; if occupied, they brake smoothly to a stop line outside the yard throat (outer loop, entry signal, or throat switch), release turnout locks, play a Comms Radio warning ping (`WorkerAudio`), and re-audit every 15s (auto-selected legs asynchronously adopt free alternate tracks; explicitly chosen tracks are never altered).
 
-*(Deferred to a future update due to pulled-forward release: Intermediate Tail-Cut Wagon Drop-Offs, Diegetic Station Paperwork / Itinerary Sheets, and full mid-route Autonomous Run-Around / Reverse Shoving.)*
+*(Deferred to a future update due to pulled-forward release: In-game UI/paperwork selection for Multi-Stop Itineraries, Intermediate Tail-Cut Wagon Drop-Offs, Diegetic Station Paperwork / Itinerary Sheets, and full mid-route Autonomous Run-Around / Reverse Shoving.)*
 
 ---
 
