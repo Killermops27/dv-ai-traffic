@@ -1,8 +1,8 @@
 [center][size=5][b][color=#FFB833]Derail Valley AI Traffic (AITraffic)[/color][/b][/size]
 [size=3][i]Autonomous AI Train Traffic, Timetable Dispatching & Player-Employed AI Workers[/i][/size]
-[size=2]Author: [b]Killermops27[/b] | Version: [b][color=#55DD55]0.2.8 (Alpha)[/color][/b][/size]
+[size=2]Author: [b]Killermops27[/b] | Version: [b][color=#55DD55]0.2.9 (Alpha)[/color][/b][/size]
 
-[url=https://github.com/Killermops27/dv-ai-traffic][b]GitHub Repository[/b][/url] • [url=https://github.com/Killermops27/dv-ai-traffic/releases/tag/v0.2.8][b]Latest Release[/b][/url] • [url=https://github.com/Killermops27/dv-ai-traffic/issues][b]Report a Bug[/b][/url] • [url=https://www.nexusmods.com/derailvalley/mods/1685][b]Nexus Mods #1685[/b][/url]
+[url=https://github.com/Killermops27/dv-ai-traffic][b]GitHub Repository[/b][/url] • [url=https://github.com/Killermops27/dv-ai-traffic/releases/tag/v0.2.9][b]Latest Release[/b][/url] • [url=https://github.com/Killermops27/dv-ai-traffic/issues][b]Report a Bug[/b][/url] • [url=https://www.nexusmods.com/derailvalley/mods/1685][b]Nexus Mods #1685[/b][/url]
 [/center]
 
 [quote]
@@ -11,27 +11,28 @@ This mod is in [b]active early alpha development[/b]. Always make a backup copy 
 Report reproducible bugs on our [url=https://github.com/Killermops27/dv-ai-traffic/issues][b]GitHub Issues[/b][/url] or the Nexus Bugs tab!
 [/quote]
 
-[size=4][b][color=#55DD55]✦ Compatibility: Persistent Jobs is DEFINITELY Supported![/color][/b][/size]
 [quote]
-[b]Persistent Jobs is now 100% officially supported and fully integrated into AI Traffic as of v0.2.8.[/b]
-Even though the [i]Persistent Jobs[/i] mod page may currently claim that AI Traffic is unsupported or incompatible, [b]this is outdated[/b]. AI Traffic v0.2.8 includes dedicated integration patches that reflect lightweight suspended cars ([i]FarCarOpt[/i]) in pathfinding, protect yard tracks, and segregate debt ledgers so both mods run together seamlessly!
+[center][size=3][color=#FFB833][b]📢 RELEASE NOTICE: v0.2.9 PULLED FORWARD FOR URGENT FIXES[/b][/color][/size][/center]
+This release was [b]pulled forward ahead of schedule to deliver urgent fixes[/b] for signaling, double-track right-hand running, DM3/thermal physics, MU lighting, and AI worker stability. Because of this expedited release, [b]not all new features originally planned for 0.2.9 made it in[/b] — remaining Phase 2 worker features (such as Intermediate Tail-Cut Wagon Drop-Offs, Diegetic Station Paperwork / Itinerary Sheets, and full Autonomous Run-Around / Reverse Shoving) have been deferred to the next update.
 [/quote]
 
-[size=4][b][color=#FFB833]✦ What's New in Version 0.2.8[/color][/b][/size]
+[size=4][b][color=#55DD55]✦ Compatibility: Persistent Jobs is DEFINITELY Supported![/color][/b][/size]
+[quote]
+[b]Persistent Jobs is 100% officially supported and integrated into AI Traffic (v0.2.8+).[/b]
+Even though the [i]Persistent Jobs[/i] mod page may currently claim that AI Traffic is unsupported or incompatible, [b]this is outdated[/b]. AI Traffic includes dedicated integration patches that reflect lightweight suspended cars ([i]FarCarOpt[/i]) in pathfinding, protect yard tracks, and segregate debt ledgers so both mods run together seamlessly!
+[/quote]
+
+[size=4][b][color=#FFB833]✦ What's New in Version 0.2.9[/color][/b][/size]
 
 [list]
-[*][b]30-Minute Job Desync CTD Fix:[/b] Replaced station-wide destruction locks with track-specific protection ([i]Yard.IsTrackOccupied[/i]). Vanilla DV safely cleans expired jobs every 30 mins without PhysX explosions, NaN coordinates, or crashes.
-[*][b]Crash & Patch Optimizations:[/b] Eliminated recursive stack overflow crashes in station wakeup patches and debounced signal wakeup calls (0.5s cooldown) to eliminate DVSignals traversal storms.
-[*][b]Wet-Weather Physics & 5-Stage Hill-Starts:[/b] 6-second cumulative ground progress tracking ends the DE2 slip-grip oscillation trap. Includes immediate rain sanding and automated controlled rollback descents.
-[*][b]Active Wheel Slide Protection (WSP):[/b] Consist-wide brake slide detection scales wet service deceleration, cuts dynamic braking on drive wheel slides, and auto-sands to maintain adhesion.
-[*][b]Multiple Unit (MU) Helper Automation:[/b] Trailing helper locomotives automatically spawn with double-heading cocks cut out ([i]BrakeCutout = 0.0[/i]), independent brakes released, and MU lines connected.
-[*][b]Single-Track Corridor Tokens & Reverse Maneuver:[/b] Atomic tokens prevent opposing entries. In standoffs, AI sounds 3 horn bursts, turns on red marker lights, and backs into the nearest siding.
-[*][b]Turnout Lock Interlocking & AI Preemption ([JNC-09]):[/b] Protects crossover switches in reserved signal blocks, enforces alignment cooldowns, and resolves AI-vs-AI turnout conflicts by signal reservation and train priority.
-[*][b]Siding Shunting Handover Fix:[/b] 4-layer mast crossing check ensures trains leaving yards transition smoothly back to line speed instead of crawling at 15 km/h across the mainline.
-[*][b]Yard Through-Transit Avoidance:[/b] +500,000m routing penalty keeps through trains out of yard sidings while protecting central running lines ([i][--][/i]) at full line speed.
-[*][b]Military Base Career License Gating:[/b] Completely excludes AI trains from Military Base (MB), Harbor military spur, and Machine Factory military yard unless the [i]Military 1[/i] license is owned.
-[*][b]Advanced INI Configuration ([i]settings.ini[/i]):[/b] Real-time tunable physics PID gains, dispatching buffers, and lighting modes, with an in-game UMM [i]Apply & Reload INI[/i] button.
-[*][b]AI Lighting & EOT Markers:[/b] 4-mode locomotive headlight selector and diegetic rear End-of-Train (EOT) lanterns on freight consists and cabooses.
+[*][b]Signaling Classification & Contention Storm Fixes:[/b] Fixed combined Main/Entry masts (e.g. OWC Entry Signal A), added world-load/toggle signal index invalidation with post-load rescans, fixed aspect display labels, and added a 5s failure cooldown to stop per-tick DVSignals reservation storms.
+[*][b]Right-Hand Running & CW–OWC Routing Fixes:[/b] Separated 0.8m diamond crossings (0.35m merge threshold) from phantom degree-4 nodes, enabled safe same-direction following on paired right-hand double tracks, added proactive right-hand corridor realignment, prevented wrong-way parallel spawns, and fixed corridor token leaks.
+[*][b]Destination Exit Signal & Two-Open-Sided Track Stopping:[/b] Arriving trains now detect and brake cleanly before destination exit signals and forward switches instead of rolling past into the throat.
+[*][b]DM3 Gearbox, 65 km/h Cap & Thermal Protection:[/b] Fixed DM3 A2–B2 gear snap-back, froze hill-stagnation timers during DM3 shifts, capped DM3 speed at 65 km/h, added universal thermal throttle cut (>= 95°C) and dynamic brake thermal cutoff (> 90°C), and fixed false job completion on permanent hill stalls.
+[*][b]MU Headlight Cross-Talk & Terminal Parked Latch:[/b] Stopped MU-connected trailing helper locomotives from extinguishing the lead locomotive's forward headlights at night, and eliminated per-frame reverser/headlight servo ping-pong on parked consists.
+[*][b]AI Worker Multi-Stop Itineraries & Non-Blocking Waypoints:[/b] Added multi-leg itineraries with intermediate dwells, non-blocking async waypoint departures (with spur switchback support and 15s non-destructive exit retries), and upfront billing with a 10s/25m 100% grace window and pro-rated cancellation refunds.
+[*][b]Valley-Wide Comms Radio Worker Channel:[/b] Monitor active worker trains remotely from anywhere on the map, issue in-flight orders ([i]Resume Run[/i], [i]Hold at Next Loop[/i], [i]Emergency Stop[/i]), and resolve 30s blocked-track alerts via the Escalation Menu.
+[*][b]In-Cab Co-Pilot Touch-to-Yield & Destination Congestion Staging:[/b] Moving cab controls hands authority cleanly to the player (re-engage smoothly with [b]Ctrl+A[/b] or Comms Radio), caps slip/stall fuel/oil/sand burn, and safely holds workers outside occupied destination throats with Comms Radio warning pings.
 [/list]
 
 [size=4][b][color=#FFB833]✦ Core Features Overview[/color][/b][/size]
@@ -59,4 +60,4 @@ Even though the [i]Persistent Jobs[/i] mod page may currently claim that AI Traf
 [*][b]Persistent Jobs[/b] ([b]Fully Compatible & Supported![/b])
 [/list]
 
-[b]Install:[/b] Download [b]AITraffic-v0.2.8.zip[/b] and drop into UMM, or extract into [i]Derail Valley/Mods/[/i].
+[b]Install:[/b] Download [b]AITraffic-v0.2.9.zip[/b] and drop into UMM, or extract into [i]Derail Valley/Mods/[/i].
