@@ -259,6 +259,139 @@ namespace AITraffic.Navigation
             return occupied;
         }
 
+        private static readonly List<UpcomingSignal> s_playerSignalCheckScratch = new List<UpcomingSignal>(16);
+        private static readonly List<RailTrack> s_playerAheadTracksScratch = new List<RailTrack>(4);
+
+        /// <summary>
+        /// Main-thread only ([RGR-03]). Returns true when a stopped player trainset (&lt; 1.5 km/h) has a
+        /// governing red/stop aspect (DisallowPassing) signal within maxSignalDistance ahead along an active facing direction.
+        /// Used to distinguish a signal-queued player train from a parked/mid-block obstruction.
+        /// </summary>
+        public static bool IsPlayerTrainWaitingAtRedSignal(
+            Trainset playerTrainset,
+            float maxSignalDistance,
+            Vector3 expectedTravelDir,
+            out bool matchesExpectedDir,
+            out Vector3 matchedDirection)
+        {
+            matchesExpectedDir = false;
+            matchedDirection = Vector3.zero;
+            if (Main.IsBackgroundThread || playerTrainset == null || playerTrainset.cars == null || playerTrainset.cars.Count == 0 || !ModCompatManager.IsDVSignalsLoaded)
+                return false;
+
+            if (!s_isInitialized || s_trackSignals.Count == 0)
+            {
+                Initialize();
+            }
+
+            TrainCar refLoco = null;
+            if (PlayerManager.Car != null && PlayerManager.Car.trainset == playerTrainset && PlayerManager.Car.IsLoco)
+                refLoco = PlayerManager.Car;
+            else if (PlayerManager.LastLoco != null && PlayerManager.LastLoco.trainset == playerTrainset && PlayerManager.LastLoco.IsLoco)
+                refLoco = PlayerManager.LastLoco;
+            else
+            {
+                for (int i = 0; i < playerTrainset.cars.Count; i++)
+                {
+                    var c = playerTrainset.cars[i];
+                    if (c != null && c.IsLoco) { refLoco = c; break; }
+                }
+            }
+            if (refLoco == null)
+                refLoco = playerTrainset.cars[0];
+            if (refLoco == null)
+                return false;
+
+            // Check both ends (lead bogie forward and tail car opposite) so push-pull / mid-consist locomotives also resolve ahead signals cleanly.
+            for (int dirTry = 0; dirTry < 2; dirTry++)
+            {
+                TrainCar probeCar = (dirTry == 0) ? refLoco : playerTrainset.cars[playerTrainset.cars.Count - 1];
+                if (probeCar == null) continue;
+                Bogie probeBogie = (dirTry == 0) ? (probeCar.FrontBogie ?? probeCar.RearBogie) : (probeCar.RearBogie ?? probeCar.FrontBogie);
+                RailTrack trk = (probeBogie != null) ? probeBogie.track : null;
+                if (trk == null || trk.curve == null || probeBogie.traveller == null) continue;
+
+                double span = probeBogie.traveller.Span;
+                float len = trk.curve.length;
+                float t = (len > 0.01f) ? Mathf.Clamp01((float)(span / len)) : 0.5f;
+                Vector3 tan = trk.curve.GetTangentAt(t);
+                tan.y = 0f;
+                if (tan.sqrMagnitude < 0.0001f) continue;
+                tan.Normalize();
+
+                float travelDirSign;
+                if (expectedTravelDir.sqrMagnitude > 0.01f)
+                {
+                    float dotExp = Vector3.Dot(expectedTravelDir.normalized, tan);
+                    if (Mathf.Abs(dotExp) < 0.1f) continue;
+                    travelDirSign = (dotExp >= 0f) ? 1f : -1f;
+                }
+                else
+                {
+                    var graph = RailGraph.Instance;
+                    RailEdge re = (graph != null && graph.IsInitialized) ? graph.GetEdge(trk) : null;
+                    if (re != null && re.IsDoubleTrackMainline && re.ParallelEdge != null)
+                    {
+                        travelDirSign = re.IsRightHandInDirection(true) ? 1f : -1f;
+                    }
+                    else
+                    {
+                        travelDirSign = (Vector3.Dot(probeCar.transform.forward, tan) >= 0f) ? 1f : -1f;
+                    }
+                }
+
+                // Walk up to 2 aligned tracks ahead from probeCar so signals just past the current switch mast are visible.
+                s_playerAheadTracksScratch.Clear();
+                s_playerAheadTracksScratch.Add(trk);
+                RailTrack walkTrack = trk;
+                bool walkFwd = travelDirSign >= 0f;
+                for (int step = 0; step < 2; step++)
+                {
+                    Junction exitJunc = walkFwd ? walkTrack.outJunction : walkTrack.inJunction;
+                    RailTrack nextTrack = null;
+                    if (exitJunc != null)
+                    {
+                        if (exitJunc.inBranch != null && exitJunc.inBranch.track == walkTrack && exitJunc.outBranches != null &&
+                            exitJunc.selectedBranch >= 0 && exitJunc.selectedBranch < exitJunc.outBranches.Count)
+                        {
+                            nextTrack = exitJunc.outBranches[exitJunc.selectedBranch]?.track;
+                        }
+                        else if (exitJunc.inBranch != null && exitJunc.inBranch.track != walkTrack)
+                        {
+                            nextTrack = exitJunc.inBranch.track;
+                        }
+                    }
+                    if (nextTrack == null || nextTrack.curve == null || s_playerAheadTracksScratch.Contains(nextTrack)) break;
+                    Vector3 curExitPos = walkFwd ? walkTrack.curve.GetPointAt(1f) : walkTrack.curve.GetPointAt(0f);
+                    walkFwd = Vector3.Distance(curExitPos, nextTrack.curve.GetPointAt(0f)) <= Vector3.Distance(curExitPos, nextTrack.curve.GetPointAt(1f));
+                    s_playerAheadTracksScratch.Add(nextTrack);
+                    walkTrack = nextTrack;
+                }
+
+                s_playerSignalCheckScratch.Clear();
+                if (TryFindUpcomingSignals(trk, span, travelDirSign, s_playerAheadTracksScratch, s_playerSignalCheckScratch))
+                {
+                    for (int s = 0; s < s_playerSignalCheckScratch.Count; s++)
+                    {
+                        var us = s_playerSignalCheckScratch[s];
+                        if (us.Signal == null || us.Distance < 0f || us.Distance > maxSignalDistance) continue;
+                        var eff = us.Signal.Parent != null ? us.Signal.Parent : us.Signal;
+                        if (!IsGoverningSignal(eff)) continue;
+                        bool isRed = eff.IsOn && !eff.IsOff && eff.CurrentAspect != null && eff.CurrentAspect.DisallowPassing;
+                        if (isRed)
+                        {
+                            Vector3 worldDir = tan * travelDirSign;
+                            matchedDirection = worldDir;
+                            matchesExpectedDir = expectedTravelDir.sqrMagnitude > 0.01f && Vector3.Dot(expectedTravelDir.normalized, worldDir) > 0.2f;
+                            return true;
+                        }
+                    }
+                }
+            }
+
+            return false;
+        }
+
         public static Vector3 GetPlayerPosition()
         {
             if (PlayerManager.PlayerTransform != null) return PlayerManager.PlayerTransform.position;

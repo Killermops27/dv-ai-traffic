@@ -619,11 +619,11 @@ namespace AITraffic.Core
                 OccupiedTracksSnapshot = occupiedSnapshot,
                 PlayerOccupiedTracksSnapshot = playerOccupied,
                 PlayerPosition = playerPos,
-                RequesterTrainset = (PlayerManager.Car != null) ? PlayerManager.Car.trainset : null,
+                RequesterTrainset = null,
                 ConsistLength = 100.0f
             };
 
-            int maxTracksToCheck = Math.Min(4, candidateTracks.Count);
+            int maxTracksToCheck = Math.Min(8, candidateTracks.Count);
             int pathSearches = 0;
             bool stopSearches = false;
 
@@ -700,13 +700,21 @@ namespace AITraffic.Core
 
                         pathSearches++;
 
-                        if (pathSearches >= 4)
+                        if (pathSearches >= 6)
                         {
                             stopSearches = true;
                             break;
                         }
 
-                        var pathTask = AITraffic.Navigation.Pathfinder.FindPathAsync(candTrack, destTrack, pathOptions);
+                        bool hasDirectionalRightHand = (candEdge != null &&
+                                                        candEdge.IsDoubleTrackMainline &&
+                                                        candEdge.ParallelEdge != null &&
+                                                        !candEdge.IsIndustrialYardOrStorageTrack &&
+                                                        (candEdge.IsRightHandInDirection(true) != candEdge.IsRightHandInDirection(false)));
+
+                        var pathTask = hasDirectionalRightHand
+                            ? AITraffic.Navigation.Pathfinder.FindPathAsync(candTrack, destTrack, candEdge.PreferredForward, pathOptions)
+                            : AITraffic.Navigation.Pathfinder.FindPathAsync(candTrack, destTrack, pathOptions);
                         while (!pathTask.IsCompleted)
                         {
                             yield return null;
@@ -714,6 +722,15 @@ namespace AITraffic.Core
                         var path = pathTask.Result;
                         if (path == null || !path.IsValid || path.Tracks == null || path.Tracks.Count < 3)
                             continue;
+
+                        // Never spawn a passing encounter train wrong-way onto a center/left parallel track.
+                        if (candEdge != null && candEdge.IsDoubleTrackMainline && candEdge.ParallelEdge != null &&
+                            path.Edges != null && path.Nodes != null && path.Edges.Count > 0 && path.Nodes.Count > 1)
+                        {
+                            bool depFwd = candEdge.IsForward(path.Nodes[0], path.Nodes[1]);
+                            if (!candEdge.IsRightHandInDirection(depFwd))
+                                continue;
+                        }
 
                         // Intermediate track avoidance check: Ensure passing train routes never cut through intermediate loading/storage tracks!
                         bool traversesStrictlyAvoided = false;
@@ -2598,9 +2615,11 @@ namespace AITraffic.Core
             };
 
             // Evaluate up to top 3 departure tracks and top 2 destination tracks, yielding a frame between searches
-            int maxDep = Math.Min(3, depTracks.Count);
+            int maxDep = Math.Min(6, depTracks.Count);
             int maxDest = Math.Min(2, destTracks.Count);
             int pathSearches = 0;
+            RailTrack fallbackWrongWayTrack = null;
+            RailPath fallbackWrongWayPath = null;
 
             for (int i = 0; i < maxDep; i++)
             {
@@ -2614,6 +2633,15 @@ namespace AITraffic.Core
                     continue;
                 }
 
+                var depEdge = (AITraffic.Navigation.RailGraph.Instance != null) ? AITraffic.Navigation.RailGraph.Instance.GetEdge(depTrack) : null;
+                bool depOneWayMainline = (depEdge != null &&
+                                          depEdge.IsDoubleTrackMainline &&
+                                          depEdge.ParallelEdge != null &&
+                                          !depEdge.IsYardTrack &&
+                                          !depEdge.IsPassingLoopOrSiding &&
+                                          !depEdge.IsIndustrialYardOrStorageTrack &&
+                                          (depEdge.IsRightHandInDirection(true) != depEdge.IsRightHandInDirection(false)));
+
                 for (int d = 0; d < maxDest; d++)
                 {
                     var dt = destTracks[d];
@@ -2621,7 +2649,9 @@ namespace AITraffic.Core
 
                     pathSearches++;
 
-                    var pathTask = AITraffic.Navigation.Pathfinder.FindPathAsync(depTrack, dt, pathOptions);
+                    var pathTask = depOneWayMainline
+                        ? AITraffic.Navigation.Pathfinder.FindPathAsync(depTrack, dt, depEdge.PreferredForward, pathOptions)
+                        : AITraffic.Navigation.Pathfinder.FindPathAsync(depTrack, dt, pathOptions);
                     while (!pathTask.IsCompleted)
                     {
                         yield return null;
@@ -2663,10 +2693,28 @@ namespace AITraffic.Core
                             continue; // Skip this track, search for a flat track or decline!
                         }
 
+                        if (depEdge != null && depEdge.IsDoubleTrackMainline && depEdge.ParallelEdge != null &&
+                            path.Edges != null && path.Nodes != null && path.Edges.Count > 0 && path.Nodes.Count > 1 &&
+                            !depEdge.IsRightHandInDirection(depEdge.IsForward(path.Nodes[0], path.Nodes[1])))
+                        {
+                            if (fallbackWrongWayPath == null)
+                            {
+                                fallbackWrongWayTrack = depTrack;
+                                fallbackWrongWayPath = path;
+                            }
+                            continue;
+                        }
+
                         if (onFound != null) onFound(depTrack, path);
                         yield break;
                     }
                 }
+            }
+
+            if (fallbackWrongWayTrack != null && fallbackWrongWayPath != null)
+            {
+                if (onFound != null) onFound(fallbackWrongWayTrack, fallbackWrongWayPath);
+                yield break;
             }
 
             if (onFound != null) onFound(null, null);

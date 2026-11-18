@@ -144,6 +144,18 @@ namespace AITraffic.Driver
 
 		private float _slipThrottleReduction;
 
+		private const float MaxDM3SpeedKmh = 65f;
+
+		private const float ThermalDerateStartTempC = 85f;
+
+		private const float ThermalOverheatCutTempC = 95f;
+
+		private const float ThermalOverheatClearTempC = 85f;
+
+		private const float DynamicBrakeCutTempC = 90f;
+
+		private const float DynamicBrakeClearTempC = 85f;
+
 		private ConsistType _consistType = ConsistType.RegionalFreight;
 
 		private float _thermalThrottleLimit;
@@ -151,6 +163,8 @@ namespace AITraffic.Driver
 		private float _overcurrentThrottleLimit;
 
 		private bool _isOverheated;
+
+		private bool _isDynamicBrakeThermalCut;
 
 		private bool _isRollbackDetected;
 
@@ -443,6 +457,20 @@ namespace AITraffic.Driver
 		private bool _reroutePending;
 
 		private readonly Dictionary<string, float> _consumedRerouteKeys = new Dictionary<string, float>();
+
+		private float _rightHandRealignCooldown = 8f;
+
+		private Task<RailPath> _rightHandRealignTask;
+
+		private int _rightHandRealignAnchorIndex = -1;
+
+		private RailTrack _rightHandRealignAnchorTrack;
+
+		private RailTrack _rightHandRealignDestTrack;
+
+		private int _rightHandRealignBaselineWrongEdges;
+
+		private float _rightHandRealignBaselineWrongMeters;
 
 		private float _speedProfileUpdateCooldown = 0f;
 
@@ -1048,6 +1076,8 @@ namespace AITraffic.Driver
 
 		public bool IsOverheated { get; private set; }
 
+		public bool IsDynamicBrakeThermalCut { get; private set; }
+
 		public bool IsRollbackDetected { get; private set; }
 
 		public bool IsHillStarting { get; private set; }
@@ -1143,6 +1173,7 @@ namespace AITraffic.Driver
 					_registeredConsistCars.Add(trainCar);
 				}
 			}
+			_portsInitialized = false;
 		}
 
 		public bool HoldsSignalReservation(Signals.Game.Signal signal)
@@ -1546,6 +1577,10 @@ namespace AITraffic.Driver
 			_slipThrottleReduction = 1f;
 			_thermalThrottleLimit = 1f;
 			_overcurrentThrottleLimit = 1f;
+			_isOverheated = false;
+			_isDynamicBrakeThermalCut = false;
+			IsOverheated = false;
+			IsDynamicBrakeThermalCut = false;
 			_rampThrottle = 0f;
 			ClearShuntingState();
 			SpawnTime = Time.time;
@@ -1615,6 +1650,7 @@ namespace AITraffic.Driver
 			}
 			// CS-2: CRITICAL INVARIANT [WRK-10] — frame-atomic staging reset on leg assignment
 			ClearWorkerApproachStaging();
+			ClearRightHandRealignState();
 			_isEmergencyStop = false;
 			_holdAtNextLoopRequested = false;
 			_isHoldingAtLoop = false;
@@ -1718,6 +1754,7 @@ namespace AITraffic.Driver
 			_junctionAlignCooldownUntil.Clear();
 			_lastRequestedJunctionBranch.Clear();
 			_lastRequestedJunctionTime.Clear();
+			ClearRightHandRealignState();
 			ReleaseAllSignalReservations();
 			ClearShuntingState();
 			if (TrafficManager.IsRunning && TrafficManager.Instance != null)
@@ -2859,6 +2896,7 @@ namespace AITraffic.Driver
 							PathfinderOptions pathfinderOptions3 = new PathfinderOptions();
 							pathfinderOptions3.Requester = this;
 							pathfinderOptions3.RequesterTrainset = ((_trainCar != null) ? _trainCar.trainset : null);
+							pathfinderOptions3.PreventPlayerOvertake = false;
 							pathfinderOptions3.PreferSpeedOverDistance = true;
 							pathfinderOptions3.AvoidOccupiedTracks = true;
 							pathfinderOptions3.StrictlyAvoidOccupied = true;
@@ -2897,6 +2935,7 @@ namespace AITraffic.Driver
 					}
 				}
 			}
+			TryRightHandCorridorRealignment(railTrack, dt);
 			if (CurrentPath.Tracks != null && CurrentPath.Tracks.Count > CurrentPathTrackIndex)
 			{
 				_upcomingTracks.Clear();
@@ -4015,6 +4054,7 @@ namespace AITraffic.Driver
 			{
 				return;
 			}
+			bool matchedActiveAI = false;
 			List<AIEngineer> activeEngineers = TrafficManager.Instance.ActiveEngineers;
 			for (int i = 0; i < activeEngineers.Count; i++)
 			{
@@ -4022,6 +4062,16 @@ namespace AITraffic.Driver
 				if (aIEngineer == null || aIEngineer == this || aIEngineer._trainCar == null || (!(aIEngineer._trainCar == obstCar) && (aIEngineer._trainCar.trainset == null || obstCar.trainset != aIEngineer._trainCar.trainset) && (aIEngineer._registeredConsistCars == null || !aIEngineer._registeredConsistCars.Contains(obstCar))))
 				{
 					continue;
+				}
+				matchedActiveAI = true;
+				if (aIEngineer.IsPermanentlyStalled ||
+				    aIEngineer.IsEmergencyStopped ||
+				    aIEngineer.HasArrivedAtDestination ||
+				    aIEngineer.State == EngineState.TerminusStop ||
+				    aIEngineer.State == EngineState.StationHold)
+				{
+					// Permanently stalled or terminus/station-holding AI is treated as a stationary obstacle for bypass rather than moving traffic.
+					break;
 				}
 				if (aIEngineer._trainCar != obstCar)
 				{
@@ -4052,6 +4102,18 @@ namespace AITraffic.Driver
 				{
 					isComingHeadOn = true;
 					break;
+				}
+			}
+
+			// A stopped player trainset actively waiting at a governing red signal in our travel direction is queued behind rather than detoured around wrong-way.
+			// Stopped player trains NOT at a red signal and uncrewed parked cars remain stationary obstacles (isSameDirectionTraffic == false).
+			if (!matchedActiveAI && !isComingHeadOn && obstCar.trainset != null && !AITraffic.Compat.ModCompatManager.IsAITrain(obstCar.trainset))
+			{
+				bool matchesDir;
+				Vector3 redDir;
+				if (SignalRegistry.IsPlayerTrainWaitingAtRedSignal(obstCar.trainset, 250f, normalized, out matchesDir, out redDir) && matchesDir)
+				{
+					isSameDirectionTraffic = true;
 				}
 			}
 		}
@@ -6002,6 +6064,252 @@ namespace AITraffic.Driver
 			return false;
 		}
 
+		private void ClearRightHandRealignState()
+		{
+			_rightHandRealignTask = null;
+			_rightHandRealignAnchorIndex = -1;
+			_rightHandRealignAnchorTrack = null;
+			_rightHandRealignDestTrack = null;
+			_rightHandRealignBaselineWrongEdges = 0;
+			_rightHandRealignBaselineWrongMeters = 0f;
+			_rightHandRealignCooldown = 8f;
+		}
+
+		private static void MeasureWrongWayCorridorUsage(RailPath path, int startEdgeIndex, out int wrongEdges, out float wrongMeters)
+		{
+			wrongEdges = 0;
+			wrongMeters = 0f;
+			if (path == null || path.Edges == null || path.Nodes == null || path.Nodes.Count != path.Edges.Count + 1)
+				return;
+
+			int fromIdx = Mathf.Max(0, startEdgeIndex);
+			for (int i = fromIdx; i < path.Edges.Count; i++)
+			{
+				RailEdge e = path.Edges[i];
+				if (e == null || !e.IsDoubleTrackMainline || e.ParallelEdge == null || e.IsIndustrialYardOrStorageTrack)
+					continue;
+				bool fwd = e.IsForward(path.Nodes[i], path.Nodes[i + 1]);
+				if (!e.IsRightHandInDirection(fwd))
+				{
+					wrongEdges++;
+					wrongMeters += e.Length;
+				}
+			}
+		}
+
+		// CRITICAL INVARIANT [RGR-07] & [AIE-12] & [AIE-16] & [WRK-02] & [WRK-10]:
+		// Background-async right-hand corridor re-alignment anchored >= max(250m, stopDist + 100m) ahead so switches within
+		// braking/locking distance are never disturbed and Worker explicit/auto destination tracks & pulling heading stay invariant.
+		private void TryRightHandCorridorRealignment(RailTrack curTrack, float dt)
+		{
+			if (_trainCar == null || curTrack == null || RailGraph.Instance == null || !RailGraph.Instance.IsInitialized)
+				return;
+
+			if (_parkedStateLatched || HasArrivedAtDestination || IsPermanentlyStalled || _isEmergencyStop ||
+			    State == EngineState.TerminusStop || State == EngineState.StationHold || State == EngineState.PlayerCoPilotStandby ||
+			    _isHoldingForCorridor || _isHoldingInMultiTrack || _isHoldingAtLoop ||
+			    _isWaitingOutsideStationThroat || _isWorkerApproachStaging || IsStationDestination ||
+			    _isShuntingMode || IsIntentionalReverseActive ||
+			    _reverseProtocolStage != SingleTrackReverseStage.None || _offRouteReverseStage != OffRouteReverseStage.None ||
+			    _playerYieldWaitTimer > 0f || _reroutePending || _rerouteTask != null ||
+			    DistanceToDestination <= 600f)
+			{
+				if (_rightHandRealignTask != null) _rightHandRealignTask = null;
+				return;
+			}
+
+			if (CurrentPath == null || !CurrentPath.IsValid || CurrentPath.Tracks == null || CurrentPath.Edges == null || CurrentPath.Nodes == null ||
+			    CurrentPath.Tracks.Count <= 2 || CurrentPath.Edges.Count != CurrentPath.Tracks.Count || CurrentPath.Nodes.Count != CurrentPath.Edges.Count + 1 ||
+			    CurrentPathTrackIndex < 0 || CurrentPathTrackIndex >= CurrentPath.Tracks.Count || CurrentPath.Tracks[CurrentPathTrackIndex] != curTrack)
+			{
+				_rightHandRealignTask = null;
+				return;
+			}
+
+			float safeAnchorLeadDist = Mathf.Max(250f, CalculateStoppingDistance() + 100f);
+
+			if (_rightHandRealignTask != null)
+			{
+				if (!_rightHandRealignTask.IsCompleted)
+					return;
+
+				RailPath subPath = (_rightHandRealignTask.Status == TaskStatus.RanToCompletion) ? _rightHandRealignTask.Result : null;
+				_rightHandRealignTask = null;
+				_rightHandRealignCooldown = 15f;
+
+				int anchorIdx = _rightHandRealignAnchorIndex;
+				RailTrack anchorTrack = _rightHandRealignAnchorTrack;
+				RailTrack destTrack = _rightHandRealignDestTrack;
+				if (subPath == null || !subPath.IsValid || subPath.Tracks == null || subPath.Tracks.Count < 2 ||
+				    anchorTrack == null || destTrack == null || anchorIdx < CurrentPathTrackIndex || anchorIdx >= CurrentPath.Tracks.Count - 1 ||
+				    CurrentPath.Tracks[anchorIdx] != anchorTrack || CurrentPath.Tracks[CurrentPath.Tracks.Count - 1] != destTrack ||
+				    subPath.Tracks[0] != anchorTrack || subPath.Tracks[subPath.Tracks.Count - 1] != destTrack)
+				{
+					return;
+				}
+
+				// Confirm anchorTrack exit still sits beyond braking/locking horizon before committing any downstream switch change.
+				double leadSpan = (_trainCar.FrontBogie != null && _trainCar.FrontBogie.traveller != null) ? _trainCar.FrontBogie.traveller.Span : 0.0;
+				float curTrackLen = (curTrack.curve != null) ? curTrack.curve.length : 100f;
+				float distToAnchorExit = (TargetDirection >= 0f) ? Mathf.Max(0f, curTrackLen - (float)leadSpan) : Mathf.Max(0f, (float)leadSpan);
+				for (int i = CurrentPathTrackIndex + 1; i <= anchorIdx; i++)
+				{
+					RailTrack tMid = CurrentPath.Tracks[i];
+					distToAnchorExit += (tMid != null && tMid.curve != null) ? tMid.curve.length : 100f;
+				}
+				if (distToAnchorExit < safeAnchorLeadDist)
+					return;
+
+				int curWrongEdges;
+				float curWrongMeters;
+				MeasureWrongWayCorridorUsage(CurrentPath, anchorIdx, out curWrongEdges, out curWrongMeters);
+				int subWrongEdges;
+				float subWrongMeters;
+				MeasureWrongWayCorridorUsage(subPath, 0, out subWrongEdges, out subWrongMeters);
+
+				if (subWrongEdges >= curWrongEdges && subWrongMeters + 40f >= curWrongMeters)
+					return;
+
+				// Reject subPaths that re-enter current/rear consist or prefix tracks (cycle) or flip travel direction at the splice boundary.
+				int cycleCheckStart = Mathf.Max(0, CurrentPathTrackIndex - 2);
+				for (int p = cycleCheckStart; p < anchorIdx; p++)
+				{
+					RailTrack prefixTrack = CurrentPath.Tracks[p];
+					if (prefixTrack != null && subPath.Tracks.Contains(prefixTrack))
+						return;
+				}
+
+				int prefixLen = Mathf.Max(0, anchorIdx - CurrentPathTrackIndex);
+				var stitchedTracks = new List<RailTrack>(prefixLen + subPath.Tracks.Count);
+				for (int p = CurrentPathTrackIndex; p < anchorIdx; p++)
+				{
+					stitchedTracks.Add(CurrentPath.Tracks[p]);
+				}
+				for (int s = 0; s < subPath.Tracks.Count; s++)
+				{
+					stitchedTracks.Add(subPath.Tracks[s]);
+				}
+
+				RailPath stitched = new Pathfinder(RailGraph.Instance).BuildPathFromTracks(stitchedTracks);
+				if (stitched == null || !stitched.IsValid || stitched.Tracks == null || stitched.Tracks.Count < 2 ||
+				    stitched.Edges == null || stitched.Nodes == null || stitched.Nodes.Count != stitched.Edges.Count + 1 ||
+				    stitched.Tracks[0] != curTrack ||
+				    stitched.Tracks[stitched.Tracks.Count - 1] != destTrack)
+				{
+					return;
+				}
+
+				bool curFwdNow = CurrentPath.Edges[CurrentPathTrackIndex].IsForward(CurrentPath.Nodes[CurrentPathTrackIndex], CurrentPath.Nodes[CurrentPathTrackIndex + 1]);
+				bool newFwdNow = stitched.Edges[0].IsForward(stitched.Nodes[0], stitched.Nodes[1]);
+				if (curFwdNow != newFwdNow)
+					return;
+
+				for (int k = 0; k < stitched.Edges.Count - 1; k++)
+				{
+					RailEdge eA = stitched.Edges[k];
+					RailEdge eB = stitched.Edges[k + 1];
+					RailNode joinNode = stitched.Nodes[k + 1];
+					if (eA == null || eB == null || joinNode == null) return;
+					Vector3 inV = RailGraph.GetIncomingVector(joinNode, eA);
+					Vector3 outV = RailGraph.GetDepartingVector(joinNode, eB);
+					if (Vector3.Dot(inV, outV) <= 0.2f) return;
+				}
+
+				CurrentPath = stitched;
+				CurrentPathTrackIndex = 0;
+				_upcomingTracks.Clear();
+				for (int i = 0; i < CurrentPath.Tracks.Count; i++)
+				{
+					_upcomingTracks.Add(CurrentPath.Tracks[i]);
+				}
+				if (Main.IsDebugLoggingEnabled)
+				{
+					Main.LogDebug(string.Format("[AITraffic] Right-Hand Realignment: '{0}' re-aligned back to right-hand corridor at anchor '{1}' (wrong-way {2:F0}m -> {3:F0}m).",
+						LocoId, anchorTrack.name, curWrongMeters, subWrongMeters));
+				}
+				return;
+			}
+
+			_rightHandRealignCooldown -= dt;
+			if (_rightHandRealignCooldown > 0f)
+				return;
+
+			int checkCurWrongEdges;
+			float checkCurWrongMeters;
+			MeasureWrongWayCorridorUsage(CurrentPath, CurrentPathTrackIndex, out checkCurWrongEdges, out checkCurWrongMeters);
+			if (checkCurWrongEdges == 0)
+			{
+				_rightHandRealignCooldown = 6f;
+				return;
+			}
+
+			double fSpan = (_trainCar.FrontBogie != null && _trainCar.FrontBogie.traveller != null) ? _trainCar.FrontBogie.traveller.Span : 0.0;
+			float firstLen = (curTrack.curve != null) ? curTrack.curve.length : 100f;
+			float accumDist = (TargetDirection >= 0f) ? Mathf.Max(0f, firstLen - (float)fSpan) : Mathf.Max(0f, (float)fSpan);
+
+			int candidateAnchorIdx = -1;
+			for (int idx = CurrentPathTrackIndex; idx < CurrentPath.Tracks.Count - 2; idx++)
+			{
+				if (idx > CurrentPathTrackIndex)
+				{
+					RailTrack tSeg = CurrentPath.Tracks[idx];
+					accumDist += (tSeg != null && tSeg.curve != null) ? tSeg.curve.length : 100f;
+				}
+				if (accumDist >= safeAnchorLeadDist)
+				{
+					candidateAnchorIdx = idx;
+					break;
+				}
+			}
+
+			if (candidateAnchorIdx < 0 || candidateAnchorIdx >= CurrentPath.Tracks.Count - 2)
+			{
+				_rightHandRealignCooldown = 6f;
+				return;
+			}
+
+			int anchorWrongEdges;
+			float anchorWrongMeters;
+			MeasureWrongWayCorridorUsage(CurrentPath, candidateAnchorIdx, out anchorWrongEdges, out anchorWrongMeters);
+			if (anchorWrongEdges == 0)
+			{
+				_rightHandRealignCooldown = 6f;
+				return;
+			}
+
+			RailTrack cAnchorTrack = CurrentPath.Tracks[candidateAnchorIdx];
+			RailTrack cDestTrack = CurrentPath.Tracks[CurrentPath.Tracks.Count - 1];
+			RailEdge cAnchorEdge = CurrentPath.Edges[candidateAnchorIdx];
+			if (cAnchorTrack == null || cDestTrack == null || cAnchorEdge == null || cAnchorTrack == cDestTrack)
+			{
+				_rightHandRealignCooldown = 10f;
+				return;
+			}
+
+			bool anchorForward = cAnchorEdge.IsForward(CurrentPath.Nodes[candidateAnchorIdx], CurrentPath.Nodes[candidateAnchorIdx + 1]);
+			var realignOpts = new PathfinderOptions
+			{
+				Requester = this,
+				RequesterTrainset = _trainCar.trainset,
+				PreferSpeedOverDistance = true,
+				AvoidOccupiedTracks = true,
+				StrictlyAvoidOccupied = true,
+				AvoidReservedTracks = true,
+				StrictlyAvoidReserved = false,
+				PreventPlayerOvertake = false,
+				ConsistLength = ConsistLengthMeters,
+				MaxSearchDistance = 5000000f
+			};
+
+			_rightHandRealignAnchorIndex = candidateAnchorIdx;
+			_rightHandRealignAnchorTrack = cAnchorTrack;
+			_rightHandRealignDestTrack = cDestTrack;
+			_rightHandRealignBaselineWrongEdges = anchorWrongEdges;
+			_rightHandRealignBaselineWrongMeters = anchorWrongMeters;
+			_rightHandRealignCooldown = 15f;
+			_rightHandRealignTask = Pathfinder.FindPathAsync(cAnchorTrack, cDestTrack, anchorForward, realignOpts);
+		}
+
 		private void ApplyClosedLoopReverseControl(float targetReverseSpeedKmh, float dt)
 		{
 			TargetSpeedKmh = targetReverseSpeedKmh;
@@ -6687,6 +6995,19 @@ namespace AITraffic.Driver
 				currentSpeedProfile.TargetSpeedMs = SpeedProfileGenerator.KmHToMs(num4);
 				currentSpeedProfile.LimitingReason = SpeedLimitReason.CurvatureRadius;
 			}
+			if (IsLocoDM3 && currentSpeedProfile.TargetSpeedKmh > MaxDM3SpeedKmh)
+			{
+				currentSpeedProfile.TargetSpeedKmh = MaxDM3SpeedKmh;
+				currentSpeedProfile.TargetSpeedMs = SpeedProfileGenerator.KmHToMs(MaxDM3SpeedKmh);
+				if (currentSpeedProfile.TrackLimitKmh > MaxDM3SpeedKmh)
+				{
+					currentSpeedProfile.TrackLimitKmh = MaxDM3SpeedKmh;
+				}
+				if (currentSpeedProfile.LimitingReason == SpeedLimitReason.TrackSignLimit)
+				{
+					currentSpeedProfile.LimitingReason = SpeedLimitReason.DefaultLineSpeed;
+				}
+			}
 			if (_isShuntingMode && currentSpeedProfile.TargetSpeedKmh > 15f)
 			{
 				currentSpeedProfile.TargetSpeedKmh = 15f;
@@ -6777,7 +7098,7 @@ namespace AITraffic.Driver
 				{
 					continue;
 				}
-				if (port.valueType == PortValueType.TEMPERATURE || port.id.IndexOf("TEMPERATURE", StringComparison.OrdinalIgnoreCase) >= 0 || port.id.IndexOf("engineTemp", StringComparison.OrdinalIgnoreCase) >= 0 || port.id.IndexOf("oilTemp", StringComparison.OrdinalIgnoreCase) >= 0 || port.id.IndexOf("waterTemp", StringComparison.OrdinalIgnoreCase) >= 0 || port.id.IndexOf("tmTemp", StringComparison.OrdinalIgnoreCase) >= 0)
+				if ((port.valueType == PortValueType.TEMPERATURE || port.id.IndexOf("TEMPERATURE", StringComparison.OrdinalIgnoreCase) >= 0 || port.id.IndexOf("engineTemp", StringComparison.OrdinalIgnoreCase) >= 0 || port.id.IndexOf("oilTemp", StringComparison.OrdinalIgnoreCase) >= 0 || port.id.IndexOf("waterTemp", StringComparison.OrdinalIgnoreCase) >= 0 || port.id.IndexOf("tmTemp", StringComparison.OrdinalIgnoreCase) >= 0) && port.id.IndexOf("LIMIT", StringComparison.OrdinalIgnoreCase) < 0 && port.id.IndexOf("EXT_IN", StringComparison.OrdinalIgnoreCase) < 0)
 				{
 					_temperaturePorts.Add(port);
 				}
@@ -7055,30 +7376,44 @@ namespace AITraffic.Driver
 			float num = 0f;
 			for (int i = 0; i < _temperaturePorts.Count; i++)
 			{
-				float value = _temperaturePorts[i].Value;
-				if (value > num)
+				Port tempPort = _temperaturePorts[i];
+				if (tempPort == null)
+				{
+					continue;
+				}
+				float value = tempPort.Value;
+				if (!float.IsNaN(value) && !float.IsInfinity(value) && value > num)
 				{
 					num = value;
 				}
 			}
 			CurrentMaxTemperature = num;
-			if (num >= 105f)
+			if (num >= ThermalOverheatCutTempC)
 			{
 				_isOverheated = true;
 			}
-			else if (num < 95f)
+			else if (num < ThermalOverheatClearTempC)
 			{
 				_isOverheated = false;
 			}
 			IsOverheated = _isOverheated;
+			if (num > DynamicBrakeCutTempC)
+			{
+				_isDynamicBrakeThermalCut = true;
+			}
+			else if (num < DynamicBrakeClearTempC)
+			{
+				_isDynamicBrakeThermalCut = false;
+			}
+			IsDynamicBrakeThermalCut = _isDynamicBrakeThermalCut;
 			if (_isOverheated)
 			{
 				_thermalThrottleLimit = 0f;
 			}
-			else if (num > 95f)
+			else if (num > ThermalDerateStartTempC)
 			{
-				float t = (num - 95f) / 10f;
-				_thermalThrottleLimit = Mathf.Lerp(1f, 0.25f, t);
+				float t = Mathf.Clamp01((num - ThermalDerateStartTempC) / Mathf.Max(1f, ThermalOverheatCutTempC - ThermalDerateStartTempC));
+				_thermalThrottleLimit = Mathf.Lerp(1f, 0.15f, t);
 			}
 			else
 			{
@@ -8224,9 +8559,14 @@ namespace AITraffic.Driver
 						}
 						_commandedThrottle = ComputeAcceleratingThrottle(dt);
 						float currentThrottle = _currentThrottle;
-						if (HillStage == HillLaunchStage.MomentumRunUp)
+						if (_isOverheated)
 						{
-							_commandedThrottle = Mathf.Max(_commandedThrottle, 0.95f);
+							_commandedThrottle = 0f;
+							_rampThrottle = 0f;
+						}
+						else if (HillStage == HillLaunchStage.MomentumRunUp)
+						{
+							_commandedThrottle = Mathf.Max(_commandedThrottle, 0.95f * GetTractionAuthorityMultiplier());
 						}
 						if (currentThrottle >= eqThrottle * 0.85f)
 						{
@@ -8382,7 +8722,13 @@ namespace AITraffic.Driver
 				else
 				{
 					_commandedIndependentBrake = 0f;
-					if (flag10 && num13 < -0.15f)
+					if (_isOverheated && CurrentSpeedKmh < 0.5f)
+					{
+						_commandedTrainBrake = 1f;
+						// CRITICAL INVARIANT [AIE-03]: Independent brake only when < 0.2 km/h.
+						_commandedIndependentBrake = ((CurrentSpeedKmh < 0.2f) ? 1f : 0f);
+					}
+					else if (flag10 && num13 < -0.15f)
 					{
 						_commandedTrainBrake = Mathf.Max(_commandedTrainBrake, 0.2f);
 					}
@@ -8390,7 +8736,7 @@ namespace AITraffic.Driver
 					{
 						_commandedTrainBrake = 0f;
 					}
-					_commandedThrottle = ComputeAcceleratingThrottle(dt);
+					_commandedThrottle = (_isOverheated ? 0f : ComputeAcceleratingThrottle(dt));
 					HillStage = HillLaunchStage.None;
 				}
 				BrakePID.Reset();
@@ -8407,12 +8753,15 @@ namespace AITraffic.Driver
 				break;
 			}
 			case EngineState.Cruising:
+			{
 				_commandedReverser = _desiredReverser;
 				_commandedIndependentBrake = 0f;
 				_commandedTrainBrake = 0f;
+				_commandedDynamicBrake = 0f;
 				_commandedThrottle = ComputeCruisingThrottle(dt);
 				BrakePID.Reset();
-				if (TargetSpeedKmh <= 0.01f || num < -4f)
+				float cruiseBrakeEntryDelta = (IsLocoDM3 && CurrentSpeedKmh >= 64.5f) ? -1.5f : -4f;
+				if (TargetSpeedKmh <= 0.01f || num < cruiseBrakeEntryDelta)
 				{
 					_rampThrottle = 0f;
 					_brakeHoldTimer = 3f;
@@ -8431,16 +8780,19 @@ namespace AITraffic.Driver
 					State = EngineState.Coasting;
 				}
 				break;
+			}
 			case EngineState.Coasting:
+			{
 				_commandedReverser = _desiredReverser;
 				_commandedThrottle = 0f;
 				_rampThrottle = 0f;
-				if (_hasDynamicBrake && num < 0f)
+				bool canUseDynamicBrake = _hasDynamicBrake && !_isDynamicBrakeThermalCut && !_isOverheated;
+				if (canUseDynamicBrake && num < 0f)
 				{
 					_commandedDynamicBrake = Mathf.Clamp01((0f - num) / 5f);
 					_commandedTrainBrake = 0f;
 				}
-				else if (!_hasDynamicBrake && num < -0.8f)
+				else if (!canUseDynamicBrake && num < -0.8f)
 				{
 					_commandedDynamicBrake = 0f;
 					_commandedTrainBrake = Mathf.Clamp((0f - num) * 0.04f, 0f, 0.2f);
@@ -8450,7 +8802,8 @@ namespace AITraffic.Driver
 					_commandedDynamicBrake = 0f;
 					_commandedTrainBrake = 0f;
 				}
-				if (TargetSpeedKmh <= 0.01f || num < -4f)
+				float coastBrakeEntryDelta = (IsLocoDM3 && CurrentSpeedKmh >= 64.5f) ? -1.5f : -4f;
+				if (TargetSpeedKmh <= 0.01f || num < coastBrakeEntryDelta)
 				{
 					_brakeHoldTimer = 3f;
 					State = EngineState.Braking;
@@ -8462,6 +8815,7 @@ namespace AITraffic.Driver
 					State = EngineState.Accelerating;
 				}
 				break;
+			}
 			case EngineState.Braking:
 			{
 				_commandedThrottle = 0f;
@@ -8590,7 +8944,8 @@ namespace AITraffic.Driver
 				float a = ((IniConfigManager.Instance != null && IniConfigManager.Instance.Physics != null) ? IniConfigManager.Instance.Physics.MaxWetServiceBrakeDemand : 0.55f);
 				_commandedTrainBrake = Mathf.Min(a, _commandedTrainBrake);
 			}
-			if (_hasDynamicBrake && CurrentSpeedKmh > 5f && !_isLocoWheelSliding)
+			bool canUseDynamicBrake = _hasDynamicBrake && !_isDynamicBrakeThermalCut && !_isOverheated;
+			if (canUseDynamicBrake && CurrentSpeedKmh > 5f && !_isLocoWheelSliding)
 			{
 				float num = Mathf.Lerp(1.25f, 0.7f, trackWetness);
 				if (trackWetness > 0.1f && _commandedTrainBrake > 0.35f)
@@ -8608,9 +8963,13 @@ namespace AITraffic.Driver
 			if (effectiveObstacleDistance < 30f || (effectiveObstacleDistance < 80f && CurrentSpeedKmh > 25f))
 			{
 				_commandedTrainBrake = 1f;
-				if (_hasDynamicBrake)
+				if (canUseDynamicBrake && !_isLocoWheelSliding)
 				{
 					_commandedDynamicBrake = 1f;
+				}
+				else
+				{
+					_commandedDynamicBrake = 0f;
 				}
 			}
 			if (CurrentSpeedKmh < 0.2f && (TargetSpeedKmh <= 0.1f || effectiveObstacleDistance <= 45f))
@@ -8832,6 +9191,16 @@ namespace AITraffic.Driver
 			{
 				_commandedThrottle = 0f;
 				_rampThrottle = 0f;
+				_currentThrottle = 0f;
+				_copilotStartThrottle = 0f;
+				if (ThrottlePID != null)
+				{
+					ThrottlePID.Reset();
+				}
+			}
+			if (_isDynamicBrakeThermalCut || _isOverheated)
+			{
+				_commandedDynamicBrake = 0f;
 			}
 			if (IsIntentionalReverseActive && Mathf.Abs(_currentReverser - _commandedReverser) > 0.1f)
 			{
@@ -8902,6 +9271,10 @@ namespace AITraffic.Driver
 				return;
 			}
 			float num2 = ((IsHillStarting && num > _currentThrottle) ? Mathf.Max(ThrottleSlewRate, 0.16f) : ThrottleSlewRate);
+			if (num < _currentThrottle && (_thermalThrottleLimit < 0.999f || _overcurrentThrottleLimit < 0.999f || _slipThrottleReduction < 0.999f))
+			{
+				num2 = Mathf.Max(num2, 1.0f);
+			}
 			_currentThrottle = Mathf.MoveTowards(_currentThrottle, num, num2 * dt);
 			if (_controlsOverrider.Throttle != null && CanActuateCoPilotLever(ref _copilotThrottleState))
 			{
@@ -8927,7 +9300,8 @@ namespace AITraffic.Driver
 			}
 			if (_hasDynamicBrake && _controlsOverrider.DynamicBrake != null)
 			{
-				_currentDynamicBrake = Mathf.MoveTowards(_currentDynamicBrake, _commandedDynamicBrake, DynamicBrakeSlewRate * dt);
+				float dynSlew = ((_isDynamicBrakeThermalCut || _isOverheated) ? Mathf.Max(DynamicBrakeSlewRate, 3.0f) : DynamicBrakeSlewRate);
+				_currentDynamicBrake = Mathf.MoveTowards(_currentDynamicBrake, _commandedDynamicBrake, dynSlew * dt);
 				if (CanActuateCoPilotLever(ref _copilotDynBrakeState))
 				{
 					_controlsOverrider.DynamicBrake.Set(_currentDynamicBrake);
